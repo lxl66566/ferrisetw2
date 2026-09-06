@@ -11,7 +11,6 @@ use crate::native::tdh_types::{
 use crate::native::time::{FileTime, SystemTime};
 use crate::property::PropertySlice;
 use crate::schema::Schema;
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
@@ -85,17 +84,18 @@ type ParserResult<T> = Result<T, ParserError>;
 /// Cache of the properties we've extracted already
 ///
 /// This is useful because computing their offset can be costly
+///
+/// The slices are stored in schema order (one entry per parsed property, even
+/// when names repeat), and looked up by probing from `next_probe` (right after
+/// the last hit, wrapping around): property access usually follows schema
+/// order, so this finds entries in O(1) without any hashing, and without
+/// allocating a key per parsed property.
 struct CachedSlices<'schema, 'record> {
-    slices: HashMap<String, PropertySlice<'schema, 'record>>,
+    slices: Vec<PropertySlice<'schema, 'record>>,
+    /// Where the next name lookup starts probing
+    next_probe: usize,
     /// The user buffer index we've cached up to
     last_cached_offset: usize,
-    /// The number of properties (in schema order) we've cached up to.
-    ///
-    /// Distinct from `slices.len()`: a schema may hold several properties with
-    /// the same name (manifests allow it), and the map then holds fewer entries
-    /// than properties parsed. Resuming from `slices.len()` would re-parse
-    /// already-consumed properties and misalign `last_cached_offset`.
-    properties_parsed: usize,
 }
 
 /// Represents a Parser
@@ -266,13 +266,17 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     fn find_property(&self, name: &str) -> ParserResult<PropertySlice<'schema, 'record>> {
         let mut cache = self.cache.lock().unwrap();
 
-        // We may have extracted this property already
-        if let Some(p) = cache.slices.get(name) {
-            return Ok(*p);
+        // We may have extracted this property already: probe right after the
+        // last hit first, as successive accesses usually advance in schema order
+        for i in 0..cache.slices.len() {
+            let idx = (cache.next_probe + i) % cache.slices.len();
+            if cache.slices[idx].property.name == name {
+                cache.next_probe = (idx + 1) % cache.slices.len();
+                return Ok(cache.slices[idx]);
+            }
         }
 
-        let last_cached_property = cache.properties_parsed;
-        let properties_not_parsed_yet = match self.properties.get(last_cached_property..) {
+        let properties_not_parsed_yet = match self.properties.get(cache.slices.len()..) {
             Some(s) => s,
             // If we've parsed every property already, that means no property matches this name
             None => return Err(ParserError::NotFound),
@@ -303,11 +307,8 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 property,
                 buffer: property_buffer,
             };
-            cache
-                .slices
-                .insert(String::clone(&property.name), prop_slice);
+            cache.slices.push(prop_slice);
             cache.last_cached_offset += prop_size;
-            cache.properties_parsed += 1;
 
             if property.name == name {
                 return Ok(prop_slice);
@@ -866,6 +867,33 @@ mod tests {
             parser.try_parse::<u32>("missing"),
             Err(ParserError::NotFound)
         ));
+    }
+
+    #[test]
+    fn cached_properties_are_found_out_of_order() {
+        // Parsing "c" first has to walk through "a" and "b"; asking for them
+        // afterwards must hit the cache (a re-parse would consume the buffer
+        // again and return the values of the wrong properties)
+        let props = [
+            PropSpec::new("a", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("b", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("c", TdhInType::InTypeUInt32, 4),
+        ];
+        let user_data: [u8; 12] = [
+            1, 0, 0, 0, // a
+            2, 0, 0, 0, // b
+            3, 0, 0, 0, // c
+        ];
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&props);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.try_parse::<u32>("c").unwrap(), 3);
+        assert_eq!(parser.try_parse::<u32>("a").unwrap(), 1);
+        assert_eq!(parser.try_parse::<u32>("b").unwrap(), 2);
+        // Repeated accesses are served from the cache as well
+        assert_eq!(parser.try_parse::<u32>("c").unwrap(), 3);
+        assert_eq!(parser.try_parse::<u32>("a").unwrap(), 1);
     }
 
     #[test]
