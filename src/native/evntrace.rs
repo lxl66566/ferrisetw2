@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 use once_cell::sync::Lazy;
 
@@ -56,6 +56,11 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 /// Since that is not possible, let's discard every callback run after we've called `CloseTrace`.
 /// That's the purpose of this set.
 ///
+/// Note: this must remain an external, pointer-keyed registry: `is_valid` runs
+/// when the pointed-to `CallbackData` may already be deallocated, so it is only
+/// sound as long as it never dereferences the pointer. (e.g. an `AtomicBool`
+/// embedded in `CallbackData` would be read after free)
+///
 /// TODO: it _might_ be possible to know whether we've processed the last buffered event, as
 ///       ControlTraceW(EVENT_TRACE_CONTROL_QUERY) _might_ tell us if the buffers are empty or not.
 ///       In case the trace is in ERROR_CTX_CLOSE_PENDING state, we could call this after every
@@ -63,29 +68,31 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 ///       Maybe also setting the BufferCallback in EVENT_TRACE_LOGFILEW may help us.
 ///       That's <https://github.com/n4r1b/ferrisetw/issues/62>
 static UNIQUE_VALID_CONTEXTS: UniqueValidContexts = UniqueValidContexts::new();
-struct UniqueValidContexts(Lazy<Mutex<HashSet<u64>>>);
+struct UniqueValidContexts(Lazy<RwLock<HashSet<u64>>>);
 enum ContextError {
     AlreadyExist,
 }
 
 impl UniqueValidContexts {
     pub const fn new() -> Self {
-        Self(Lazy::new(|| Mutex::new(HashSet::new())))
+        Self(Lazy::new(|| RwLock::new(HashSet::new())))
     }
     /// Insert if it did not exist previously
     fn insert(&self, ctx_ptr: *const c_void) -> Result<(), ContextError> {
-        match self.0.lock().unwrap().insert(ctx_ptr as u64) {
+        match self.0.write().unwrap().insert(ctx_ptr as u64) {
             true => Ok(()),
             false => Err(ContextError::AlreadyExist),
         }
     }
 
     fn remove(&self, ctx_ptr: *const c_void) {
-        self.0.lock().unwrap().remove(&(ctx_ptr as u64));
+        self.0.write().unwrap().remove(&(ctx_ptr as u64));
     }
 
     pub fn is_valid(&self, ctx_ptr: *const c_void) -> bool {
-        self.0.lock().unwrap().contains(&(ctx_ptr as u64))
+        // Read lock: every event takes this once, and concurrent events (from
+        // several ETW delivery threads) must not serialize on each other
+        self.0.read().unwrap().contains(&(ctx_ptr as u64))
     }
 }
 
