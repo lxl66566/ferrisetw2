@@ -146,6 +146,14 @@ impl EventFilterDescriptor {
         Ok(s)
     }
 
+    /// The `Type` of the EVENT_FILTER_DESCRIPTOR that will be generated
+    ///
+    /// Note that each filter type may only appear once per call to
+    /// [EnableTraceEx2](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks)
+    pub fn filter_type(&self) -> u32 {
+        self.ty
+    }
+
     /// Returns the EVENT_FILTER_DESCRIPTOR from this [`EventFilterDescriptor`]
     ///
     /// # Safety

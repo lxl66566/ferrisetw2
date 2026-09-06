@@ -292,7 +292,9 @@ impl ProviderBuilder {
     /// Add a filter to this Provider.
     ///
     /// Adding multiple filters will bind them with an `AND` relationship.<br/>
-    /// If you want an `OR` relationship, include them in the same `EventFilter`.
+    /// If you want an `OR` relationship, include them in the same `EventFilter`.<br/>
+    /// Note that Windows allows at most one filter of each type per provider
+    /// (e.g. only one `EventFilter::ByEventIds`): adding more will make trace creation fail.
     ///
     /// # Example
     /// ```

@@ -241,11 +241,21 @@ pub(crate) fn open_trace(
 fn build_event_filter_descriptors(
     provider: &Provider,
 ) -> EvntraceNativeResult<Vec<EventFilterDescriptor>> {
+    // Note: > Each type of filter (a specific Type member) may only appear once
+    //       in a call to the EnableTraceEx2 function.
+    //       (https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks)
+    let mut seen_types = HashSet::new();
     let mut descriptors = Vec::with_capacity(provider.filters().len());
     for filter in provider.filters() {
         let descriptor = filter
             .to_event_filter_descriptor()
             .map_err(|err| EvntraceNativeError::InvalidFilter(err.to_string()))?;
+        if !seen_types.insert(descriptor.filter_type()) {
+            return Err(EvntraceNativeError::InvalidFilter(format!(
+                "several filters share the type {}; at most one filter of each type is allowed",
+                descriptor.filter_type()
+            )));
+        }
         descriptors.push(descriptor);
     }
     Ok(descriptors)
@@ -441,5 +451,20 @@ mod tests {
             .build();
 
         assert_eq!(build_event_filter_descriptors(&provider).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn filters_sharing_a_type_are_rejected() {
+        // EnableTraceEx2 documentation: each filter type may only appear once,
+        // otherwise the call fails
+        let provider = Provider::by_guid(GUID::new().unwrap())
+            .add_filter(EventFilter::ByEventIds(vec![18]))
+            .add_filter(EventFilter::ByEventIds(vec![42]))
+            .build();
+
+        assert!(matches!(
+            build_event_filter_descriptors(&provider),
+            Err(EvntraceNativeError::InvalidFilter(_))
+        ));
     }
 }
