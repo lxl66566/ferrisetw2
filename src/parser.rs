@@ -196,26 +196,25 @@ impl<'schema, 'record> Parser<'schema, 'record> {
 
                 match in_type {
                     TdhInType::InTypeAnsiString => {
-                        let mut l = 0;
-                        for char in remaining_user_buffer {
-                            if char == &0 {
-                                l += 1; // include the final null byte
-                                break;
-                            }
-                            l += 1;
-                        }
-                        return Ok(l);
+                        // The property spans up to and including the NUL terminator
+                        let Some(nul_index) = remaining_user_buffer.iter().position(|b| *b == 0)
+                        else {
+                            return Err(ParserError::PropertyError(
+                                "AnsiString property is not null-terminated".into(),
+                            ));
+                        };
+                        return Ok(nul_index + 1);
                     }
                     TdhInType::InTypeUnicodeString => {
-                        let mut l = 0;
-                        for bytes in remaining_user_buffer.chunks_exact(2) {
-                            if bytes[0] == 0 && bytes[1] == 0 {
-                                l += 2;
-                                break;
-                            }
-                            l += 2;
-                        }
-                        return Ok(l);
+                        let Some(nul_index) = remaining_user_buffer
+                            .chunks_exact(2)
+                            .position(|bytes| bytes[0] == 0 && bytes[1] == 0)
+                        else {
+                            return Err(ParserError::PropertyError(
+                                "UnicodeString property is not null-terminated".into(),
+                            ));
+                        };
+                        return Ok((nul_index + 1) * 2);
                     }
                     _ => (),
                 }
@@ -864,5 +863,43 @@ mod tests {
             parser.try_parse::<u32>("missing"),
             Err(ParserError::NotFound)
         ));
+    }
+
+    #[test]
+    fn unterminated_strings_are_an_error() {
+        // AnsiString without a NUL terminator: reporting the whole remaining
+        // buffer as the property size would corrupt the parsing of everything
+        // that follows
+        let user_data = b"no terminator".to_vec();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new("s", TdhInType::InTypeAnsiString, 0)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(parser.try_parse::<String>("s").is_err());
+
+        // Same for UnicodeString (wide NUL = 2 null bytes)
+        let user_data = vec![0x68u8, 0, 0x69, 0]; // "hi" without the wide terminator
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new("w", TdhInType::InTypeUnicodeString, 0)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(parser.try_parse::<String>("w").is_err());
+    }
+
+    #[test]
+    fn terminated_strings_parse_and_advance_the_offset() {
+        let user_data: Vec<u8> = Vec::from("ab\0")
+            .into_iter()
+            .chain(0x11223344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("s", TdhInType::InTypeAnsiString, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.try_parse::<String>("s").unwrap(), "ab");
+        // The u32 sits right after the 3-byte string: this verifies the string
+        // size computation (NUL included)
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x11223344);
     }
 }
