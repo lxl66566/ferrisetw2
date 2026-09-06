@@ -42,6 +42,9 @@ pub enum EvntraceNativeError {
     AlreadyExist,
     /// Represents an standard IO Error
     IoError(std::io::Error),
+    /// A provider filter could not be built (e.g. empty, too large, or several
+    /// filters of a type that may only appear once)
+    InvalidFilter(String),
 }
 
 pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
@@ -230,6 +233,24 @@ pub(crate) fn open_trace(
     }
 }
 
+/// Builds the provider's filters into descriptors
+///
+/// Returns an error (rather than silently dropping the filter) if one of them
+/// cannot be built: a user misspelling a filter (e.g. an empty list) would
+/// otherwise get a trace that does not filter as requested, without any hint
+fn build_event_filter_descriptors(
+    provider: &Provider,
+) -> EvntraceNativeResult<Vec<EventFilterDescriptor>> {
+    let mut descriptors = Vec::with_capacity(provider.filters().len());
+    for filter in provider.filters() {
+        let descriptor = filter
+            .to_event_filter_descriptor()
+            .map_err(|err| EvntraceNativeError::InvalidFilter(err.to_string()))?;
+        descriptors.push(descriptor);
+    }
+    Ok(descriptors)
+}
+
 /// Attach a provider to a trace
 pub(crate) fn enable_provider(
     control_handle: ControlHandle,
@@ -238,11 +259,7 @@ pub(crate) fn enable_provider(
     match filter_invalid_control_handle(control_handle) {
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
-            let owned_event_filter_descriptors: Vec<EventFilterDescriptor> = provider
-                .filters()
-                .iter()
-                .filter_map(|filter| filter.to_event_filter_descriptor().ok()) // Silently ignoring invalid filters (basically, empty ones)
-                .collect();
+            let owned_event_filter_descriptors = build_event_filter_descriptors(provider)?;
 
             let parameters = EnableTraceParameters::create(
                 provider.guid(),
@@ -395,4 +412,34 @@ pub(crate) fn query_info(class: TraceInformation, buf: &mut [u8]) -> EvntraceNat
     result.map_err(|err| {
         EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::EventFilter;
+
+    #[test]
+    fn unbuidable_filters_are_reported() {
+        // An empty PID list cannot become a filter: this must be an explicit
+        // error, not a silently-ignored filter
+        let provider = Provider::by_guid(GUID::new().unwrap())
+            .add_filter(EventFilter::ByPids(vec![]))
+            .build();
+
+        assert!(matches!(
+            build_event_filter_descriptors(&provider),
+            Err(EvntraceNativeError::InvalidFilter(_))
+        ));
+    }
+
+    #[test]
+    fn valid_filters_are_all_built() {
+        let provider = Provider::by_guid(GUID::new().unwrap())
+            .add_filter(EventFilter::ByPids(vec![1234]))
+            .add_filter(EventFilter::ByEventIds(vec![18]))
+            .build();
+
+        assert_eq!(build_event_filter_descriptors(&provider).unwrap().len(), 2);
+    }
 }
