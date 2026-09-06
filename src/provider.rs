@@ -5,6 +5,7 @@ use crate::native::etw_types::event_record::EventRecord;
 use crate::native::pla;
 use crate::schema_locator::SchemaLocator;
 
+use std::convert::TryFrom;
 use std::sync::{Arc, RwLock};
 use windows::core::GUID;
 
@@ -79,15 +80,44 @@ impl std::fmt::Debug for ProviderBuilder {
     }
 }
 
+/// Types that can be converted into a provider [`GUID`].
+///
+/// This is a substitute for the `Into<GUID>` bound that used to accept GUID
+/// string literals: windows-core 0.61.2 removed its `From<&str> for GUID`
+/// implementation (only fallible `TryFrom<&str>` remains), which would break
+/// `Provider::by_guid("22fb2cd6-...")` and every doc example of this crate.
+pub trait IntoGuid {
+    /// Consumes self, returning the equivalent [`GUID`]
+    fn into_guid(self) -> GUID;
+}
+
+impl IntoGuid for GUID {
+    fn into_guid(self) -> GUID {
+        self
+    }
+}
+
+impl IntoGuid for u128 {
+    fn into_guid(self) -> GUID {
+        GUID::from(self)
+    }
+}
+
+impl IntoGuid for &str {
+    fn into_guid(self) -> GUID {
+        GUID::try_from(self).unwrap_or_else(|_| panic!("invalid GUID string: {:?}", self))
+    }
+}
+
 // Create builders
 impl Provider {
     /// Create a Provider defined by its GUID
     ///
-    /// Many types [implement `Into<GUID>`](https://microsoft.github.io/windows-docs-rs/doc/windows/core/struct.GUID.html#trait-implementations)
-    /// and are acceptable as argument: `GUID` themselves, but also `&str`, etc.
-    pub fn by_guid<G: Into<GUID>>(guid: G) -> ProviderBuilder {
+    /// Many types are acceptable as argument: `GUID` themselves, `u128` values
+    /// and `&str` strings such as `"22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716"`.
+    pub fn by_guid<G: IntoGuid>(guid: G) -> ProviderBuilder {
         ProviderBuilder {
-            guid: guid.into(),
+            guid: guid.into_guid(),
             any: 0,
             all: 0,
             level: 5,
@@ -304,5 +334,28 @@ impl ProviderBuilder {
             filters: self.filters,
             callbacks: self.callbacks,
         }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn by_guid_accepts_guid_u128_and_str() {
+        let guid = GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
+        assert_eq!(Provider::by_guid(guid).build().guid(), guid);
+        assert_eq!(
+            Provider::by_guid(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716)
+                .build()
+                .guid(),
+            guid
+        );
+        assert_eq!(
+            Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
+                .build()
+                .guid(),
+            guid
+        );
     }
 }
