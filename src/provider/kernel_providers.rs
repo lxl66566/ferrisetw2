@@ -270,7 +270,7 @@ pub static INTERRUPT_PROVIDER: KernelProvider = KernelProvider::new(
 /// Represents the Driver Kernel Provider
 pub static DRIVER_PROVIDER: KernelProvider = KernelProvider::new(
     kernel_guids::DISK_IO_GUID,
-    kernel_flags::EVENT_TRACE_FLAG_DISK_IO,
+    kernel_flags::EVENT_TRACE_FLAG_DRIVER,
 );
 /// Represents the DPC Kernel Provider
 pub static DPC_PROVIDER: KernelProvider = KernelProvider::new(
@@ -354,6 +354,27 @@ mod test {
 
         assert_eq!(EVENT_TRACE_FLAG_IMAGE_LOAD, kernel_provider.kernel_flags());
         assert_eq!(IMAGE_LOAD_GUID, kernel_provider.guid());
+    }
+
+    // Values cross-checked against krabsetw's krabs/kernel_providers.hpp
+    #[test]
+    fn test_standard_providers_use_the_krabsetw_flags() {
+        let cases = [
+            (&DRIVER_PROVIDER, DISK_IO_GUID, EVENT_TRACE_FLAG_DRIVER),
+            (&DISK_IO_PROVIDER, DISK_IO_GUID, EVENT_TRACE_FLAG_DISK_IO),
+            (
+                &DISK_FILE_IO_PROVIDER,
+                FILE_IO_GUID,
+                EVENT_TRACE_FLAG_DISK_FILE_IO,
+            ),
+            (&THREAD_PROVIDER, THREAD_GUID, EVENT_TRACE_FLAG_THREAD),
+            (&REGISTRY_PROVIDER, REGISTRY_GUID, EVENT_TRACE_FLAG_REGISTRY),
+        ];
+        for (provider, guid, flag) in cases {
+            let bound = Provider::kernel(provider).build();
+            assert_eq!(guid, bound.guid());
+            assert_eq!(flag, bound.kernel_flags());
+        }
     }
 
     #[test]
