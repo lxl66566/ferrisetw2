@@ -28,19 +28,22 @@ jobs:
         command: fmt
         args: --check
     # Cargo check
+    # --all-features: several modules (e.g. ser.rs) are feature-gated and would
+    # otherwise never be compiled by CI
     - uses: actions-rs/cargo@v1
       with:
         command: check
+        args: --all-features
     # Cargo doc
     - uses: actions-rs/cargo@v1
       with:
         command: doc
-        args: --no-deps
+        args: --no-deps --all-features
     # Cargo test
     - uses: actions-rs/cargo@v1
       with:
         command: test
-
+        args: --all-features
   clippy-on-diffs:
     runs-on: windows-2022
     steps:
@@ -50,7 +53,9 @@ jobs:
         profile: minimal
         toolchain: stable
         override: true
+        components: clippy
     - uses: actions-rs/clippy-check@v1
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
+        args: --all-features
 
