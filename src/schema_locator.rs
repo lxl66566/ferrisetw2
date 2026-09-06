@@ -92,6 +92,14 @@ pub struct SchemaLocator {
     schemas: Mutex<FxHashMap<SchemaKey, Arc<Schema>>>,
 }
 
+/// Upper bound on the number of cached schemas.
+///
+/// Without it, a long-running process collecting many distinct event kinds
+/// (especially TraceLogging events, whose dynamic names all get their own key)
+/// would grow the cache forever. Once full, new schemas are still built and
+/// returned, they are just not cached anymore.
+const MAX_CACHED_SCHEMAS: usize = 4096;
+
 impl std::fmt::Debug for SchemaLocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SchemaLocator")
@@ -129,18 +137,87 @@ impl SchemaLocator {
 
         // Building the schema involves a (potentially slow, manifest-parsing)
         // TDH call: don't hold the lock while doing so, as the events of a
-        // real-time session may be delivered from several threads. If another
-        // thread inserted the same key in the meantime, its schema wins.
+        // real-time session may be delivered from several threads.
         let tei = TraceEventInfo::build_from_event(event)?;
         let new_schema = Arc::new(Schema::new(tei));
 
+        Ok(self.store(key, new_schema))
+    }
+
+    /// Caches `built` under `key` and returns the schema to use from now on
+    ///
+    /// If another thread stored a schema with the same key in the meantime,
+    /// that one wins and is returned instead (both describe the same event
+    /// kind, so they are interchangeable).
+    fn store(&self, key: SchemaKey, built: Arc<Schema>) -> Arc<Schema> {
         let mut schemas = self.schemas.lock().unwrap();
-        match schemas.entry(key) {
-            std::collections::hash_map::Entry::Occupied(e) => Ok(Arc::clone(e.get())),
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(Arc::clone(&new_schema));
-                Ok(new_schema)
-            }
+        if let Some(existing) = schemas.get(&key) {
+            return Arc::clone(existing);
         }
+        if schemas.len() < MAX_CACHED_SCHEMAS {
+            schemas.insert(key, Arc::clone(&built));
+        }
+        built
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::alloc::Layout;
+    use windows::Win32::System::Diagnostics::Etw;
+
+    fn synthetic_tei() -> TraceEventInfo {
+        // An all-zero TRACE_EVENT_INFO: the schema content does not matter here
+        let size = std::mem::size_of::<Etw::TRACE_EVENT_INFO>();
+        let layout = Layout::from_size_align(size, std::mem::align_of::<Etw::TRACE_EVENT_INFO>())
+            .expect("valid layout");
+        unsafe {
+            let buffer = std::alloc::alloc(layout);
+            std::ptr::write_bytes(buffer, 0, size);
+            TraceEventInfo::from_raw_parts(buffer, layout)
+        }
+    }
+
+    fn key(n: u16) -> SchemaKey {
+        SchemaKey {
+            provider: GUID::from_u128(n as u128),
+            id: n,
+            opcode: 0,
+            version: 0,
+            level: 0,
+            event_name: String::new(),
+        }
+    }
+
+    #[test]
+    fn cache_is_bounded() {
+        let locator = SchemaLocator::new();
+        let schema = Arc::new(Schema::new(synthetic_tei()));
+
+        for n in 0..MAX_CACHED_SCHEMAS as u16 {
+            let stored = locator.store(key(n), Arc::clone(&schema));
+            assert!(Arc::ptr_eq(&stored, &schema));
+        }
+        assert_eq!(locator.schemas.lock().unwrap().len(), MAX_CACHED_SCHEMAS);
+
+        // Once full, a new schema is still handed out, but not cached
+        let extra = locator.store(key(u16::MAX), Arc::clone(&schema));
+        assert!(Arc::ptr_eq(&extra, &schema));
+        assert_eq!(locator.schemas.lock().unwrap().len(), MAX_CACHED_SCHEMAS);
+    }
+
+    #[test]
+    fn concurrent_insert_of_the_same_key_wins_over_the_loser() {
+        let locator = SchemaLocator::new();
+        let winner = Arc::new(Schema::new(synthetic_tei()));
+        let loser = Arc::new(Schema::new(synthetic_tei()));
+
+        let first = locator.store(key(1), Arc::clone(&winner));
+        let second = locator.store(key(1), Arc::clone(&loser));
+
+        assert!(Arc::ptr_eq(&first, &winner));
+        // The second storer gets back the first-inserted schema
+        assert!(Arc::ptr_eq(&second, &winner));
     }
 }
