@@ -298,10 +298,37 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
 
 struct PropSer(PropHandler);
 
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::native::tdh_types::PropertyLength;
+
+    fn value_info(in_type: TdhInType) -> PropertyInfo {
+        PropertyInfo::Value {
+            in_type,
+            out_type: TdhOutType::OutTypeNull,
+            length: PropertyLength::Length(0),
+        }
+    }
+
+    #[test]
+    fn counted_ansi_string_serializes_as_string() {
+        let info = value_info(TdhInType::InTypeCountedAnsiString);
+        assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
+    }
+
+    #[test]
+    fn counted_string_is_not_serialized_yet() {
+        let info = value_info(TdhInType::InTypeCountedString);
+        assert!(info.get_parser().is_none());
+    }
+}
+
 trait PropSerable {
     fn get_parser(&self) -> Option<PropSer>;
 }
 
+#[derive(Debug, PartialEq)]
 enum PropHandler {
     Null,
     Bool,
@@ -436,6 +463,8 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::Int32)),
                         TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::Int64)),
                         TdhInType::InTypeCountedString => None, // TODO
+                        // `try_parse::<String>` is implemented for CountedAnsiString (see parser.rs)
+                        TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
                     },
                 }
             }
