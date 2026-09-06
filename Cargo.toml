@@ -39,7 +39,6 @@ windows = { version = "0.62", features = [
     "Win32_System_Variant"
 ]}
 memoffset = "0.9"
-rand = "0.10"
 once_cell = "1.21"
 num-traits = "0.2"
 num-derive = "0.5"
