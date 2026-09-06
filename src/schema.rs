@@ -15,6 +15,12 @@ use once_cell::sync::OnceCell;
 pub struct Schema {
     te_info: TraceEventInfo,
     cached_properties: OnceCell<Result<Vec<Property>, PropertyError>>,
+    /// Extracting a name requires a UTF-16 -> String conversion of the raw
+    /// `TRACE_EVENT_INFO` buffer; these values are constant per schema, and
+    /// the serde path requests them for every serialized event
+    cached_provider_name: OnceCell<String>,
+    cached_task_name: OnceCell<String>,
+    cached_opcode_name: OnceCell<String>,
 }
 
 impl Schema {
@@ -22,6 +28,9 @@ impl Schema {
         Schema {
             te_info,
             cached_properties: OnceCell::new(),
+            cached_provider_name: OnceCell::new(),
+            cached_task_name: OnceCell::new(),
+            cached_opcode_name: OnceCell::new(),
         }
     }
 
@@ -55,7 +64,13 @@ impl Schema {
     /// };
     /// ```
     pub fn provider_name(&self) -> String {
-        self.te_info.provider_name()
+        self.provider_name_cached().to_owned()
+    }
+
+    /// Cached variant of [`Schema::provider_name`], avoiding a copy
+    pub(crate) fn provider_name_cached(&self) -> &str {
+        self.cached_provider_name
+            .get_or_init(|| self.te_info.provider_name())
     }
 
     /// Use the `task_name` function to obtain the Task name from the `TRACE_EVENT_INFO`
@@ -71,7 +86,13 @@ impl Schema {
     /// };
     /// ```
     pub fn task_name(&self) -> String {
-        self.te_info.task_name()
+        self.task_name_cached().to_owned()
+    }
+
+    /// Cached variant of [`Schema::task_name`], avoiding a copy
+    pub(crate) fn task_name_cached(&self) -> &str {
+        self.cached_task_name
+            .get_or_init(|| self.te_info.task_name())
     }
 
     /// Use the `opcode_name` function to obtain the Opcode name from the `TRACE_EVENT_INFO`
@@ -87,7 +108,13 @@ impl Schema {
     /// };
     /// ```
     pub fn opcode_name(&self) -> String {
-        self.te_info.opcode_name()
+        self.opcode_name_cached().to_owned()
+    }
+
+    /// Cached variant of [`Schema::opcode_name`], avoiding a copy
+    pub(crate) fn opcode_name_cached(&self) -> &str {
+        self.cached_opcode_name
+            .get_or_init(|| self.te_info.opcode_name())
     }
 
     /// Parses the list of properties of the wrapped `TRACE_EVENT_INFO`

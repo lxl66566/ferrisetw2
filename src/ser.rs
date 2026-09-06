@@ -153,10 +153,12 @@ impl serde::ser::Serialize for SchemaSer<'_> {
     where
         S: serde::Serializer,
     {
+        // The cached getters avoid re-decoding the UTF-16 names of the
+        // TRACE_EVENT_INFO on every serialized event
         let mut state = serializer.serialize_struct("Schema", 3)?;
-        state.serialize_field("Provider", &self.schema.provider_name().trim())?;
-        state.serialize_field("Opcode", &self.schema.opcode_name().trim())?;
-        state.serialize_field("Task", &self.schema.task_name().trim())?;
+        state.serialize_field("Provider", &self.schema.provider_name_cached().trim())?;
+        state.serialize_field("Opcode", &self.schema.opcode_name_cached().trim())?;
+        state.serialize_field("Task", &self.schema.task_name_cached().trim())?;
         state.end()
     }
 }
