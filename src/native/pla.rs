@@ -10,7 +10,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::{
     core::GUID,
     Win32::System::{
-        Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
+        Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
         Performance::{ITraceDataProviderCollection, TraceDataProviderCollection},
     },
 };
@@ -34,9 +34,23 @@ pub(crate) type ProvidersComResult<T> = Result<T, PlaError>;
 
 // https://github.com/microsoft/krabsetw/blob/31679cf84bc85360158672699f2f68a821e8a6d0/krabs/krabs/provider.hpp#L487
 pub(crate) unsafe fn get_provider_guid(name: &str) -> ProvidersComResult<GUID> {
-    // FIXME: This is not paired with a call to CoUninitialize, so this will leak COM resources.
+    // CoUninitialize must be called once for every successful CoInitializeEx
+    // (including when it returns S_FALSE, i.e. COM was already initialized on
+    // this thread), so pair the calls even on the early-return paths
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
 
+    let result = find_provider_guid(name);
+
+    unsafe { CoUninitialize() };
+    result
+}
+
+/// Enumerates the registered providers to find `name`'s GUID.
+///
+/// # Safety
+///
+/// COM must be initialized on the current thread (see [`get_provider_guid`])
+unsafe fn find_provider_guid(name: &str) -> ProvidersComResult<GUID> {
     let all_providers: ITraceDataProviderCollection =
         unsafe { CoCreateInstance(&TraceDataProviderCollection, None, CLSCTX_ALL) }?;
 
@@ -90,6 +104,20 @@ mod test {
             let err = get_provider_guid("Not-A-Real-Provider");
 
             assert_eq!(err, Err(PlaError::NotFound));
+        }
+    }
+
+    #[test]
+    pub fn test_repeated_lookups_keep_com_balanced() {
+        // Both the success and the early-return paths must balance
+        // CoInitializeEx with CoUninitialize, or COM resources leak away
+        unsafe {
+            for _ in 0..3 {
+                get_provider_guid("Not-A-Real-Provider").unwrap_err();
+            }
+            for _ in 0..3 {
+                get_provider_guid("Microsoft-Windows-Kernel-Process").unwrap();
+            }
         }
     }
 }
