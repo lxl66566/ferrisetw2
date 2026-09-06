@@ -1,13 +1,13 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::System::Diagnostics::Etw;
 
+use crate::EtwCallback;
 use crate::native::etw_types::event_record::EventRecord;
 use crate::provider::Provider;
 use crate::schema_locator::SchemaLocator;
 use crate::trace::RealTimeTraceTrait;
-use crate::EtwCallback;
 
 /// Data used by callbacks when the trace is running
 // NOTE: this structure is accessed in an unsafe block in a separate thread (see the `trace_callback_thunk` function)

@@ -11,22 +11,20 @@ use std::sync::Mutex;
 use once_cell::sync::Lazy;
 
 use widestring::U16CStr;
-use windows::core::GUID;
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::Foundation::ERROR_CTX_CLOSE_PENDING;
 use windows::Win32::Foundation::ERROR_SUCCESS;
 use windows::Win32::Foundation::FILETIME;
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_WMI_INSTANCE_NOT_FOUND};
 use windows::Win32::System::Diagnostics::Etw;
-use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_TRACE_CONTROL_QUERY,
-};
-use windows::Win32::System::Diagnostics::Etw::{EVENT_TRACE_CONTROL_STOP, TRACE_QUERY_INFO_CLASS};
+use windows::Win32::System::Diagnostics::Etw::EVENT_CONTROL_CODE_ENABLE_PROVIDER;
+use windows::Win32::System::Diagnostics::Etw::TRACE_QUERY_INFO_CLASS;
+use windows::core::GUID;
+use windows::core::PCWSTR;
 
 use super::etw_types::*;
 use crate::native::etw_types::event_record::EventRecord;
-use crate::provider::event_filter::EventFilterDescriptor;
 use crate::provider::Provider;
+use crate::provider::event_filter::EventFilterDescriptor;
 use crate::trace::callback_data::CallbackData;
 use crate::trace::{RealTimeTraceTrait, TraceProperties};
 
@@ -145,11 +143,7 @@ fn filter_invalid_trace_handles(h: TraceHandle) -> Option<TraceHandle> {
 fn filter_invalid_control_handle(h: ControlHandle) -> Option<ControlHandle> {
     // The control handle is 0 if the handle is not valid.
     // (https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew)
-    if h.Value == 0 {
-        None
-    } else {
-        Some(h)
-    }
+    if h.Value == 0 { None } else { Some(h) }
 }
 
 /// Create a new session.

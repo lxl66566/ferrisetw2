@@ -1,9 +1,9 @@
 use core::ffi::c_void;
 use std::str::Utf8Error;
-use windows::core::PSTR;
-use windows::Win32::Foundation::{LocalFree, HLOCAL};
+use windows::Win32::Foundation::{HLOCAL, LocalFree};
 use windows::Win32::Security::Authorization::ConvertSidToStringSidA;
 use windows::Win32::Security::PSID;
+use windows::core::PSTR;
 
 /// SDDL native error
 #[derive(Debug)]

@@ -8,20 +8,20 @@
 //! needed by using the functions exposed by the modules at the crate level
 #![allow(clippy::bad_bit_mask)]
 
-use crate::provider::event_filter::EventFilterDescriptor;
 use crate::provider::TraceFlags;
+use crate::provider::event_filter::EventFilterDescriptor;
 use crate::trace::callback_data::CallbackData;
 use crate::trace::{RealTimeTraceTrait, TraceProperties};
-use std::ffi::{c_void, OsString};
+use std::ffi::{OsString, c_void};
 use std::fmt::Formatter;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
 use widestring::{U16CStr, U16CString};
-use windows::core::GUID;
-use windows::core::PWSTR;
 use windows::Win32::System::Diagnostics::Etw;
 use windows::Win32::System::Diagnostics::Etw::EVENT_FILTER_DESCRIPTOR;
+use windows::core::GUID;
+use windows::core::PWSTR;
 
 pub(crate) mod event_record;
 pub(crate) mod extended_data;
@@ -82,6 +82,7 @@ bitflags! {
     /// Logging Mode constants that applies to a general trace
     ///
     /// This is a subset of <https://learn.microsoft.com/en-us/windows/win32/etw/logging-mode-constants>
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct LoggingMode: u32 {
         // Commented values only apply to DumpFileLoggingMod
 
@@ -119,6 +120,7 @@ bitflags! {
     /// This is a subset of <https://learn.microsoft.com/en-us/windows/win32/etw/logging-mode-constants>
     ///
     /// See the documentation of [`crate::trace::TraceBuilder::set_etl_dump_file`] for more info.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub struct DumpFileLoggingMode: u32 {
         // Commented values only apply to LoggingMode
 

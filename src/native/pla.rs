@@ -5,14 +5,14 @@
 //!
 //! This module shouldn't be accessed directly. Modules from the the crate level provide a safe API to interact
 //! with the crate
-use windows::core::BSTR;
 use windows::Win32::System::Variant::VARIANT;
+use windows::core::BSTR;
 use windows::{
-    core::GUID,
     Win32::System::{
-        Com::{CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED},
+        Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
         Performance::{ITraceDataProviderCollection, TraceDataProviderCollection},
     },
+    core::GUID,
 };
 
 /// Pla native module errors
@@ -39,7 +39,8 @@ pub(crate) unsafe fn get_provider_guid(name: &str) -> ProvidersComResult<GUID> {
     // this thread), so pair the calls even on the early-return paths
     unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok()?;
 
-    let result = find_provider_guid(name);
+    // Safety: COM has been initialized above on this thread
+    let result = unsafe { find_provider_guid(name) };
 
     unsafe { CoUninitialize() };
     result
@@ -54,23 +55,25 @@ unsafe fn find_provider_guid(name: &str) -> ProvidersComResult<GUID> {
     let all_providers: ITraceDataProviderCollection =
         unsafe { CoCreateInstance(&TraceDataProviderCollection, None, CLSCTX_ALL) }?;
 
-    all_providers.GetTraceDataProviders(&BSTR::default())?;
+    // Every unsafe call below is a COM invocation relying on the
+    // COM initialization invariant documented under # Safety
+    unsafe { all_providers.GetTraceDataProviders(&BSTR::default()) }?;
 
-    let count = all_providers.Count()? as u32;
+    let count = unsafe { all_providers.Count() }? as u32;
 
     let mut index = 0u32;
     let mut guid = None;
 
     while index < count as u32 {
-        let provider = all_providers.get_Item(&VARIANT::from(index))?;
-        let raw_name = provider.DisplayName()?;
+        let provider = unsafe { all_providers.get_Item(&VARIANT::from(index)) }?;
+        let raw_name = unsafe { provider.DisplayName() }?;
 
         let prov_name = String::from_utf16_lossy(&raw_name);
 
         index += 1;
         // check if matches, if it does get guid and break
         if prov_name.eq(name) {
-            guid = Some(provider.Guid()?);
+            guid = Some(unsafe { provider.Guid() }?);
             break;
         }
     }

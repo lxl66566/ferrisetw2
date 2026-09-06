@@ -1,8 +1,8 @@
+use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::*;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::*;
-use ferrisetw::EventRecord;
 use std::time::Duration;
 
 fn main() {

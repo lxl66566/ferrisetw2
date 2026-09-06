@@ -1,10 +1,10 @@
 //! Safe wrappers over the EVENT_RECORD type
 
-use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::EVENT_RECORD;
+use windows::core::GUID;
 
-use crate::native::etw_types::extended_data::EventHeaderExtendedDataItem;
 use crate::native::ExtendedDataItem;
+use crate::native::etw_types::extended_data::EventHeaderExtendedDataItem;
 
 use super::EVENT_HEADER_FLAG_32_BIT_HEADER;
 
@@ -22,7 +22,8 @@ impl EventRecord {
     ///    Thus, the sub-function will not be able to leak this reference.
     pub(crate) unsafe fn from_ptr<'a>(p: *const EVENT_RECORD) -> Option<&'a Self> {
         let s = p as *const Self;
-        s.as_ref()
+        // Safety: caller-guaranteed, see # Safety above
+        unsafe { s.as_ref() }
     }
 
     /// Get the wrapped `EVENT_RECORD` (usually to feed Windows API functions)

@@ -12,9 +12,9 @@ use crate::native::etw_types::event_record::EventRecord;
 use crate::native::tdh_types::Property;
 use crate::traits::*;
 use widestring::U16CStr;
-use windows::core::GUID;
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 use windows::Win32::System::Diagnostics::Etw::{self, EVENT_PROPERTY_INFO, TRACE_EVENT_INFO};
+use windows::core::GUID;
 
 /// Tdh native module errors
 #[derive(Debug)]
@@ -179,7 +179,7 @@ impl TraceEventInfo {
         extract_utf16_string!(self, OpcodeNameOffset);
     }
 
-    pub fn properties(&self) -> PropertyIterator {
+    pub fn properties(&self) -> PropertyIterator<'_> {
         PropertyIterator::new(self)
     }
 }

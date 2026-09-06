@@ -207,7 +207,9 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     }
                     TdhInType::InTypeUnicodeString => {
                         let Some(nul_index) = remaining_user_buffer
-                            .chunks_exact(2)
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
                             .position(|bytes| bytes[0] == 0 && bytes[1] == 0)
                         else {
                             return Err(ParserError::PropertyError(
@@ -282,7 +284,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     None => {
                         return Err(ParserError::PropertyError(
                             "Invalid buffer bounds".to_owned(),
-                        ))
+                        ));
                     }
                     Some(s) => s,
                 };
@@ -292,7 +294,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 None => {
                     return Err(ParserError::PropertyError(
                         "Property length out of buffer bounds".to_owned(),
-                    ))
+                    ));
                 }
                 Some(s) => s,
             };
@@ -480,8 +482,8 @@ impl private::TryParse<String> for Parser<'_, '_> {
                     // the buffer into a new Vec<u16> and use that as the source for the slice
                     // until we can find a better solution.
                     let mut aligned_buffer = Vec::with_capacity(prop_slice.buffer.len() / 2);
-                    for chunk in prop_slice.buffer.chunks_exact(2) {
-                        let part = u16::from_ne_bytes([chunk[0], chunk[1]]);
+                    for chunk in prop_slice.buffer.as_chunks::<2>().0 {
+                        let part = u16::from_ne_bytes(*chunk);
                         aligned_buffer.push(part);
                     }
 

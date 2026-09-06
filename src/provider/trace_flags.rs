@@ -3,6 +3,7 @@ use bitflags::bitflags;
 use windows::Win32::System::Diagnostics::Etw;
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
     pub struct TraceFlags: u32 {
         const EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0 =  Etw::EVENT_ENABLE_PROPERTY_IGNORE_KEYWORD_0;
         const EVENT_ENABLE_PROPERTY_PROVIDER_GROUP =    Etw::EVENT_ENABLE_PROPERTY_PROVIDER_GROUP;

@@ -1,11 +1,17 @@
+//! Saving a trace to an ETL file, then processing it back
+//!
+//! Starting an ETW trace session requires administrator privileges,
+//! so this test is gated behind the `admin_tests` feature.
+#![cfg(feature = "admin_tests")]
+
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ferrisetw::EventRecord;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::DumpFileParams;
 use ferrisetw::trace::TraceTrait;
-use ferrisetw::EventRecord;
 use ferrisetw::{FileTrace, UserTrace};
 
 #[test]

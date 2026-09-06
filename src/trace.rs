@@ -8,22 +8,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use widestring::U16CString;
-use windows::core::GUID;
 use windows::Win32::Foundation::ERROR_WMI_INSTANCE_NOT_FOUND;
 use windows::Win32::System::Diagnostics::Etw;
+use windows::core::GUID;
 
 use self::private::{PrivateRealTimeTraceTrait, PrivateTraceTrait};
 
-use crate::native::etw_types::{EventTraceProperties, SubscriptionSource};
-use crate::native::evntrace::{
-    close_trace, control_trace, control_trace_by_name, enable_provider, open_trace, process_trace,
-    start_trace, ControlHandle, TraceHandle,
-};
-use crate::native::{version_helper, EvntraceNativeError};
-use crate::provider::Provider;
-use crate::utils;
 use crate::EventRecord;
 use crate::SchemaLocator;
+use crate::native::etw_types::{EventTraceProperties, SubscriptionSource};
+use crate::native::evntrace::{
+    ControlHandle, TraceHandle, close_trace, control_trace, control_trace_by_name, enable_provider,
+    open_trace, process_trace, start_trace,
+};
+use crate::native::{EvntraceNativeError, version_helper};
+use crate::provider::Provider;
+use crate::utils;
 
 pub use crate::native::etw_types::DumpFileLoggingMode;
 pub use crate::native::etw_types::LoggingMode;
@@ -41,7 +41,7 @@ const EVENT_TRACE_SYSTEM_LOGGER_MODE: u32 = 0x02000000;
 #[derive(Debug)]
 pub enum TraceError {
     InvalidTraceName,
-    /// Wrapper over an internal [EvntraceNativeError](crate::native::EvntraceNativeError)
+    /// Wrapper over an internal [`EvntraceNativeError`]
     EtwNativeError(crate::native::EvntraceNativeError),
 }
 

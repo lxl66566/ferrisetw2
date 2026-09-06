@@ -1,12 +1,16 @@
-#![cfg(feature = "serde")]
+//! Serialization benchmarks against a set of system providers
+//!
+//! These run real ETW traces, which require administrator privileges,
+//! so they are gated behind the `admin_tests` feature on top of `serde`.
+#![cfg(all(feature = "serde", feature = "admin_tests"))]
 
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{stop_trace_by_name, TraceBuilder, TraceTrait, UserTrace};
+use ferrisetw::trace::{TraceBuilder, TraceTrait, UserTrace, stop_trace_by_name};
 use ferrisetw::{EventRecord, EventSerializer, EventSerializerOptions};
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 static BENCHMARK_PROVIDERS: &[&str] = &[

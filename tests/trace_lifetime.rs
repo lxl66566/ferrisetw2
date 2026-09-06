@@ -1,13 +1,17 @@
 //! Test that traces are started and stopped as expected
+//!
+//! Starting an ETW trace session requires administrator privileges,
+//! so this test is gated behind the `admin_tests` feature.
+#![cfg(feature = "admin_tests")]
 
 use std::process::Command;
 
+use ferrisetw::EventRecord;
 use ferrisetw::provider::Provider;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::RealTimeTraceTrait;
 use ferrisetw::trace::TraceTrait;
 use ferrisetw::trace::UserTrace;
-use ferrisetw::EventRecord;
 
 #[derive(Clone, Copy, Debug)]
 enum HowToProcess {
@@ -21,9 +25,12 @@ fn trace_lifetime() {
     // List of (names to request, ASCII part to look for)
     const NAME_EXAMPLES: [(&str, &str); 4] = [
         ("simple-trace-name", "simple-trace-name"),
-        ("998877",            "998877"),
-        ("My Ütf-8 tråce",    "tf-8 tr"),
-        ("My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS). My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS).", "that has quite a"),
+        ("998877", "998877"),
+        ("My Ütf-8 tråce", "tf-8 tr"),
+        (
+            "My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS). My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS).",
+            "that has quite a",
+        ),
     ];
 
     const HOW_TO_PROCESS: [HowToProcess; 3] = [

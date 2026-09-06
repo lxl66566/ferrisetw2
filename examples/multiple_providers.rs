@@ -1,8 +1,8 @@
+use ferrisetw::EventRecord;
 use ferrisetw::parser::{Parser, Pointer};
 use ferrisetw::provider::*;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::*;
-use ferrisetw::EventRecord;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
@@ -12,9 +12,9 @@ fn registry_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
             if record.event_id() == 7 {
                 let parser = Parser::create(record, &schema);
                 let pid = record.process_id();
-                let key_obj: Pointer = parser.try_parse("KeyObject").unwrap_or(Pointer::default());
+                let key_obj: Pointer = parser.try_parse("KeyObject").unwrap_or_default();
                 let status: u32 = parser.try_parse("Status").unwrap_or(0);
-                let value_name: String = parser.try_parse("ValueName").unwrap_or(String::from(""));
+                let value_name: String = parser.try_parse("ValueName").unwrap_or_default();
                 println!(
                     "QueryValueKey (PID: {}) -> KeyObj: {:#08x}, ValueName: {}, Status: {:#04X}",
                     pid, key_obj, value_name, status,

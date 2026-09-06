@@ -1,17 +1,20 @@
-//! Use the DNS provider to test a few things regarding user traces
+//! Use a kernel provider to test a few things regarding kernel traces
+//!
+//! Starting an ETW trace session requires administrator privileges,
+//! so this test is gated behind the `admin_tests` feature.
+#![cfg(feature = "admin_tests")]
 
 use std::time::Duration;
 
+use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::kernel_providers;
 use ferrisetw::provider::{EventFilter, Provider};
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::KernelTrace;
-use ferrisetw::EventRecord;
 
+use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_FLAGS, LoadLibraryExW};
 use windows::core::HSTRING;
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::LibraryLoader::{LoadLibraryExW, LOAD_LIBRARY_FLAGS};
 
 mod utils;
 use utils::{Status, StatusNotifier, TestKind};
@@ -84,10 +87,10 @@ fn has_seen_dll_load(record: &EventRecord, parser: &Parser) -> bool {
     if record.process_id() == std::process::id() {
         let filename = parser.try_parse::<String>("FileName");
         println!("   this one's for us: {:?}", filename);
-        if let Ok(filename) = filename {
-            if filename.ends_with(TEST_LIBRARY_NAME) {
-                return true;
-            }
+        if let Ok(filename) = filename
+            && filename.ends_with(TEST_LIBRARY_NAME)
+        {
+            return true;
         }
     }
 

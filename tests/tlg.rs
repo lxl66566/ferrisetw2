@@ -12,8 +12,8 @@ use utils::{Status, TestKind};
 
 const EVENT1_COUNT: u32 = 1;
 const EVENT2_COUNT: u32 = 5;
-const TEST_STRING_VALUE: &'static str = "TestString";
-const PROVIDER_NAME: &'static str = "ferrisETW.TraceLoggingTest";
+const TEST_STRING_VALUE: &str = "TestString";
+const PROVIDER_NAME: &str = "ferrisETW.TraceLoggingTest";
 
 tlg::define_provider!(FERRIS_PROVIDER, "ferrisETW.TraceLoggingTest");
 
@@ -85,7 +85,7 @@ fn tlg_multiple_events(provider_guid: GUID) {
                     // assert!(data.is_ok());
                     // assert_eq!(data, TEST_STRING_VALUE);
 
-                    event1_count = event1_count + 1;
+                    event1_count += 1;
                 } else if record.event_name() == "Event2" {
                     println!(
                         "Received Event2({}) from ferrisETW.TraceLoggingTest",
@@ -100,7 +100,7 @@ fn tlg_multiple_events(provider_guid: GUID) {
                     assert!(data.is_ok());
                     assert_eq!(data.unwrap(), event2_count);
 
-                    event2_count = event2_count + 1;
+                    event2_count += 1;
                 }
 
                 if event1_count == EVENT1_COUNT && event2_count == EVENT2_COUNT {

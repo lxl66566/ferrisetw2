@@ -28,12 +28,12 @@
 //! ```
 #![cfg(feature = "serde")]
 
+use crate::GUID;
 use crate::native::etw_types::event_record::EventRecord;
 use crate::native::tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType};
 use crate::native::time::{FileTime, SystemTime};
 use crate::parser::Parser;
 use crate::schema::Schema;
-use crate::GUID;
 use serde::ser::{SerializeMap, SerializeStruct};
 use std::net::IpAddr;
 use windows::Win32::System::Diagnostics::Etw::{EVENT_DESCRIPTOR, EVENT_HEADER};

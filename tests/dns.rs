@@ -1,15 +1,19 @@
 //! Use the DNS provider to test a few things regarding user traces
+//!
+//! Creating an ETW trace session requires administrator privileges,
+//! so this whole test is gated behind the `admin_tests` feature.
+#![cfg(feature = "admin_tests")]
 
 use std::process::Command;
 use std::time::Duration;
 
+use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::{EventFilter, Provider};
 use ferrisetw::schema::Schema;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::TraceTrait;
 use ferrisetw::trace::UserTrace;
-use ferrisetw::EventRecord;
 
 mod utils;
 use utils::{Status, TestKind};

@@ -5,13 +5,13 @@
 //!
 //! At the moment the only option available is to check if the actual System Version is greater than
 //! Win8, is the only check we need for the crate to work as expected
-use windows::core::HRESULT;
-use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Foundation::ERROR_OLD_WIN_VERSION;
-use windows::Win32::System::SystemInformation::{VerSetConditionMask, VerifyVersionInfoA};
+use windows::Win32::Foundation::GetLastError;
 use windows::Win32::System::SystemInformation::{
     OSVERSIONINFOEXA, VER_MAJORVERSION, VER_MINORVERSION, VER_SERVICEPACKMAJOR,
 };
+use windows::Win32::System::SystemInformation::{VerSetConditionMask, VerifyVersionInfoA};
+use windows::core::HRESULT;
 
 /// Version Helper native error
 #[derive(Debug)]

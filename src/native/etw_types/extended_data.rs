@@ -1,17 +1,17 @@
 //! A module to handle Extended Data from ETW traces
 
 use std::{convert::TryInto, ffi::CStr, mem};
-use windows::core::GUID;
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID, EVENT_EXTENDED_ITEM_TS_ID,
 };
 use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_HEADER_EXTENDED_DATA_ITEM, EVENT_HEADER_EXT_TYPE_EVENT_KEY,
-    EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, EVENT_HEADER_EXT_TYPE_INSTANCE_INFO,
-    EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
-    EVENT_HEADER_EXT_TYPE_SID, EVENT_HEADER_EXT_TYPE_STACK_TRACE32,
-    EVENT_HEADER_EXT_TYPE_STACK_TRACE64, EVENT_HEADER_EXT_TYPE_TS_ID,
+    EVENT_HEADER_EXT_TYPE_EVENT_KEY, EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
+    EVENT_HEADER_EXT_TYPE_INSTANCE_INFO, EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY,
+    EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, EVENT_HEADER_EXT_TYPE_SID,
+    EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+    EVENT_HEADER_EXT_TYPE_TS_ID, EVENT_HEADER_EXTENDED_DATA_ITEM,
 };
+use windows::core::GUID;
 
 // These types are returned by our public API. Let's use their re-exported versions
 use crate::native::{
@@ -56,9 +56,7 @@ where
         first_address: *const Address,
         item_size: usize,
     ) -> StackTraceItem<Address> {
-        let array_size_in_bytes = item_size
-            .checked_sub(OFFSET_OF_ADDRESS_IN_ITEM)
-            .unwrap_or(0);
+        let array_size_in_bytes = item_size.saturating_sub(OFFSET_OF_ADDRESS_IN_ITEM);
         let array_size = array_size_in_bytes / core::mem::size_of::<Address>();
         let addresses = unsafe { std::slice::from_raw_parts(first_address, array_size) }.into();
         StackTraceItem {
@@ -74,7 +72,7 @@ pub struct EventHeaderExtendedDataItem(EVENT_HEADER_EXTENDED_DATA_ITEM);
 
 /// An owned security identifier (SID), deep-copied from an event's extended data.
 ///
-/// The windows [`SID`] type is only the fixed-size prefix of a variable-length
+/// The windows `SID` type is only the fixed-size prefix of a variable-length
 /// structure (its `SubAuthority` array holds a single element): copying it by
 /// value would lose every sub-authority but the first, and any later use
 /// (e.g. by `ConvertSidToStringSid`) would read out of bounds. `Sid` owns the
@@ -276,16 +274,14 @@ impl EventHeaderExtendedDataItem {
         // The size is a u16: read both of its bytes (it used to be read as a
         // single byte, so any metadata >= 256 bytes got a bogus size)
         // Safety: reading the 2 first bytes of the extended data item
-        let size = (data_ptr as *const u16)
-            .read_unaligned()
-            .min(self.0.DataSize);
-        data_ptr = data_ptr.add(mem::size_of::<u16>());
+        let size = unsafe { (data_ptr as *const u16).read_unaligned() }.min(self.0.DataSize);
+        data_ptr = unsafe { data_ptr.add(mem::size_of::<u16>()) };
 
         let mut n = 0;
         while n < size {
             // Read until you hit a byte with high bit unset.
-            let tag = data_ptr.read_unaligned();
-            data_ptr = data_ptr.add(TAGS_SIZE);
+            let tag = unsafe { data_ptr.read_unaligned() };
+            data_ptr = unsafe { data_ptr.add(TAGS_SIZE) };
 
             if tag & 0b1000_0000 == 0 {
                 break;
@@ -301,7 +297,11 @@ impl EventHeaderExtendedDataItem {
         }
 
         Some(String::from(
-            CStr::from_ptr(data_ptr as *const _).to_string_lossy(),
+            unsafe {
+                // Safety: same extended data item, the name follows the tags
+                CStr::from_ptr(data_ptr as *const _)
+            }
+            .to_string_lossy(),
         ))
     }
 }

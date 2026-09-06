@@ -2,13 +2,13 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use ferrisetw::EventRecord;
 use ferrisetw::parser::Parser;
 use ferrisetw::provider::Provider;
 use ferrisetw::provider::TraceFlags;
 use ferrisetw::schema::Schema;
 use ferrisetw::schema_locator::SchemaLocator;
 use ferrisetw::trace::UserTrace;
-use ferrisetw::EventRecord;
 
 static N_EVENTS: AtomicU32 = AtomicU32::new(0);
 
