@@ -197,8 +197,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 match in_type {
                     TdhInType::InTypeAnsiString => {
                         // The property spans up to and including the NUL terminator
-                        let Some(nul_index) = remaining_user_buffer.iter().position(|b| *b == 0)
-                        else {
+                        let Some(nul_index) = memchr::memchr(0, remaining_user_buffer) else {
                             return Err(ParserError::PropertyError(
                                 "AnsiString property is not null-terminated".into(),
                             ));
@@ -206,11 +205,12 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                         return Ok(nul_index + 1);
                     }
                     TdhInType::InTypeUnicodeString => {
+                        // The property spans up to and including the NUL terminator
                         let Some(nul_index) = remaining_user_buffer
                             .as_chunks::<2>()
                             .0
                             .iter()
-                            .position(|bytes| bytes[0] == 0 && bytes[1] == 0)
+                            .position(|bytes| u16::from_ne_bytes(*bytes) == 0)
                         else {
                             return Err(ParserError::PropertyError(
                                 "UnicodeString property is not null-terminated".into(),
