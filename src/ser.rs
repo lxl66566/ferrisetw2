@@ -125,13 +125,57 @@ impl serde::ser::Serialize for EventSerializer<'_> {
 
 struct GUIDExt(GUID);
 
+/// Formats a GUID as its `Debug` representation (uppercase, hyphenated),
+/// into a stack buffer instead of a heap-allocated String
+fn guid_to_ascii_upper(guid: &GUID) -> [u8; 36] {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let bytes: [u8; 16] = [
+        (guid.data1 >> 24) as u8,
+        (guid.data1 >> 16) as u8,
+        (guid.data1 >> 8) as u8,
+        guid.data1 as u8,
+        (guid.data2 >> 8) as u8,
+        guid.data2 as u8,
+        (guid.data3 >> 8) as u8,
+        guid.data3 as u8,
+        guid.data4[0],
+        guid.data4[1],
+        guid.data4[2],
+        guid.data4[3],
+        guid.data4[4],
+        guid.data4[5],
+        guid.data4[6],
+        guid.data4[7],
+    ];
+    // hex groups of 4-2-2-2-6 bytes, separated by hyphens (8-4-4-4-12 digits)
+    let mut out = [0u8; 36];
+    let mut byte_index = 0;
+    let mut out_index = 0;
+    for (group, &len) in [4usize, 2, 2, 2, 6].iter().enumerate() {
+        if group > 0 {
+            out[out_index] = b'-';
+            out_index += 1;
+        }
+        for &b in &bytes[byte_index..byte_index + len] {
+            out[out_index] = HEX[(b >> 4) as usize];
+            out[out_index + 1] = HEX[(b & 0xf) as usize];
+            out_index += 2;
+        }
+        byte_index += len;
+    }
+    out
+}
+
 impl serde::ser::Serialize for GUIDExt {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::ser::Serializer,
     {
         if serializer.is_human_readable() {
-            return serializer.serialize_str(&format!("{:?}", self.0));
+            let ascii = guid_to_ascii_upper(&self.0);
+            // All written bytes are ASCII (hex digits and hyphens), so this cannot fail
+            let s = std::str::from_utf8(&ascii).expect("GUID buffer is valid UTF-8");
+            return serializer.serialize_str(s);
         }
 
         (self.0.data1, self.0.data2, self.0.data3, self.0.data4).serialize(serializer)
@@ -304,6 +348,23 @@ struct PropSer(PropHandler);
 mod test {
     use super::*;
     use crate::native::tdh_types::PropertyLength;
+
+    #[test]
+    fn guid_serializes_like_its_debug_representation() {
+        // GUIDExt used to format!("{:?}") on every serialization: the manual
+        // hex writer must stay byte-for-byte identical
+        for guid in [
+            GUID::zeroed(),
+            GUID::from_u128(0x56781234_abcd_4609_0102_030405060708),
+            GUID::from_u128(u128::MAX),
+            GUID::from_u128(0x00000000_0000_0000_0000_0000000000ff),
+        ] {
+            assert_eq!(
+                serde_json::to_value(GUIDExt(guid)).unwrap(),
+                serde_json::Value::String(format!("{guid:?}"))
+            );
+        }
+    }
 
     #[test]
     fn header_serializes_flags_and_event_property_separately() {
