@@ -543,9 +543,11 @@ impl private::TryParse<GUID> for Parser<'_, '_> {
                 }
 
                 Ok(GUID {
+                    // win:GUID is laid out in memory just like the GUID struct:
+                    // Data1/2/3 are all little-endian
                     data1: u32::from_ne_bytes(prop_slice.buffer[0..4].try_into()?),
                     data2: u16::from_ne_bytes(prop_slice.buffer[4..6].try_into()?),
-                    data3: u16::from_be_bytes(prop_slice.buffer[6..8].try_into()?),
+                    data3: u16::from_ne_bytes(prop_slice.buffer[6..8].try_into()?),
                     data4: prop_slice.buffer[8..].try_into()?,
                 })
             }
@@ -705,3 +707,119 @@ impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
 
 // TODO: Implement SocketAddress
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests built on synthetic `TRACE_EVENT_INFO` / `EVENT_RECORD` buffers,
+    //! so that the parsing logic can be exercised without a real ETW session
+    //! (which would require administrator rights).
+
+    use super::*;
+    use crate::native::tdh::TraceEventInfo;
+    use crate::schema::Schema;
+    use std::alloc::Layout;
+    use windows::Win32::System::Diagnostics::Etw;
+
+    /// Description of one synthetic property of a schema
+    struct PropSpec {
+        name: &'static str,
+        in_type: TdhInType,
+        /// `EVENT_PROPERTY_INFO.Flags` (e.g. `PropertyParamCount`)
+        flags: u32,
+        /// Value written to the count/countPropertyIndex union member
+        count: u16,
+        /// Value written to the length/lengthPropertyIndex union member
+        length: u16,
+    }
+
+    impl PropSpec {
+        const fn new(name: &'static str, in_type: TdhInType, length: u16) -> Self {
+            Self {
+                name,
+                in_type,
+                flags: 0,
+                count: 0,
+                length,
+            }
+        }
+    }
+
+    /// Builds a `Schema` wrapping a synthetic `TRACE_EVENT_INFO` describing `props`
+    fn synthetic_schema(props: &[PropSpec]) -> Schema {
+        let size_of_info = std::mem::size_of::<Etw::TRACE_EVENT_INFO>();
+        let size_of_prop = std::mem::size_of::<Etw::EVENT_PROPERTY_INFO>();
+        let mut names_size = 0;
+        for prop in props {
+            names_size += (prop.name.len() + 1) * 2; // utf-16 code units, NUL included
+        }
+        let size = size_of_info + props.len().saturating_sub(1) * size_of_prop + names_size;
+        let layout = Layout::from_size_align(size, std::mem::align_of::<Etw::TRACE_EVENT_INFO>())
+            .expect("valid layout");
+
+        let buffer = unsafe {
+            // Safety: size is non-zero (at least the size of a TRACE_EVENT_INFO fixed part)
+            let buffer = std::alloc::alloc(layout);
+            std::ptr::write_bytes(buffer, 0, size);
+            buffer
+        };
+
+        let names_offset = (size - names_size) as u32;
+        unsafe {
+            let info = buffer.cast::<Etw::TRACE_EVENT_INFO>();
+            (*info).PropertyCount = props.len() as u32;
+
+            let mut name_offset = names_offset;
+            for (index, spec) in props.iter().enumerate() {
+                let prop = (*info).EventPropertyInfoArray.as_mut_ptr().add(index);
+                (*prop).Flags = Etw::PROPERTY_FLAGS(spec.flags as i32);
+                (*prop).NameOffset = name_offset;
+                (*prop).Anonymous1.nonStructType.InType = spec.in_type as u16;
+                (*prop).Anonymous2.count = spec.count;
+                (*prop).Anonymous3.length = spec.length;
+
+                let name = buffer.cast::<u16>().add(name_offset as usize / 2);
+                for (i, unit) in spec
+                    .name
+                    .encode_utf16()
+                    .chain(std::iter::once(0))
+                    .enumerate()
+                {
+                    name.add(i).write_unaligned(unit);
+                }
+                name_offset += ((spec.name.len() + 1) * 2) as u32;
+            }
+        }
+
+        Schema::new(TraceEventInfo::from_raw_parts(buffer, layout))
+    }
+
+    /// Builds an `EventRecord` whose user data is `user_data`
+    fn synthetic_record(user_data: &[u8]) -> EventRecord {
+        let mut record = Etw::EVENT_RECORD::default();
+        record.UserData = user_data.as_ptr() as *mut _;
+        record.UserDataLength = user_data.len() as u16;
+        EventRecord(record)
+    }
+
+    #[test]
+    fn parse_guid_property() {
+        // A GUID as laid out in ETW user data: Data1/2/3 are all little-endian
+        let user_data: [u8; 16] = [
+            0x34, 0x12, 0x78, 0x56, // data1: 0x56781234
+            0xcd, 0xab, // data2: 0xabcd
+            0x09, 0x46, // data3: 0x4609
+            1, 2, 3, 4, 5, 6, 7, 8, // data4
+        ];
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new("guid_prop", TdhInType::InTypeGuid, 16)]);
+        let parser = Parser::create(&record, &schema);
+
+        let guid = parser
+            .try_parse::<GUID>("guid_prop")
+            .expect("GUID should parse");
+        assert_eq!(
+            guid,
+            GUID::from_u128(0x56781234_abcd_4609_0102_030405060708)
+        );
+    }
+}

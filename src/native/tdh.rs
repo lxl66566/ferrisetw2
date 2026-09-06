@@ -74,6 +74,18 @@ macro_rules! extract_utf16_string {
 }
 
 impl TraceEventInfo {
+    /// Build an instance that takes ownership of a manually-crafted
+    /// `TRACE_EVENT_INFO` buffer (used by unit tests, so that no real ETW
+    /// event is needed to exercise the parsing code)
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(data: *mut u8, layout: Layout) -> Self {
+        Self {
+            data,
+            mut_data_for_dealloc: data,
+            layout,
+        }
+    }
+
     /// Create a instance of `Self` suitable for the given event
     pub fn build_from_event(event: &EventRecord) -> TdhNativeResult<Self> {
         let mut buffer_size = 0;
