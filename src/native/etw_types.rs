@@ -231,10 +231,12 @@ impl EventTraceProperties {
         etw_trace_properties.BufferSize = trace_properties.buffer_size;
         etw_trace_properties.MinimumBuffers = trace_properties.min_buffer;
         etw_trace_properties.MaximumBuffers = trace_properties.max_buffer;
-        etw_trace_properties.FlushTimer = trace_properties
-            .flush_timer
-            .as_secs()
-            .clamp(1, u32::MAX as u64) as u32; // See https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties
+        etw_trace_properties.FlushTimer = {
+            // Round to the closest second (FlushTimer is expressed in seconds),
+            // and clamp to at least 1s as documented on TraceProperties
+            let rounded_seconds = (trace_properties.flush_timer.as_millis() + 500) / 1_000;
+            rounded_seconds.clamp(1, u32::MAX as u128) as u32
+        };
 
         if !trace_properties.log_file_mode.is_empty() {
             etw_trace_properties.LogFileMode = trace_properties.log_file_mode.bits();
@@ -464,3 +466,36 @@ impl From<Etw::DECODING_SOURCE> for DecodingSource {
 // Safe cast (EVENT_HEADER_FLAG_32_BIT_HEADER = 32)
 #[doc(hidden)]
 pub const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = Etw::EVENT_HEADER_FLAG_32_BIT_HEADER as u16;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::{TraceProperties, UserTrace};
+    use std::time::Duration;
+
+    fn computed_flush_timer(flush_timer: Duration) -> u32 {
+        let properties = TraceProperties {
+            flush_timer,
+            ..Default::default()
+        };
+        let etw_properties = EventTraceProperties::new::<UserTrace>(
+            &U16CString::from_str("test-trace").unwrap(),
+            None,
+            &properties,
+            Etw::EVENT_TRACE_FLAG::default(),
+        );
+        etw_properties.etw_trace_properties.FlushTimer
+    }
+
+    #[test]
+    fn flush_timer_is_rounded_to_the_closest_second() {
+        // 0 is translated as 1 second, as documented on TraceProperties
+        assert_eq!(computed_flush_timer(Duration::from_secs(0)), 1);
+        assert_eq!(computed_flush_timer(Duration::from_millis(400)), 1); // 0.4s
+        assert_eq!(computed_flush_timer(Duration::from_secs(1)), 1);
+        assert_eq!(computed_flush_timer(Duration::from_millis(1200)), 1); // 1.2s
+        assert_eq!(computed_flush_timer(Duration::from_millis(1500)), 2); // 1.5s, rounds up
+        assert_eq!(computed_flush_timer(Duration::from_secs(2)), 2);
+        assert_eq!(computed_flush_timer(Duration::from_millis(2500)), 3); // 2.5s, rounds up
+    }
+}
