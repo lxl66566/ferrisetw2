@@ -121,20 +121,22 @@ impl Property {
             };
 
             let count = if flags.contains(PropertyFlags::PROPERTY_PARAM_COUNT) {
-                unsafe {
-                    if property.Anonymous2.countPropertyIndex > 1 {
-                        Some(PropertyCount::Index(property.Anonymous2.countPropertyIndex))
-                    } else {
-                        None
-                    }
-                }
+                // The union holds countPropertyIndex: the 0-based index of the
+                // property that contains the number of elements. It can
+                // legitimately be 0 or 1, so always treat it as an index.
+                Some(PropertyCount::Index(unsafe {
+                    property.Anonymous2.countPropertyIndex
+                }))
             } else {
-                unsafe {
-                    if property.Anonymous2.count > 1 {
-                        Some(PropertyCount::Count(property.Anonymous2.count))
-                    } else {
-                        None
-                    }
+                // The union holds the literal number of elements. Note that TDH
+                // reports 1 for properties that are not defined as an array
+                // (see EVENT_PROPERTY_INFO's documentation), so only count > 1
+                // unambiguously means "array"
+                let count = unsafe { property.Anonymous2.count };
+                if count > 1 {
+                    Some(PropertyCount::Count(count))
+                } else {
+                    None
                 }
             };
 
@@ -261,5 +263,63 @@ impl From<Etw::PROPERTY_FLAGS> for PropertyFlags {
         let flags: i32 = val.0;
         // Should be a safe cast
         PropertyFlags::from_bits_truncate(flags as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Builds an EVENT_PROPERTY_INFO describing a UInt32 of 4 bytes, with the
+    /// given value in the count/countPropertyIndex union member
+    fn property_with_count_union(flags: u32, count_union: u16) -> Result<Property, PropertyError> {
+        let mut info = Etw::EVENT_PROPERTY_INFO::default();
+        unsafe {
+            info.Flags = Etw::PROPERTY_FLAGS(flags as i32);
+            info.Anonymous1.nonStructType.InType = TdhInType::InTypeUInt32 as u16;
+            info.Anonymous2.count = count_union;
+            info.Anonymous3.length = 4;
+        }
+        Property::new("prop".into(), &info)
+    }
+
+    #[test]
+    fn param_count_with_small_property_index_is_an_array() {
+        // With PROPERTY_PARAM_COUNT, the union holds the 0-based index of the
+        // property holding the element count: 0 and 1 are valid indexes and
+        // used to be mistaken for scalars, breaking dynamic arrays
+        for index in [0u16, 1, 2] {
+            let property =
+                property_with_count_union(PropertyFlags::PROPERTY_PARAM_COUNT.bits(), index)
+                    .unwrap();
+            match property.info {
+                PropertyInfo::Array {
+                    count: PropertyCount::Index(i),
+                    ..
+                } => assert_eq!(i, index),
+                other => panic!("expected a dynamic array, got {:?}", other),
+            }
+        }
+    }
+
+    #[test]
+    fn literal_count_classifies_arrays_and_scalars() {
+        // TDH reports 1 for properties that are NOT arrays
+        // (EVENT_PROPERTY_INFO.count documentation), so count == 1 cannot be
+        // distinguished from an actual 1-element array
+        let scalar = property_with_count_union(0, 1).unwrap();
+        assert!(matches!(scalar.info, PropertyInfo::Value { .. }));
+
+        let zero = property_with_count_union(0, 0).unwrap();
+        assert!(matches!(zero.info, PropertyInfo::Value { .. }));
+
+        let array = property_with_count_union(0, 3).unwrap();
+        assert!(matches!(
+            array.info,
+            PropertyInfo::Array {
+                count: PropertyCount::Count(3),
+                ..
+            }
+        ));
     }
 }
