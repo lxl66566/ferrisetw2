@@ -180,7 +180,7 @@ impl serde::ser::Serialize for HeaderSer<'_> {
         state.serialize_field("Size", &self.header.Size)?;
         state.serialize_field("HeaderType", &self.header.HeaderType)?;
         state.serialize_field("Flags", &self.header.Flags)?;
-        state.serialize_field("EventProperty", &self.header.Flags)?;
+        state.serialize_field("EventProperty", &self.header.EventProperty)?;
         state.serialize_field("ThreadId", &self.header.ThreadId)?;
         state.serialize_field("ProcessId", &self.header.ProcessId)?;
         state.serialize_field("TimeStamp", &FileTime::from_quad(self.header.TimeStamp))?;
@@ -302,6 +302,17 @@ struct PropSer(PropHandler);
 mod test {
     use super::*;
     use crate::native::tdh_types::PropertyLength;
+
+    #[test]
+    fn header_serializes_flags_and_event_property_separately() {
+        let mut header = EVENT_HEADER::default();
+        header.Flags = 0x0001;
+        header.EventProperty = 0x0002;
+
+        let value = serde_json::to_value(HeaderSer::new(&header)).unwrap();
+        assert_eq!(value["Flags"], serde_json::json!(0x0001));
+        assert_eq!(value["EventProperty"], serde_json::json!(0x0002));
+    }
 
     fn value_info(in_type: TdhInType) -> PropertyInfo {
         PropertyInfo::Value {
