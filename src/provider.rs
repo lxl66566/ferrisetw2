@@ -6,7 +6,7 @@ use crate::native::pla;
 use crate::schema_locator::SchemaLocator;
 
 use std::convert::TryFrom;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use windows::core::GUID;
 
 pub(crate) mod event_filter;
@@ -48,7 +48,10 @@ pub struct Provider {
     /// Provider filters
     filters: Vec<EventFilter>,
     /// Callbacks that will receive events from this Provider
-    callbacks: Arc<RwLock<Vec<crate::EtwCallback>>>,
+    // A Mutex rather than a RwLock: callbacks are FnMut, so every event takes
+    // an exclusive lock anyway, and an uncontended Mutex is cheaper than a
+    // RwLock write lock
+    callbacks: Arc<Mutex<Vec<crate::EtwCallback>>>,
 }
 
 /// A Builder for a `Provider`
@@ -62,7 +65,7 @@ pub struct ProviderBuilder {
     trace_flags: TraceFlags,
     kernel_flags: u32,
     filters: Vec<EventFilter>,
-    callbacks: Arc<RwLock<Vec<crate::EtwCallback>>>,
+    callbacks: Arc<Mutex<Vec<crate::EtwCallback>>>,
 }
 
 impl std::fmt::Debug for ProviderBuilder {
@@ -75,7 +78,7 @@ impl std::fmt::Debug for ProviderBuilder {
             .field("trace_flags", &self.trace_flags)
             .field("kernel_flags", &self.kernel_flags)
             .field("filters", &self.filters)
-            .field("n_callbacks", &self.callbacks.read().unwrap().len())
+            .field("n_callbacks", &self.callbacks.lock().unwrap().len())
             .finish()
     }
 }
@@ -124,7 +127,7 @@ impl Provider {
             trace_flags: TraceFlags::empty(),
             kernel_flags: 0,
             filters: Vec::new(),
-            callbacks: Arc::new(RwLock::new(Vec::new())),
+            callbacks: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -181,7 +184,7 @@ impl Provider {
     }
 
     pub(crate) fn on_event(&self, record: &EventRecord, locator: &SchemaLocator) {
-        if let Ok(mut callbacks) = self.callbacks.write() {
+        if let Ok(mut callbacks) = self.callbacks.lock() {
             callbacks.iter_mut().for_each(|cb| cb(record, locator))
         };
     }
@@ -197,7 +200,7 @@ impl std::fmt::Debug for Provider {
             .field("trace_flags", &self.trace_flags)
             .field("kernel_flags", &self.kernel_flags)
             .field("filters", &self.filters)
-            .field("callbacks", &self.callbacks.read().unwrap().len())
+            .field("callbacks", &self.callbacks.lock().unwrap().len())
             .finish()
     }
 }
@@ -283,7 +286,7 @@ impl ProviderBuilder {
     where
         T: FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static,
     {
-        if let Ok(mut callbacks) = self.callbacks.write() {
+        if let Ok(mut callbacks) = self.callbacks.lock() {
             callbacks.push(Box::new(callback));
         }
         self

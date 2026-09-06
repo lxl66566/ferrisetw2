@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rustc_hash::FxHashMap;
@@ -38,7 +38,9 @@ pub struct CallbackDataFromFile {
     events_handled: AtomicUsize,
     schema_locator: SchemaLocator,
     /// This trace is reading from an ETL file, and has a single callback
-    callback: RwLock<EtwCallback>,
+    // A Mutex rather than a RwLock: the callback is FnMut, so every event
+    // takes an exclusive lock anyway
+    callback: Mutex<EtwCallback>,
 }
 
 impl CallbackData {
@@ -110,7 +112,7 @@ impl CallbackDataFromFile {
         Self {
             events_handled: AtomicUsize::new(0),
             schema_locator: SchemaLocator::new(),
-            callback: RwLock::new(callback),
+            callback: Mutex::new(callback),
         }
     }
 
@@ -121,7 +123,7 @@ impl CallbackDataFromFile {
 
     pub fn on_event(&self, record: &EventRecord) {
         self.events_handled.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut cb) = self.callback.write() {
+        if let Ok(mut cb) = self.callback.lock() {
             cb(record, &self.schema_locator);
         }
     }
