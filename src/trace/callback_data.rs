@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use rustc_hash::FxHashMap;
 use windows::Win32::System::Diagnostics::Etw;
 
 use crate::EtwCallback;
@@ -8,6 +10,7 @@ use crate::native::etw_types::event_record::EventRecord;
 use crate::provider::Provider;
 use crate::schema_locator::SchemaLocator;
 use crate::trace::RealTimeTraceTrait;
+use windows::core::GUID;
 
 /// Data used by callbacks when the trace is running
 // NOTE: this structure is accessed in an unsafe block in a separate thread (see the `trace_callback_thunk` function)
@@ -25,6 +28,9 @@ pub struct RealTimeCallbackData {
     schema_locator: SchemaLocator,
     /// List of Providers associated with the Trace. This also owns the callback closures and their state
     providers: Vec<Provider>,
+    /// Maps a provider GUID to the indices of `providers` with that GUID, so
+    /// that `on_event` does not linearly scan every provider on each event
+    providers_by_guid: FxHashMap<GUID, Vec<usize>>,
 }
 
 pub struct CallbackDataFromFile {
@@ -57,6 +63,7 @@ impl std::default::Default for RealTimeCallbackData {
             events_handled: AtomicUsize::new(0),
             schema_locator: SchemaLocator::new(),
             providers: Vec::new(),
+            providers_by_guid: HashMap::default(),
         }
     }
 }
@@ -67,6 +74,10 @@ impl RealTimeCallbackData {
     }
 
     pub fn add_provider(&mut self, provider: Provider) {
+        self.providers_by_guid
+            .entry(provider.guid())
+            .or_default()
+            .push(self.providers.len());
         self.providers.push(provider)
     }
 
@@ -86,9 +97,9 @@ impl RealTimeCallbackData {
     pub fn on_event(&self, record: &EventRecord) {
         self.events_handled.fetch_add(1, Ordering::Relaxed);
 
-        for prov in &self.providers {
-            if prov.guid() == record.provider_id() {
-                prov.on_event(record, &self.schema_locator);
+        if let Some(providers) = self.providers_by_guid.get(&record.provider_id()) {
+            for &prov_idx in providers {
+                self.providers[prov_idx].on_event(record, &self.schema_locator);
             }
         }
     }
