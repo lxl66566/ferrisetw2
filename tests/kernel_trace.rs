@@ -36,8 +36,9 @@ fn kernel_trace_tests() {
 
 fn create_simple_kernel_trace_trace(notifier: StatusNotifier) -> KernelTrace {
     println!("We are process {}", std::process::id());
-    let our_process_only = EventFilter::ByPids(vec![std::process::id() as _]);
+    let our_process_only = EventFilter::ByPids(vec![std::process::id()]);
 
+    let our_process_id = std::process::id();
     let kernel_provider = Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)
         .add_filter(our_process_only)
         .add_callback(
@@ -45,11 +46,11 @@ fn create_simple_kernel_trace_trace(notifier: StatusNotifier) -> KernelTrace {
                 let schema = schema_locator.event_schema(record).unwrap();
                 let parser = Parser::create(record, &schema);
 
-                // By-PID filters are not working (yet?)
-                // See See https://github.com/n4r1b/ferrisetw/issues/51
-                // if has_seen_other_pid(record) {
-                //     notifier2.notify_failure();
-                // }
+                // The ByPids filter must prevent events from other processes
+                // from reaching this callback (this used to be broken because
+                // PIDs were truncated to 16 bits, see issue #51)
+                assert_eq!(record.process_id(), our_process_id);
+
                 if has_seen_dll_load(record, &parser) {
                     notifier.notify_success();
                 }

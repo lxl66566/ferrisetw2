@@ -14,12 +14,9 @@ use windows::Win32::System::Diagnostics::Etw::{
 /// Some filters are not effective prior to Windows 8.1 ([source](https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor#remarks))
 #[derive(Debug)]
 pub enum EventFilter {
-    /// Filter by PID.
+    /// Filter by PID (a process identifier, i.e. a 32bit DWORD).
     /// This is only effective on kernel mode logger session.
-    /// TODO: even for `KernelTrace`, this does not seem to work.
-    ///       Maybe there's a distinction between "a trace run in kernel-mode" and a "System trace"?
-    ///       See <https://github.com/n4r1b/ferrisetw/issues/51>
-    ByPids(Vec<u16>),
+    ByPids(Vec<u32>),
     /// Filter by ETW Event ID.
     ByEventIds(Vec<u16>),
     // TODO: see https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
@@ -117,34 +114,33 @@ impl EventFilterDescriptor {
     /// Build a new instance that will filter by PIDs.
     ///
     /// Returns an `Err` in case the allocation failed, or if either zero or too many filter items were given
-    pub fn try_new_by_process_ids(pids: &[u16]) -> Result<Self, Box<dyn Error>> {
+    pub fn try_new_by_process_ids(pids: &[u32]) -> Result<Self, Box<dyn Error>> {
         if pids.len() > MAX_EVENT_FILTER_PID_COUNT as usize {
             // See https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
             return Err("Too many PIDs are filtered".into());
         }
 
-        let data_size = std::mem::size_of_val(pids); // PIDs are WORD, i.e. 16bits
+        // PIDs are DWORDs (see EVENT_FILTER_DESCRIPTOR documentation: Ptr points
+        // to "an array of process IDs", i.e. an array of DWORD)
+        let data_size = std::mem::size_of_val(pids);
 
-        let mut s = Self::try_new::<u16>(data_size)?;
+        // try_new rejects data_size == 0, so pids cannot be empty here
+        let mut s = Self::try_new::<u32>(data_size)?;
         s.ty = EVENT_FILTER_TYPE_PID;
 
-        if pids.is_empty() {
-            s.data = std::ptr::null_mut();
-        } else {
-            let mut p = s.data.cast::<u16>();
-            for pid in pids {
-                unsafe {
-                    *p = *pid;
-                };
+        let mut p = s.data.cast::<u32>();
+        for pid in pids {
+            unsafe {
+                *p = *pid;
+            };
 
-                p = unsafe {
-                    // Safety:
-                    // * both the starting and resulting pointer are within the same allocated object
-                    //   (except for the very last item, but that will not be written to)
-                    // * thus, the offset is smaller than an isize
-                    p.offset(1)
-                };
-            }
+            p = unsafe {
+                // Safety:
+                // * both the starting and resulting pointer are within the same allocated object
+                //   (except for the very last item, but that will not be written to)
+                // * thus, the offset is smaller than an isize
+                p.offset(1)
+            };
         }
 
         Ok(s)
@@ -173,5 +169,56 @@ impl Drop for EventFilterDescriptor {
             // * layout is th one that was used to allocate that block of memory
             std::alloc::dealloc(self.data, self.layout);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pid_filter_uses_dword_sized_pids() {
+        let pids = [0x1234_5678u32, 0x09ab_cdef];
+        let filter = EventFilterDescriptor::try_new_by_process_ids(&pids)
+            .expect("allocation should succeed");
+
+        let native = filter.as_event_filter_descriptor();
+        assert_eq!(native.Type, EVENT_FILTER_TYPE_PID);
+        // PIDs are DWORDs (4 bytes each), not WORDs
+        assert_eq!(
+            native.Size,
+            (pids.len() * std::mem::size_of::<u32>()) as u32
+        );
+
+        // Safety: `native.Ptr`/`native.Size` describe the allocation owned by `filter`,
+        // which outlives this read
+        let data =
+            unsafe { std::slice::from_raw_parts(native.Ptr as *const u8, native.Size as usize) };
+        assert_eq!(&data[..4], 0x1234_5678u32.to_ne_bytes());
+        assert_eq!(&data[4..], 0x09ab_cdefu32.to_ne_bytes());
+    }
+
+    #[test]
+    fn pid_filter_rejects_empty_and_too_many_pids() {
+        assert!(EventFilterDescriptor::try_new_by_process_ids(&[]).is_err());
+
+        let too_many = vec![1u32; MAX_EVENT_FILTER_PID_COUNT as usize + 1];
+        assert!(EventFilterDescriptor::try_new_by_process_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn event_ids_filter_has_correct_type_and_size() {
+        let filter = EventFilterDescriptor::try_new_by_event_ids(&[18, 42])
+            .expect("allocation should succeed");
+
+        let native = filter.as_event_filter_descriptor();
+        assert_eq!(native.Type, EVENT_FILTER_TYPE_EVENT_ID);
+        // sizeof(EVENT_FILTER_EVENT_ID) already includes one event id,
+        // each additional one adds a u16
+        let header_size = std::mem::size_of::<EVENT_FILTER_EVENT_ID>();
+        assert_eq!(
+            native.Size as usize,
+            header_size + 1 * std::mem::size_of::<u16>()
+        );
     }
 }
