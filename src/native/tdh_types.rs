@@ -273,13 +273,13 @@ mod tests {
     /// Builds an EVENT_PROPERTY_INFO describing a UInt32 of 4 bytes, with the
     /// given value in the count/countPropertyIndex union member
     fn property_with_count_union(flags: u32, count_union: u16) -> Result<Property, PropertyError> {
-        let mut info = Etw::EVENT_PROPERTY_INFO::default();
-        unsafe {
-            info.Flags = Etw::PROPERTY_FLAGS(flags as i32);
-            info.Anonymous1.nonStructType.InType = TdhInType::InTypeUInt32 as u16;
-            info.Anonymous2.count = count_union;
-            info.Anonymous3.length = 4;
-        }
+        let mut info = Etw::EVENT_PROPERTY_INFO {
+            Flags: Etw::PROPERTY_FLAGS(flags as i32),
+            ..Default::default()
+        };
+        info.Anonymous1.nonStructType.InType = TdhInType::InTypeUInt32 as u16;
+        info.Anonymous2.count = count_union;
+        info.Anonymous3.length = 4;
         Property::new("prop".into(), &info)
     }
 

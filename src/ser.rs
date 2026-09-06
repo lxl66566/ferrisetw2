@@ -305,9 +305,11 @@ mod test {
 
     #[test]
     fn header_serializes_flags_and_event_property_separately() {
-        let mut header = EVENT_HEADER::default();
-        header.Flags = 0x0001;
-        header.EventProperty = 0x0002;
+        let header = EVENT_HEADER {
+            Flags: 0x0001,
+            EventProperty: 0x0002,
+            ..Default::default()
+        };
 
         let value = serde_json::to_value(HeaderSer::new(&header)).unwrap();
         assert_eq!(value["Flags"], serde_json::json!(0x0001));

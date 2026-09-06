@@ -119,16 +119,42 @@ impl SystemTime {
         let read_u16 = |offset: usize| -> u16 {
             u16::from_ne_bytes(slice[offset..offset + 2].try_into().unwrap())
         };
-        let mut system_time = SYSTEMTIME::default();
-        system_time.wYear = read_u16(0);
-        system_time.wMonth = read_u16(2);
-        system_time.wDayOfWeek = read_u16(4);
-        system_time.wDay = read_u16(6);
-        system_time.wHour = read_u16(8);
-        system_time.wMinute = read_u16(10);
-        system_time.wSecond = read_u16(12);
-        system_time.wMilliseconds = read_u16(14);
-        SystemTime(system_time)
+        SystemTime(SYSTEMTIME {
+            wYear: read_u16(0),
+            wMonth: read_u16(2),
+            wDayOfWeek: read_u16(4),
+            wDay: read_u16(6),
+            wHour: read_u16(8),
+            wMinute: read_u16(10),
+            wSecond: read_u16(12),
+            wMilliseconds: read_u16(14),
+        })
+    }
+}
+
+#[cfg(feature = "time_rs")]
+impl From<SystemTime> for time::OffsetDateTime {
+    fn from(file_time: SystemTime) -> Self {
+        file_time.as_date_time()
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::ser::Serialize for SystemTime {
+    #[cfg(feature = "time_rs")]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_date_time().serialize(serializer)
+    }
+
+    #[cfg(not(feature = "time_rs"))]
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_unix_timestamp().serialize(serializer)
     }
 }
 
@@ -179,31 +205,5 @@ mod tests {
         ];
         let system_time = SystemTime::from_slice(&bytes);
         assert_eq!(system_time.as_unix_timestamp(), 1_767_323_045_006);
-    }
-}
-
-#[cfg(feature = "time_rs")]
-impl From<SystemTime> for time::OffsetDateTime {
-    fn from(file_time: SystemTime) -> Self {
-        file_time.as_date_time()
-    }
-}
-
-#[cfg(feature = "serde")]
-impl serde::ser::Serialize for SystemTime {
-    #[cfg(feature = "time_rs")]
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.as_date_time().serialize(serializer)
-    }
-
-    #[cfg(not(feature = "time_rs"))]
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.as_unix_timestamp().serialize(serializer)
     }
 }

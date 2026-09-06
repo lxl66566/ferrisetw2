@@ -226,7 +226,7 @@ mod tests {
         let header_size = std::mem::size_of::<EVENT_FILTER_EVENT_ID>();
         assert_eq!(
             native.Size as usize,
-            header_size + 1 * std::mem::size_of::<u16>()
+            header_size + std::mem::size_of::<u16>()
         );
     }
 }

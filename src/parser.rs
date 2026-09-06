@@ -802,10 +802,11 @@ mod tests {
 
     /// Builds an `EventRecord` whose user data is `user_data`
     fn synthetic_record(user_data: &[u8]) -> EventRecord {
-        let mut record = Etw::EVENT_RECORD::default();
-        record.UserData = user_data.as_ptr() as *mut _;
-        record.UserDataLength = user_data.len() as u16;
-        EventRecord(record)
+        EventRecord(Etw::EVENT_RECORD {
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: user_data.len() as u16,
+            ..Default::default()
+        })
     }
 
     #[test]
