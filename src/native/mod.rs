@@ -19,6 +19,7 @@ pub use tdh::TdhNativeError;
 // These are returned by some of our public APIs
 pub use etw_types::extended_data::EventHeaderExtendedDataItem;
 pub use etw_types::extended_data::ExtendedDataItem;
+pub use etw_types::extended_data::Sid;
 pub use etw_types::DecodingSource;
 pub use evntrace::ControlHandle;
 pub use evntrace::TraceHandle;

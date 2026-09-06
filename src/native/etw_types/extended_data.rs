@@ -1,8 +1,7 @@
 //! A module to handle Extended Data from ETW traces
 
-use std::{ffi::CStr, mem};
+use std::{convert::TryInto, ffi::CStr, mem};
 use windows::core::GUID;
-use windows::Win32::Security::SID;
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID, EVENT_EXTENDED_ITEM_TS_ID,
 };
@@ -73,6 +72,67 @@ where
 #[repr(transparent)]
 pub struct EventHeaderExtendedDataItem(EVENT_HEADER_EXTENDED_DATA_ITEM);
 
+/// An owned security identifier (SID), deep-copied from an event's extended data.
+///
+/// The windows [`SID`] type is only the fixed-size prefix of a variable-length
+/// structure (its `SubAuthority` array holds a single element): copying it by
+/// value would lose every sub-authority but the first, and any later use
+/// (e.g. by `ConvertSidToStringSid`) would read out of bounds. `Sid` owns the
+/// full buffer instead.
+#[derive(Debug)]
+pub struct Sid {
+    /// `Revision`, `SubAuthorityCount`, `IdentifierAuthority`, then one
+    /// little-endian `u32` per sub-authority
+    data: Vec<u8>,
+}
+
+impl Sid {
+    /// Deep-copies the full variable-length SID starting at `data_ptr`.
+    ///
+    /// The copy is bounded by `data_size`, the extended data item's declared size.
+    ///
+    /// # Safety
+    ///
+    /// `min(8 + 4 * SubAuthorityCount, data_size)` bytes must be readable from `data_ptr`
+    unsafe fn from_raw(data_ptr: *const u8, data_size: u16) -> Self {
+        // Safety: the SID prefix (2 first bytes) is part of the readable data
+        let sub_authority_count = unsafe { data_ptr.add(1).read_unaligned() };
+        let full_len = 8 + 4 * sub_authority_count as usize;
+        let len = full_len.min(data_size as usize);
+        // Safety: forwarded to the caller (at most data_size bytes are read)
+        let bytes = unsafe { std::slice::from_raw_parts(data_ptr, len) };
+        Self {
+            data: bytes.to_vec(),
+        }
+    }
+
+    /// The raw SID bytes, as expected by SID-related Win32 APIs taking a `PSID`
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// Number of sub-authorities (e.g. 5 for `S-1-5-21-...-...-...-RID`)
+    pub fn sub_authority_count(&self) -> u8 {
+        self.data[1]
+    }
+
+    /// The `index`-th sub-authority (0-based), little-endian
+    pub fn sub_authority(&self, index: usize) -> Option<u32> {
+        if index >= self.sub_authority_count() as usize {
+            return None;
+        }
+        let start = 8 + 4 * index;
+        Some(u32::from_le_bytes(
+            self.data[start..start + 4].try_into().unwrap(),
+        ))
+    }
+
+    /// Renders this SID into its string form (e.g. `S-1-5-18`)
+    pub fn to_sddl_string(&self) -> Result<String, crate::native::SddlNativeError> {
+        crate::native::sddl::convert_sid_to_string(self.data.as_ptr() as *const _)
+    }
+}
+
 /// A safe representation of an ExtendedDataItem
 ///
 /// See <https://docs.microsoft.com/en-us/windows/win32/api/relogger/ns-relogger-event_header_extended_data_item>
@@ -83,7 +143,7 @@ pub enum ExtendedDataItem {
     /// Related activity identifier
     RelatedActivityId(GUID),
     /// Security identifier (SID) of the user that logged the event
-    Sid(SID),
+    Sid(Sid),
     /// Terminal session identifier
     TsId(u32),
     InstanceInfo(EVENT_EXTENDED_ITEM_INSTANCE),
@@ -128,10 +188,9 @@ impl EventHeaderExtendedDataItem {
                 ExtendedDataItem::RelatedActivityId(unsafe { *data_ptr }.RelatedActivityId)
             }
 
-            EVENT_HEADER_EXT_TYPE_SID => {
-                let data_ptr = data_ptr as *const SID;
-                ExtendedDataItem::Sid(unsafe { *data_ptr })
-            }
+            EVENT_HEADER_EXT_TYPE_SID => ExtendedDataItem::Sid(unsafe {
+                Sid::from_raw(data_ptr as *const u8, self.0.DataSize)
+            }),
 
             EVENT_HEADER_EXT_TYPE_TS_ID => {
                 let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_TS_ID;
@@ -251,5 +310,66 @@ impl EventHeaderExtendedDataItem {
         Some(String::from(
             CStr::from_ptr(data_ptr as *const _).to_string_lossy(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::System::Diagnostics::Etw::EVENT_HEADER_EXT_TYPE_SID;
+
+    /// Builds S-1-5-21-100-200-300-999: 5 sub-authorities (i.e. longer than the
+    /// single one windows' `SID` prefix type can hold)
+    fn sample_sid_bytes() -> Vec<u8> {
+        let mut bytes = vec![1u8, 5, 0, 0, 0, 0, 0, 5]; // revision, count, identifier authority
+        for sub_authority in [21u32, 100, 200, 300, 999] {
+            bytes.extend_from_slice(&sub_authority.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn sid_extended_data_is_deep_copied() {
+        let sid_bytes = sample_sid_bytes();
+
+        let item = EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: EVENT_HEADER_EXT_TYPE_SID as u16,
+            DataSize: sid_bytes.len() as u16,
+            DataPtr: sid_bytes.as_ptr() as u64,
+            ..Default::default()
+        };
+
+        let ExtendedDataItem::Sid(sid) = EventHeaderExtendedDataItem(item).to_extended_data_item()
+        else {
+            panic!("expected the Sid variant");
+        };
+
+        assert_eq!(sid.as_bytes(), &sid_bytes[..]);
+        assert_eq!(sid.sub_authority_count(), 5);
+        assert_eq!(sid.sub_authority(0), Some(21));
+        assert_eq!(sid.sub_authority(4), Some(999));
+        assert_eq!(sid.sub_authority(5), None);
+        assert_eq!(sid.to_sddl_string().unwrap(), "S-1-5-21-100-200-300-999");
+    }
+
+    #[test]
+    fn sid_copy_survives_the_original_buffer() {
+        let mut sid_bytes = sample_sid_bytes();
+
+        let item = EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: EVENT_HEADER_EXT_TYPE_SID as u16,
+            DataSize: sid_bytes.len() as u16,
+            DataPtr: sid_bytes.as_ptr() as u64,
+            ..Default::default()
+        };
+        let ExtendedDataItem::Sid(sid) = EventHeaderExtendedDataItem(item).to_extended_data_item()
+        else {
+            panic!("expected the Sid variant");
+        };
+
+        // The (old) shallow copy only captured the fixed-size prefix: trashing
+        // the original buffer must not affect our deep copy
+        sid_bytes.iter_mut().for_each(|byte| *byte = 0xaa);
+        assert_eq!(sid.sub_authority(4), Some(999));
     }
 }
