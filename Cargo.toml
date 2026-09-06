@@ -33,6 +33,8 @@ windows = { version = "0.62", features = [
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
+    # No direct use anymore (SystemTimeToFileTime is gone), but
+    # EVENT_TRACE_LOGFILEW does not compile without this feature
     "Win32_System_Time",
     "Win32_System_Variant"
 ]}

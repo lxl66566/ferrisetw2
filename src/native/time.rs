@@ -1,9 +1,6 @@
 //! Implements wrappers for various Windows time structures.
 use std::convert::TryInto;
-use windows::Win32::{
-    Foundation::{FILETIME, SYSTEMTIME},
-    System::Time::SystemTimeToFileTime,
-};
+use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 
 /// Wrapper for [FILETIME](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
 #[derive(Copy, Clone, Default)]
@@ -13,6 +10,19 @@ pub struct FileTime(pub(crate) FILETIME);
 const SECONDS_BETWEEN_1601_AND_1970: i64 = 11_644_473_600;
 const NS_IN_SECOND: i64 = 1_000_000_000;
 const MS_IN_SECOND: i64 = 1_000;
+
+/// Days between 1970-01-01 and the given (proleptic Gregorian) civil date
+///
+/// Howard Hinnant's `days_from_civil` algorithm
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = y - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (m + 9) % 12; // [0, 11], March-aligned
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
 
 impl FileTime {
     /// Converts to a unix timestamp with millisecond granularity.
@@ -89,22 +99,34 @@ impl serde::ser::Serialize for FileTime {
 pub struct SystemTime(pub(crate) SYSTEMTIME);
 
 impl SystemTime {
+    /// Converts to the FILETIME quad value (100ns intervals since 1601-01-01)
+    ///
+    /// Pure arithmetic instead of an FFI call to `SystemTimeToFileTime`:
+    /// this conversion runs for every converted SystemTime property, and the
+    /// FFI call also had its failure silently ignored
+    fn as_filetime_quad(&self) -> i64 {
+        let st = &self.0;
+        let days = days_from_civil(
+            i64::from(st.wYear),
+            i64::from(st.wMonth),
+            i64::from(st.wDay),
+        );
+        let secs_since_1601 = (days + SECONDS_BETWEEN_1601_AND_1970 / 86_400) * 86_400
+            + i64::from(st.wHour) * 3_600
+            + i64::from(st.wMinute) * 60
+            + i64::from(st.wSecond);
+        secs_since_1601 * 10_000_000 + i64::from(st.wMilliseconds) * 10_000
+    }
+
     /// Converts to a unix timestamp with millisecond granularity.
     pub fn as_unix_timestamp(&self) -> i64 {
-        let file_time: FileTime = Default::default();
-        unsafe {
-            _ = SystemTimeToFileTime(&self.0 as *const _, &file_time.0 as *const _ as *mut _);
-        }
-        file_time.as_unix_timestamp()
+        self.as_filetime_quad() / 10_000 - (SECONDS_BETWEEN_1601_AND_1970 * MS_IN_SECOND)
     }
 
     /// Converts to a unix timestamp with nanosecond granularity.
     pub fn as_unix_timestamp_nanos(&self) -> i128 {
-        let file_time: FileTime = Default::default();
-        unsafe {
-            _ = SystemTimeToFileTime(&self.0 as *const _, &file_time.0 as *const _ as *mut _);
-        }
-        file_time.as_unix_timestamp_nanos()
+        self.as_filetime_quad() as i128 * 100
+            - (SECONDS_BETWEEN_1601_AND_1970 as i128 * NS_IN_SECOND as i128)
     }
 
     /// Converts to OffsetDateTime
@@ -193,6 +215,54 @@ mod tests {
         assert_eq!(system_time.0.wMinute, 4);
         assert_eq!(system_time.0.wSecond, 5);
         assert_eq!(system_time.0.wMilliseconds, 6);
+    }
+
+    #[test]
+    fn system_time_unix_timestamp_matches_known_dates() {
+        // The conversion no longer goes through the SystemTimeToFileTime FFI
+        // call: check it against independently known unix timestamps
+        let to_unix_ms = |y, mo, d, h, mi, s, ms| {
+            SystemTime(SYSTEMTIME {
+                wYear: y,
+                wMonth: mo,
+                wDayOfWeek: 0, // redundant field, ignored by the conversion
+                wDay: d,
+                wHour: h,
+                wMinute: mi,
+                wSecond: s,
+                wMilliseconds: ms,
+            })
+            .as_unix_timestamp()
+        };
+
+        assert_eq!(to_unix_ms(1970, 1, 1, 0, 0, 0, 0), 0);
+        // Leap day
+        assert_eq!(to_unix_ms(2024, 2, 29, 12, 0, 0, 0), 1_709_208_000_000);
+        // Start of the FILETIME epoch
+        assert_eq!(to_unix_ms(1601, 1, 1, 0, 0, 0, 0), -11_644_473_600_000);
+        // Non-leap century year (1900-02-28 is followed by 1900-03-01)
+        assert_eq!(to_unix_ms(1900, 3, 1, 0, 0, 0, 0), -2_203_891_200_000);
+    }
+
+    #[test]
+    fn system_time_unix_timestamp_nanos_matches_known_dates() {
+        let st = SystemTime(SYSTEMTIME {
+            wYear: 1970,
+            wMonth: 1,
+            wDay: 1,
+            wSecond: 1,
+            wMilliseconds: 1,
+            ..Default::default()
+        });
+        assert_eq!(st.as_unix_timestamp_nanos(), 1_001_000_000);
+
+        let st = SystemTime(SYSTEMTIME {
+            wYear: 1601,
+            wMonth: 1,
+            wDay: 1,
+            ..Default::default()
+        });
+        assert_eq!(st.as_unix_timestamp_nanos(), -11_644_473_600_000_000_000);
     }
 
     #[test]
