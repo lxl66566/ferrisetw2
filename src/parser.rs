@@ -89,6 +89,13 @@ struct CachedSlices<'schema, 'record> {
     slices: HashMap<String, PropertySlice<'schema, 'record>>,
     /// The user buffer index we've cached up to
     last_cached_offset: usize,
+    /// The number of properties (in schema order) we've cached up to.
+    ///
+    /// Distinct from `slices.len()`: a schema may hold several properties with
+    /// the same name (manifests allow it), and the map then holds fewer entries
+    /// than properties parsed. Resuming from `slices.len()` would re-parse
+    /// already-consumed properties and misalign `last_cached_offset`.
+    properties_parsed: usize,
 }
 
 /// Represents a Parser
@@ -263,7 +270,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             return Ok(*p);
         }
 
-        let last_cached_property = cache.slices.len();
+        let last_cached_property = cache.properties_parsed;
         let properties_not_parsed_yet = match self.properties.get(last_cached_property..) {
             Some(s) => s,
             // If we've parsed every property already, that means no property matches this name
@@ -299,6 +306,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 .slices
                 .insert(String::clone(&property.name), prop_slice);
             cache.last_cached_offset += prop_size;
+            cache.properties_parsed += 1;
 
             if property.name == name {
                 return Ok(prop_slice);
@@ -821,5 +829,40 @@ mod tests {
             guid,
             GUID::from_u128(0x56781234_abcd_4609_0102_030405060708)
         );
+    }
+
+    #[test]
+    fn parser_advances_correctly_with_duplicate_property_names() {
+        // Manifests allow several properties with the same name
+        let props = [
+            PropSpec::new("dup", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("dup", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("third", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("fourth", TdhInType::InTypeUInt32, 4),
+        ];
+        let user_data: [u8; 16] = [
+            1, 0, 0, 0, // dup
+            2, 0, 0, 0, // dup
+            3, 0, 0, 0, // third
+            4, 0, 0, 0, // fourth
+        ];
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&props);
+        let parser = Parser::create(&record, &schema);
+
+        // "third" requires parsing through both "dup" properties
+        assert_eq!(parser.try_parse::<u32>("third").unwrap(), 3);
+
+        // The cache must remember that 3 properties were parsed (not just the
+        // 2 distinct names), otherwise "fourth" would be looked up at the wrong
+        // buffer offset
+        assert_eq!(parser.try_parse::<u32>("fourth").unwrap(), 4);
+
+        // An absent property must be reported as NotFound, not as a spurious
+        // out-of-bounds error caused by re-parsing consumed properties
+        assert!(matches!(
+            parser.try_parse::<u32>("missing"),
+            Err(ParserError::NotFound)
+        ));
     }
 }
