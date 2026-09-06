@@ -1,8 +1,8 @@
 //! A way to cache and retrieve Schemas
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use rustc_hash::FxHashMap;
 use windows::core::GUID;
 
 use crate::native::etw_types::event_record::EventRecord;
@@ -74,7 +74,7 @@ impl SchemaKey {
 
 /// Represents a cache of Schemas already located
 ///
-/// This cache is implemented as a [HashMap] where the key is a combination of the following elements
+/// This cache is implemented as a [FxHashMap] where the key is a combination of the following elements
 /// of an [Event Record](https://docs.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_record)
 /// * EventHeader.ProviderId
 /// * EventHeader.EventDescriptor.Id
@@ -82,11 +82,14 @@ impl SchemaKey {
 /// * EventHeader.EventDescriptor.Version
 /// * EventHeader.EventDescriptor.Level
 ///
+/// The hasher is FxHash rather than the default SipHash: the keys are trusted
+/// fixed-size data (built by this crate), and this lookup runs once per event.
+///
 /// Credits: [KrabsETW::schema_locator](https://github.com/microsoft/krabsetw/blob/master/krabs/krabs/schema_locator.hpp).
 /// See also the code of `SchemaKey` for more info
 #[derive(Default)]
 pub struct SchemaLocator {
-    schemas: Mutex<HashMap<SchemaKey, Arc<Schema>>>,
+    schemas: Mutex<FxHashMap<SchemaKey, Arc<Schema>>>,
 }
 
 impl std::fmt::Debug for SchemaLocator {
@@ -100,7 +103,7 @@ impl std::fmt::Debug for SchemaLocator {
 impl SchemaLocator {
     pub(crate) fn new() -> Self {
         SchemaLocator {
-            schemas: Mutex::new(HashMap::new()),
+            schemas: Mutex::new(FxHashMap::default()),
         }
     }
 
@@ -120,13 +123,22 @@ impl SchemaLocator {
     pub fn event_schema(&self, event: &EventRecord) -> SchemaResult<Arc<Schema>> {
         let key = SchemaKey::new(event);
 
+        if let Some(s) = self.schemas.lock().unwrap().get(&key) {
+            return Ok(Arc::clone(s));
+        }
+
+        // Building the schema involves a (potentially slow, manifest-parsing)
+        // TDH call: don't hold the lock while doing so, as the events of a
+        // real-time session may be delivered from several threads. If another
+        // thread inserted the same key in the meantime, its schema wins.
+        let tei = TraceEventInfo::build_from_event(event)?;
+        let new_schema = Arc::new(Schema::new(tei));
+
         let mut schemas = self.schemas.lock().unwrap();
-        match schemas.get(&key) {
-            Some(s) => Ok(Arc::clone(s)),
-            None => {
-                let tei = TraceEventInfo::build_from_event(event)?;
-                let new_schema = Arc::from(Schema::new(tei));
-                schemas.insert(key, Arc::clone(&new_schema));
+        match schemas.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => Ok(Arc::clone(e.get())),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(Arc::clone(&new_schema));
                 Ok(new_schema)
             }
         }
