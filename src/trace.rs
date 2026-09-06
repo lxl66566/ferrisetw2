@@ -636,7 +636,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     pub fn start_and_process(self) -> TraceResult<T> {
         let (trace, trace_handle) = self.start()?;
 
-        std::thread::spawn(move || UserTrace::process_from_handle(trace_handle));
+        std::thread::spawn(move || T::process_from_handle(trace_handle));
 
         Ok(trace)
     }
