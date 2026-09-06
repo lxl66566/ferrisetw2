@@ -1,4 +1,5 @@
 //! Implements wrappers for various Windows time structures.
+use std::convert::TryInto;
 use windows::Win32::{
     Foundation::{FILETIME, SYSTEMTIME},
     System::Time::SystemTimeToFileTime,
@@ -47,12 +48,11 @@ impl FileTime {
     }
 
     pub(crate) fn from_slice(slice: &[u8; std::mem::size_of::<FileTime>()]) -> Self {
-        let ptr = slice.as_ptr() as *const FileTime;
+        // ETW user data is packed: it is not guaranteed to be aligned for a
+        // FILETIME, so copy the fields one by one instead of dereferencing
         let mut file_time: FileTime = Default::default();
-        unsafe {
-            file_time.0.dwHighDateTime = (*ptr).0.dwHighDateTime;
-            file_time.0.dwLowDateTime = (*ptr).0.dwLowDateTime;
-        }
+        file_time.0.dwLowDateTime = u32::from_ne_bytes(slice[0..4].try_into().unwrap());
+        file_time.0.dwHighDateTime = u32::from_ne_bytes(slice[4..8].try_into().unwrap());
         file_time
     }
 }
@@ -114,18 +114,71 @@ impl SystemTime {
     }
 
     pub(crate) fn from_slice(slice: &[u8; std::mem::size_of::<SystemTime>()]) -> Self {
-        let ptr = slice.as_ptr() as *const SystemTime;
-        let mut system_time: SystemTime = Default::default();
-        unsafe {
-            system_time.0.wYear = (*ptr).0.wYear;
-            system_time.0.wMonth = (*ptr).0.wMonth;
-            system_time.0.wDayOfWeek = (*ptr).0.wDayOfWeek;
-            system_time.0.wDay = (*ptr).0.wDay;
-            system_time.0.wHour = (*ptr).0.wHour;
-            system_time.0.wMinute = (*ptr).0.wMinute;
-            system_time.0.wMilliseconds = (*ptr).0.wMilliseconds;
-        }
-        system_time
+        // ETW user data is packed: it is not guaranteed to be aligned for a
+        // SYSTEMTIME, so copy the fields one by one instead of dereferencing
+        let read_u16 = |offset: usize| -> u16 {
+            u16::from_ne_bytes(slice[offset..offset + 2].try_into().unwrap())
+        };
+        let mut system_time = SYSTEMTIME::default();
+        system_time.wYear = read_u16(0);
+        system_time.wMonth = read_u16(2);
+        system_time.wDayOfWeek = read_u16(4);
+        system_time.wDay = read_u16(6);
+        system_time.wHour = read_u16(8);
+        system_time.wMinute = read_u16(10);
+        system_time.wSecond = read_u16(12);
+        system_time.wMilliseconds = read_u16(14);
+        SystemTime(system_time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_time_from_slice_copies_both_dwords() {
+        // 0x0102030405060708 as it would be laid out in (packed) ETW user data
+        let bytes = [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
+        let file_time = FileTime::from_slice(&bytes);
+        assert_eq!(file_time.0.dwLowDateTime, 0x05060708);
+        assert_eq!(file_time.0.dwHighDateTime, 0x01020304);
+    }
+
+    #[test]
+    fn system_time_from_slice_copies_all_fields() {
+        // 2026-01-02 03:04:05.006, packed little-endian
+        let bytes: [u8; 16] = [
+            0xea, 0x07, // wYear = 2026
+            0x01, 0x00, // wMonth = 1
+            0x05, 0x00, // wDayOfWeek = 5
+            0x02, 0x00, // wDay = 2
+            0x03, 0x00, // wHour = 3
+            0x04, 0x00, // wMinute = 4
+            0x05, 0x00, // wSecond = 5 (was silently dropped before the fix)
+            0x06, 0x00, // wMilliseconds = 6
+        ];
+        let system_time = SystemTime::from_slice(&bytes);
+        assert_eq!(system_time.0.wYear, 2026);
+        assert_eq!(system_time.0.wMonth, 1);
+        assert_eq!(system_time.0.wDayOfWeek, 5);
+        assert_eq!(system_time.0.wDay, 2);
+        assert_eq!(system_time.0.wHour, 3);
+        assert_eq!(system_time.0.wMinute, 4);
+        assert_eq!(system_time.0.wSecond, 5);
+        assert_eq!(system_time.0.wMilliseconds, 6);
+    }
+
+    #[test]
+    fn system_time_unix_timestamp_keeps_seconds() {
+        // 2026-01-02 03:04:05.006 UTC == unix timestamp 1767323045006 (ms).
+        // Before the wSecond fix this would come out as 1767323040006.
+        let bytes: [u8; 16] = [
+            0xea, 0x07, 0x01, 0x00, 0x05, 0x00, 0x02, 0x00, //
+            0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00,
+        ];
+        let system_time = SystemTime::from_slice(&bytes);
+        assert_eq!(system_time.as_unix_timestamp(), 1_767_323_045_006);
     }
 }
 
