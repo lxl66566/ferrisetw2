@@ -11,51 +11,30 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: windows-2022
+    runs-on: windows-latest
     # Necessary so that doc issues (warnings) are catched as hard errors
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-    - uses: actions/checkout@v3
-    - uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        override: true
+        components: rustfmt
     # Cargo fmt check
-    - uses: actions-rs/cargo@v1
-      with:
-        command: fmt
-        args: --check
+    - run: cargo fmt --check
     # Cargo check
     # --all-features: several modules (e.g. ser.rs) are feature-gated and would
     # otherwise never be compiled by CI
-    - uses: actions-rs/cargo@v1
-      with:
-        command: check
-        args: --all-features
+    - run: cargo check --all-features
     # Cargo doc
-    - uses: actions-rs/cargo@v1
-      with:
-        command: doc
-        args: --no-deps --all-features
+    - run: cargo doc --no-deps --all-features
     # Cargo test
-    - uses: actions-rs/cargo@v1
-      with:
-        command: test
-        args: --all-features
-  clippy-on-diffs:
-    runs-on: windows-2022
+    - run: cargo test --all-features
+  clippy:
+    runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v3
-    - uses: actions-rs/toolchain@v1
+    - uses: actions/checkout@v7
+    - uses: dtolnay/rust-toolchain@stable
       with:
-        profile: minimal
-        toolchain: stable
-        override: true
         components: clippy
-    - uses: actions-rs/clippy-check@v1
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        args: --all-features
-
+    - run: cargo clippy --all-features --all-targets -- -D warnings

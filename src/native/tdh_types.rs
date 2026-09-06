@@ -92,8 +92,6 @@ impl Default for PropertyInfo {
 pub struct Property {
     /// Name of the Property
     pub name: String,
-    /// Represent the [PropertyFlags]
-    pub flags: PropertyFlags,
     /// Information about the property.
     pub info: PropertyInfo,
 }
@@ -147,7 +145,6 @@ impl Property {
             match count {
                 Some(c) => Ok(Property {
                     name,
-                    flags,
                     info: PropertyInfo::Array {
                         in_type,
                         out_type,
@@ -157,7 +154,6 @@ impl Property {
                 }),
                 None => Ok(Property {
                     name,
-                    flags,
                     info: PropertyInfo::Value {
                         in_type,
                         out_type,

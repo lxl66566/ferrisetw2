@@ -70,7 +70,7 @@ pub fn is_win8_or_greater() -> bool {
     // Lazy way, let's hardcode this...
     match verify_system_version(6, 2, 0) {
         Ok(res) => res,
-        Err(err) => {
+        Err(VersionHelperError::IoError(err)) => {
             log::warn!("Unable ro verify system version: {:?}", err);
             true
         }
