@@ -29,17 +29,18 @@
 
 use std::net::IpAddr;
 
-use serde::ser::{SerializeMap, SerializeStruct};
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use windows::Win32::System::Diagnostics::Etw::{EVENT_DESCRIPTOR, EVENT_HEADER};
 
 use crate::{
     GUID,
     native::{
+        EVENT_EXTENDED_ITEM_INSTANCE, EventHeaderExtendedDataItem, ExtendedDataItem,
         etw_types::event_record::EventRecord,
         tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType},
         time::{FileTime, SystemTime},
     },
-    parser::Parser,
+    parser::{Parser, TdhSocketAddress},
     schema::Schema,
 };
 
@@ -53,7 +54,8 @@ pub struct EventSerializerOptions {
     pub include_schema: bool,
     /// Includes the [EVENT_HEADER](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/fa4f7836-06ee-4ab6-8688-386a5a85f8c5) in the serialized output.
     pub include_header: bool,
-    /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output.
+    /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output,
+    /// as an `Extended` array of `{"Type", "Data"}` entries.
     pub include_extended_data: bool,
     /// When `true` unimplemented serialization fails with an error, otherwise unimplemented
     /// serialization is skipped and will not be present in the serialized output.
@@ -116,13 +118,13 @@ impl serde::ser::Serialize for EventSerializer<'_> {
             state.skip_field("Header")?;
         }
 
-        if self.options.include_extended_data && self.options.fail_unimplemented {
-            // TODO
-            return Err(serde::ser::Error::custom(
-                "not implemented for extended data",
-            ));
+        if self.options.include_extended_data {
+            let extended =
+                ExtendedSer::new(self.record.extended_data(), self.options.fail_unimplemented);
+            state.serialize_field("Extended", &extended)?;
+        } else {
+            state.skip_field("Extended")?;
         }
-        state.skip_field("Extended")?;
 
         let event = EventSer::new(self.record, self.schema, &self.parser, &self.options);
         state.serialize_field("Event", &event)?;
@@ -261,6 +263,153 @@ impl serde::ser::Serialize for DescriptorSer<'_> {
     }
 }
 
+/// Serializes the extended data items of an event as an array
+///
+/// Unsupported items are skipped, or fail the serialization when `fail_unimplemented` is set,
+/// mirroring how unimplemented event properties are handled.
+struct ExtendedSer<'a> {
+    items: &'a [EventHeaderExtendedDataItem],
+    fail_unimplemented: bool,
+}
+
+impl<'a> ExtendedSer<'a> {
+    fn new(items: &'a [EventHeaderExtendedDataItem], fail_unimplemented: bool) -> Self {
+        Self {
+            items,
+            fail_unimplemented,
+        }
+    }
+}
+
+impl serde::ser::Serialize for ExtendedSer<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_seq(None)?;
+        for item in self.items {
+            // to_extended_data_item is called exactly once per item: it may
+            // allocate (SID copy, stack trace, event name), don't repeat it
+            let data = item.to_extended_data_item();
+            if matches!(data, ExtendedDataItem::Unsupported) {
+                if self.fail_unimplemented {
+                    return Err(serde::ser::Error::custom(format!(
+                        "not implemented extended data ExtType {}",
+                        item.data_type()
+                    )));
+                }
+                continue;
+            }
+            state.serialize_element(&ExtendedDataItemSer(&data))?;
+        }
+        state.end()
+    }
+}
+
+/// Serializes one [`ExtendedDataItem`] as `{"Type": <variant name>, "Data": <payload>}`
+struct ExtendedDataItemSer<'a>(&'a ExtendedDataItem);
+
+impl serde::ser::Serialize for ExtendedDataItemSer<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ExtendedDataItem", 2)?;
+        match self.0 {
+            // Only reachable outside ExtendedSer's filtering: emit a marker
+            ExtendedDataItem::Unsupported => {
+                state.serialize_field("Type", "Unsupported")?;
+                let none: Option<u8> = None;
+                state.serialize_field("Data", &none)?;
+            },
+            ExtendedDataItem::RelatedActivityId(guid) => {
+                state.serialize_field("Type", "RelatedActivityId")?;
+                state.serialize_field("Data", &GUIDExt(*guid))?;
+            },
+            ExtendedDataItem::Sid(sid) => {
+                state.serialize_field("Type", "Sid")?;
+                let sddl = sid.to_sddl_string().map_err(serde::ser::Error::custom)?;
+                state.serialize_field("Data", &sddl)?;
+            },
+            ExtendedDataItem::TsId(id) => {
+                state.serialize_field("Type", "TsId")?;
+                state.serialize_field("Data", id)?;
+            },
+            ExtendedDataItem::InstanceInfo(info) => {
+                state.serialize_field("Type", "InstanceInfo")?;
+                state.serialize_field("Data", &InstanceInfoSer(*info))?;
+            },
+            ExtendedDataItem::StackTrace32(trace) => {
+                state.serialize_field("Type", "StackTrace32")?;
+                state.serialize_field("Data", &StackTraceSer {
+                    match_id: trace.match_id(),
+                    addresses: trace.addresses(),
+                })?;
+            },
+            ExtendedDataItem::StackTrace64(trace) => {
+                state.serialize_field("Type", "StackTrace64")?;
+                state.serialize_field("Data", &StackTraceSer {
+                    match_id: trace.match_id(),
+                    addresses: trace.addresses(),
+                })?;
+            },
+            ExtendedDataItem::TraceLogging(name) => {
+                state.serialize_field("Type", "TraceLogging")?;
+                state.serialize_field("Data", name)?;
+            },
+            ExtendedDataItem::ProvTraits(bytes) => {
+                state.serialize_field("Type", "ProvTraits")?;
+                state.serialize_field("Data", &bytes.as_slice())?;
+            },
+            ExtendedDataItem::ContainerId(guid) => {
+                state.serialize_field("Type", "ContainerId")?;
+                state.serialize_field("Data", &GUIDExt(*guid))?;
+            },
+            ExtendedDataItem::EventKey(key) => {
+                state.serialize_field("Type", "EventKey")?;
+                state.serialize_field("Data", key)?;
+            },
+            ExtendedDataItem::ProcessStartKey(key) => {
+                state.serialize_field("Type", "ProcessStartKey")?;
+                state.serialize_field("Data", key)?;
+            },
+        }
+        state.end()
+    }
+}
+
+struct InstanceInfoSer(EVENT_EXTENDED_ITEM_INSTANCE);
+
+impl serde::ser::Serialize for InstanceInfoSer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("InstanceInfo", 3)?;
+        state.serialize_field("InstanceId", &self.0.InstanceId)?;
+        state.serialize_field("ParentInstanceId", &self.0.ParentInstanceId)?;
+        state.serialize_field("ParentGuid", &GUIDExt(self.0.ParentGuid))?;
+        state.end()
+    }
+}
+
+struct StackTraceSer<'a, Address> {
+    match_id: u64,
+    addresses: &'a [Address],
+}
+
+impl<Address: serde::ser::Serialize> serde::ser::Serialize for StackTraceSer<'_, Address> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("StackTrace", 2)?;
+        state.serialize_field("MatchId", &self.match_id)?;
+        state.serialize_field("Addresses", self.addresses)?;
+        state.end()
+    }
+}
+
 struct EventSer<'a, 'b> {
     record: &'a EventRecord,
     schema: &'a Schema,
@@ -342,8 +491,14 @@ struct PropSer(PropHandler);
 
 #[cfg(test)]
 mod test {
+    use windows::Win32::System::Diagnostics::Etw::{
+        EVENT_HEADER_EXT_TYPE_PEBS_INDEX, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+        EVENT_HEADER_EXT_TYPE_SID, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+        EVENT_HEADER_EXT_TYPE_TS_ID,
+    };
+
     use super::*;
-    use crate::native::tdh_types::PropertyLength;
+    use crate::native::{etw_types::extended_data::guid_bytes, tdh_types::PropertyLength};
 
     #[test]
     fn guid_serializes_like_its_debug_representation() {
@@ -375,6 +530,57 @@ mod test {
         assert_eq!(value["EventProperty"], serde_json::json!(0x0002));
     }
 
+    #[test]
+    fn extended_data_serializes_supported_items() {
+        let guid = GUID::from_u128(0x56781234_abcd_4609_0102_030405060708);
+        // S-1-5-18 (Local System): revision 1, 1 sub-authority, authority 5, RID 18
+        let mut sid_blob = vec![1u8, 1, 0, 0, 0, 0, 0, 5];
+        sid_blob.extend_from_slice(&18u32.to_le_bytes());
+        let mut stack_blob = 42u64.to_le_bytes().to_vec(); // MatchId
+        stack_blob.extend_from_slice(&0x1000u64.to_le_bytes());
+        stack_blob.extend_from_slice(&0x2000u64.to_le_bytes());
+        let items = vec![
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+                &guid_bytes(guid),
+            ),
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &sid_blob),
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_TS_ID,
+                &7u32.to_le_bytes(),
+            ),
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+                &stack_blob,
+            ),
+        ];
+
+        let value = serde_json::to_value(ExtendedSer::new(&items, false)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"Type": "RelatedActivityId", "Data": "56781234-ABCD-4609-0102-030405060708"},
+                {"Type": "Sid", "Data": "S-1-5-18"},
+                {"Type": "TsId", "Data": 7},
+                {"Type": "StackTrace64", "Data": {"MatchId": 42, "Addresses": [0x1000, 0x2000]}},
+            ])
+        );
+    }
+
+    #[test]
+    fn unsupported_extended_data_is_skipped_or_fails() {
+        // PEBS indexes are not parsed into an ExtendedDataItem variant
+        let items = [EventHeaderExtendedDataItem::from_raw_parts(
+            EVENT_HEADER_EXT_TYPE_PEBS_INDEX,
+            &[0u8; 8],
+        )];
+
+        let value = serde_json::to_value(ExtendedSer::new(&items, false)).unwrap();
+        assert_eq!(value, serde_json::json!([]));
+
+        assert!(serde_json::to_value(ExtendedSer::new(&items, true)).is_err());
+    }
+
     fn value_info(in_type: TdhInType) -> PropertyInfo {
         PropertyInfo::Value {
             in_type,
@@ -383,16 +589,72 @@ mod test {
         }
     }
 
+    fn value_info_with_out(in_type: TdhInType, out_type: TdhOutType) -> PropertyInfo {
+        PropertyInfo::Value {
+            in_type,
+            out_type,
+            length: PropertyLength::Length(0),
+        }
+    }
+
     #[test]
-    fn counted_ansi_string_serializes_as_string() {
-        let info = value_info(TdhInType::InTypeCountedAnsiString);
+    fn counted_strings_serialize_as_string() {
+        // The WBEM (300+) and manifest (22/23) counted string variants share the
+        // same layout, and must all go through the String handler
+        for in_type in [
+            TdhInType::InTypeManifestCountedString,
+            TdhInType::InTypeCountedString,
+            TdhInType::InTypeManifestCountedAnsiString,
+            TdhInType::InTypeCountedAnsiString,
+        ] {
+            let info = value_info(in_type);
+            assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
+        }
+    }
+
+    #[test]
+    fn socket_address_serializes_via_dedicated_handler() {
+        let info = value_info_with_out(TdhInType::InTypeBinary, TdhOutType::OutTypeSocketAddress);
+        assert_eq!(
+            info.get_parser().map(|p| p.0),
+            Some(PropHandler::SocketAddress)
+        );
+    }
+
+    #[test]
+    fn utf8_out_type_serializes_as_string() {
+        // TraceLogging str8 fields: counted ANSI in type + Utf8 out type
+        let info = value_info_with_out(TdhInType::InTypeCountedAnsiString, TdhOutType::OutTypeUtf8);
         assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
     }
 
     #[test]
-    fn counted_string_is_not_serialized_yet() {
-        let info = value_info(TdhInType::InTypeCountedString);
-        assert!(info.get_parser().is_none());
+    fn hex_int_fields_serialize_as_hex_strings() {
+        // Manifest-style hex fields: the hex semantics come from the in type
+        for (in_type, handler) in [
+            (TdhInType::InTypeHexInt32, PropHandler::HexInt32),
+            (TdhInType::InTypeHexInt64, PropHandler::HexInt64),
+        ] {
+            assert_eq!(value_info(in_type).get_parser().map(|p| p.0), Some(handler));
+        }
+
+        // TraceLogging hex fields: plain integer in type + hex out type
+        for (out_type, handler) in [
+            (TdhOutType::OutTypeHexInt32, PropHandler::HexInt32),
+            (TdhOutType::OutTypeHexInt64, PropHandler::HexInt64),
+        ] {
+            let info = value_info_with_out(TdhInType::InTypeUInt32, out_type);
+            assert_eq!(info.get_parser().map(|p| p.0), Some(handler));
+        }
+
+        assert_eq!(
+            serde_json::to_value(HexDisplay(0x8007_0005u32)).unwrap(),
+            serde_json::json!("0x80070005")
+        );
+        assert_eq!(
+            serde_json::to_value(HexDisplay(u64::MAX)).unwrap(),
+            serde_json::json!("0xffffffffffffffff")
+        );
     }
 }
 
@@ -412,6 +674,8 @@ enum PropHandler {
     UInt32,
     Int64,
     UInt64,
+    HexInt32,
+    HexInt64,
     Pointer,
     Float,
     Double,
@@ -421,6 +685,7 @@ enum PropHandler {
     Guid,
     Binary,
     IpAddr,
+    SocketAddress,
     ArrayInt16,
     ArrayUInt16,
     ArrayInt32,
@@ -428,6 +693,26 @@ enum PropHandler {
     ArrayInt64,
     ArrayUInt64,
     ArrayPointer,
+}
+
+/// Serializes an integer with a hex out type as a `"0x..."` string, keeping
+/// the display semantics of `win:HexInt32`/`win:HexInt64` fields (krabsetw
+/// parity) instead of a plain number
+struct HexDisplay<T: std::fmt::LowerHex>(T);
+
+impl<T: std::fmt::LowerHex> std::fmt::Display for HexDisplay<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:x}", self.0)
+    }
+}
+
+impl<T: std::fmt::LowerHex> serde::ser::Serialize for HexDisplay<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.collect_str(self)
+    }
 }
 
 macro_rules! prop_ser_type {
@@ -460,11 +745,24 @@ impl PropHandler {
             PropHandler::UInt32 => prop_ser_type!(u32, map, prop, parser),
             PropHandler::Int64 => prop_ser_type!(i64, map, prop, parser),
             PropHandler::UInt64 => prop_ser_type!(u64, map, prop, parser),
+            PropHandler::HexInt32 => {
+                let v = parser
+                    .try_parse::<u32>(&prop.name)
+                    .map_err(serde::ser::Error::custom)?;
+                map.serialize_entry(&prop.name, &HexDisplay(v))
+            },
+            PropHandler::HexInt64 => {
+                let v = parser
+                    .try_parse::<u64>(&prop.name)
+                    .map_err(serde::ser::Error::custom)?;
+                map.serialize_entry(&prop.name, &HexDisplay(v))
+            },
             PropHandler::Float => prop_ser_type!(f32, map, prop, parser),
             PropHandler::Double => prop_ser_type!(f64, map, prop, parser),
             PropHandler::String => prop_ser_type!(String, map, prop, parser),
             PropHandler::Binary => prop_ser_type!(Vec<u8>, map, prop, parser),
             PropHandler::IpAddr => prop_ser_type!(IpAddr, map, prop, parser),
+            PropHandler::SocketAddress => prop_ser_type!(TdhSocketAddress, map, prop, parser),
             PropHandler::FileTime => prop_ser_type!(FileTime, map, prop, parser),
             PropHandler::SystemTime => prop_ser_type!(SystemTime, map, prop, parser),
             PropHandler::ArrayInt16 => prop_ser_type!(&[i16], map, prop, parser),
@@ -512,26 +810,38 @@ impl PropSerable for PropertyInfo {
                     TdhOutType::OutTypeIpv4 | TdhOutType::OutTypeIpv6 => {
                         Some(PropSer(PropHandler::IpAddr))
                     },
+                    TdhOutType::OutTypeSocketAddress => Some(PropSer(PropHandler::SocketAddress)),
+                    // TraceLogging str8 fields: the payload is a counted
+                    // string whose bytes are UTF-8 (see the parser tests for
+                    // the TDH type mapping)
+                    TdhOutType::OutTypeUtf8 => Some(PropSer(PropHandler::String)),
+                    // TraceLogging `hex` fields: the hex semantic comes from
+                    // the out type, the in type stays a plain integer
+                    TdhOutType::OutTypeHexInt32 => Some(PropSer(PropHandler::HexInt32)),
+                    TdhOutType::OutTypeHexInt64 => Some(PropSer(PropHandler::HexInt64)),
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
-                        // `try_parse::<String>` is implemented for CountedAnsiString (see
-                        // parser.rs)
+                        // `try_parse::<String>` is implemented for the counted string
+                        // in types (see parser.rs)
                         TdhInType::InTypeUnicodeString
                         | TdhInType::InTypeAnsiString
                         | TdhInType::InTypeSid
+                        | TdhInType::InTypeManifestCountedString
+                        | TdhInType::InTypeCountedString
+                        | TdhInType::InTypeManifestCountedAnsiString
                         | TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
                         TdhInType::InTypeInt16 => Some(PropSer(PropHandler::Int16)),
                         TdhInType::InTypeUInt16 => Some(PropSer(PropHandler::UInt16)),
-                        TdhInType::InTypeInt32 | TdhInType::InTypeHexInt32 => {
-                            Some(PropSer(PropHandler::Int32))
-                        },
+                        TdhInType::InTypeInt32 => Some(PropSer(PropHandler::Int32)),
                         TdhInType::InTypeUInt32 => Some(PropSer(PropHandler::UInt32)),
-                        TdhInType::InTypeInt64 | TdhInType::InTypeHexInt64 => {
-                            Some(PropSer(PropHandler::Int64))
-                        },
+                        TdhInType::InTypeInt64 => Some(PropSer(PropHandler::Int64)),
                         TdhInType::InTypeUInt64 => Some(PropSer(PropHandler::UInt64)),
+                        // Hex display semantics, whatever the width of the
+                        // underlying integer
+                        TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::HexInt32)),
+                        TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::HexInt64)),
                         TdhInType::InTypeFloat => Some(PropSer(PropHandler::Float)),
                         TdhInType::InTypeDouble => Some(PropSer(PropHandler::Double)),
                         TdhInType::InTypeBoolean => Some(PropSer(PropHandler::Bool)),
@@ -540,7 +850,6 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypePointer => Some(PropSer(PropHandler::Pointer)),
                         TdhInType::InTypeFileTime => Some(PropSer(PropHandler::FileTime)),
                         TdhInType::InTypeSystemTime => Some(PropSer(PropHandler::SystemTime)),
-                        TdhInType::InTypeCountedString => None, // TODO
                     },
                 }
             },

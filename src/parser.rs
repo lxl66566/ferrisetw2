@@ -85,6 +85,10 @@ impl std::fmt::Display for ParserError {
 
 type ParserResult<T> = Result<T, ParserError>;
 
+mod socket_address;
+
+pub use socket_address::{AddressFamily, TdhSocketAddress};
+
 #[derive(Default)]
 /// Cache of the properties we've extracted already
 ///
@@ -226,6 +230,23 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                             ));
                         };
                         return Ok((nul_index + 1) * 2);
+                    },
+                    TdhInType::InTypeManifestCountedString
+                    | TdhInType::InTypeCountedString
+                    | TdhInType::InTypeManifestCountedAnsiString
+                    | TdhInType::InTypeCountedAnsiString => {
+                        // All counted string variants share the same layout:
+                        // a little-endian u16 byte count then the payload
+                        // (TraceLogging events leave the TDH length at 0, and
+                        // TdhGetPropertySize is a costly round-trip)
+                        let Some(count) = remaining_user_buffer.get(..size_of::<u16>()) else {
+                            return Err(ParserError::PropertyError(
+                                "counted string does not have length".into(),
+                            ));
+                        };
+                        // Guaranteed by the slice length above
+                        let byte_count = u16::from_le_bytes(count.try_into().unwrap()) as usize;
+                        return Ok(size_of::<u16>() + byte_count);
                     },
                     _ => (),
                 }
@@ -448,11 +469,40 @@ impl_try_parse_primitive_array!(i32);
 impl_try_parse_primitive_array!(u64);
 impl_try_parse_primitive_array!(i64);
 
+/// Parses a count-prefixed string: a little-endian `u16` byte count followed by
+/// the payload (UTF-16 code units when `wide`, bytes otherwise)
+fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
+    const COUNT_LEN: usize = size_of::<u16>();
+    let Some(count_bytes) = buffer.get(..COUNT_LEN) else {
+        return Err(ParserError::PropertyError(
+            "counted string does not have length".into(),
+        ));
+    };
+    // Guaranteed by the slice length above
+    let byte_count = u16::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+    let Some(data) = buffer.get(COUNT_LEN..COUNT_LEN + byte_count) else {
+        return Err(ParserError::PropertyError(
+            "invalid counted string length".into(),
+        ));
+    };
+
+    if wide {
+        Ok(widestring::decode_utf16_lossy(
+            data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
+        )
+        .collect())
+    } else {
+        Ok(std::str::from_utf8(data)?.to_string())
+    }
+}
+
 /// The `String` impl of the `TryParse` trait should be used to retrieve the following [TdhInTypes]:
 ///
 /// * InTypeUnicodeString
 /// * InTypeAnsiString
-/// * InTypeCountedString
+/// * InTypeCountedString (+ its manifest twin)
+/// * InTypeCountedAnsiString (+ its manifest twin)
 /// * InTypeGuid
 ///
 /// On success a `String` with the with the data from the `name` property will be returned
@@ -515,25 +565,11 @@ impl private::TryParse<String> for Parser<'_, '_> {
                     let string = sddl::convert_sid_to_string(prop_slice.buffer.as_ptr().cast())?;
                     Ok(string)
                 },
-                TdhInType::InTypeCountedString => unimplemented!(),
-                TdhInType::InTypeCountedAnsiString => {
-                    if prop_slice.buffer.len() < 2 {
-                        return Err(ParserError::PropertyError(
-                            "counted string does not have length".into(),
-                        ));
-                    }
-                    let str_length = u16::from_le_bytes(
-                        prop_slice.buffer[..size_of::<u16>()].try_into().unwrap(),
-                    ) as usize;
-                    if prop_slice.buffer[size_of::<u16>()..].len() < str_length {
-                        return Err(ParserError::PropertyError(
-                            "invalid counted string length".into(),
-                        ));
-                    }
-                    let string = std::str::from_utf8(
-                        &prop_slice.buffer[size_of::<u16>()..size_of::<u16>() + str_length],
-                    )?;
-                    Ok(string.to_string())
+                TdhInType::InTypeManifestCountedString | TdhInType::InTypeCountedString => {
+                    parse_counted_string(prop_slice.buffer, true)
+                },
+                TdhInType::InTypeManifestCountedAnsiString | TdhInType::InTypeCountedAnsiString => {
+                    parse_counted_string(prop_slice.buffer, false)
                 },
                 _ => Err(ParserError::InvalidType),
             },
@@ -616,6 +652,37 @@ impl private::TryParse<bool> for Parser<'_, '_> {
                     8 => Ok(u64::from_ne_bytes(prop_slice.buffer.try_into()?) != 0),
                     _ => Err(ParserError::LengthMismatch),
                 }
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+        }
+    }
+}
+
+/// The `TdhSocketAddress` impl of the `TryParse` trait should be used to retrieve
+/// a `win:SocketAddress` property (OutType = [`TdhOutType::OutTypeSocketAddress`])
+///
+/// # Example
+/// ```
+/// # use ferrisetw::EventRecord;
+/// # use ferrisetw::parser::{Parser, TdhSocketAddress};
+/// # use ferrisetw::schema_locator::SchemaLocator;
+/// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
+///     let schema = schema_locator.event_schema(record).unwrap();
+///     let parser = Parser::create(record, &schema);
+///     let addr: TdhSocketAddress = parser.try_parse("RemoteAddress").unwrap();
+/// };
+/// ```
+impl private::TryParse<TdhSocketAddress> for Parser<'_, '_> {
+    fn try_parse_impl(&self, name: &str) -> ParserResult<TdhSocketAddress> {
+        let prop_slice = self.find_property(name)?;
+
+        match prop_slice.property.info {
+            PropertyInfo::Value { out_type, .. } => {
+                if out_type != TdhOutType::OutTypeSocketAddress {
+                    return Err(ParserError::InvalidType);
+                }
+
+                TdhSocketAddress::from_property_buffer(prop_slice.buffer)
             },
             PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
@@ -721,7 +788,6 @@ impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
     }
 }
 
-// TODO: Implement SocketAddress
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
 
 #[cfg(test)]
@@ -741,6 +807,7 @@ mod tests {
     struct PropSpec {
         name: &'static str,
         in_type: TdhInType,
+        out_type: TdhOutType,
         /// `EVENT_PROPERTY_INFO.Flags` (e.g. `PropertyParamCount`)
         flags: u32,
         /// Value written to the count/countPropertyIndex union member
@@ -754,10 +821,16 @@ mod tests {
             Self {
                 name,
                 in_type,
+                out_type: TdhOutType::OutTypeNull,
                 flags: 0,
                 count: 0,
                 length,
             }
+        }
+
+        const fn with_out_type(mut self, out_type: TdhOutType) -> Self {
+            self.out_type = out_type;
+            self
         }
     }
 
@@ -796,6 +869,7 @@ mod tests {
                 (*prop).Flags = flags;
                 (*prop).NameOffset = name_offset;
                 (*prop).Anonymous1.nonStructType.InType = spec.in_type as u16;
+                (*prop).Anonymous1.nonStructType.OutType = spec.out_type as u16;
                 (*prop).Anonymous2.count = spec.count;
                 (*prop).Anonymous3.length = spec.length;
 
@@ -946,5 +1020,307 @@ mod tests {
         // The u32 sits right after the 3-byte string: this verifies the string
         // size computation (NUL included)
         assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn counted_strings_parse_and_advance_the_offset() {
+        // Layout: little-endian u16 BYTE count, then the payload
+        let wide: Vec<u8> = "hï".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ansi = b"hi".to_vec();
+
+        // The WBEM (300+) and manifest (22/23) variants share the same layout
+        let cases = [
+            (
+                TdhInType::InTypeManifestCountedString,
+                wide.as_slice(),
+                "hï",
+            ),
+            (TdhInType::InTypeCountedString, wide.as_slice(), "hï"),
+            (
+                TdhInType::InTypeManifestCountedAnsiString,
+                ansi.as_slice(),
+                "hi",
+            ),
+            (TdhInType::InTypeCountedAnsiString, ansi.as_slice(), "hi"),
+        ];
+
+        for (in_type, payload, expected) in cases {
+            let user_data: Vec<u8> = u16::try_from(payload.len())
+                .unwrap()
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .chain(0x1122_3344u32.to_ne_bytes())
+                .collect();
+
+            let record = synthetic_record(&user_data);
+            let schema = synthetic_schema(&[
+                PropSpec::new("s", in_type, u16::try_from(2 + payload.len()).unwrap()),
+                PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+            ]);
+            let parser = Parser::create(&record, &schema);
+
+            assert_eq!(parser.try_parse::<String>("s").unwrap(), expected);
+            // The u32 sits right after the counted string: this verifies the
+            // property size computation
+            assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+        }
+    }
+
+    #[test]
+    fn counted_strings_with_invalid_length_are_an_error() {
+        // The byte count exceeds what the buffer holds
+        let user_data = 42u16.to_le_bytes();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new("s", TdhInType::InTypeCountedString, 2)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(parser.try_parse::<String>("s").is_err());
+    }
+
+    #[test]
+    fn socket_address_property_decodes_and_advances_the_offset() {
+        // sockaddr_in (AF_INET, port 80, 127.0.0.1) padded to 16 bytes
+        let mut sockaddr: Vec<u8> = Vec::new();
+        sockaddr.extend_from_slice(&2u16.to_ne_bytes());
+        sockaddr.extend_from_slice(&80u16.to_be_bytes());
+        sockaddr.extend_from_slice(&[127, 0, 0, 1]);
+        sockaddr.resize(16, 0);
+
+        let user_data: Vec<u8> = sockaddr
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("addr", TdhInType::InTypeBinary, 16)
+                .with_out_type(TdhOutType::OutTypeSocketAddress),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        let addr = parser
+            .try_parse::<TdhSocketAddress>("addr")
+            .expect("socket address should parse");
+        assert_eq!(addr.to_string(), "127.0.0.1:80");
+        // The u32 sits right after the 16-byte sockaddr
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+
+        // A property without the SocketAddress out type is not a socket address
+        let schema = synthetic_schema(&[PropSpec::new("addr", TdhInType::InTypeBinary, 16)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(matches!(
+            parser.try_parse::<TdhSocketAddress>("addr"),
+            Err(ParserError::InvalidType)
+        ));
+    }
+
+    // ---- TraceLogging (self-describing) events decoded through the real TDH ----
+
+    /// TraceLogging in/out type codes, as encoded in the event metadata
+    /// (values differ from the TDH enums for out types, e.g. Win32Error is 13 here)
+    mod tlg {
+        pub const IN_U16: u8 = 6;
+        pub const IN_I32: u8 = 7;
+        pub const IN_U32: u8 = 8;
+        pub const IN_BINARY: u8 = 14;
+        pub const IN_FILETIME: u8 = 17;
+        pub const IN_HEX64: u8 = 21;
+        pub const IN_STR16: u8 = 22;
+        pub const IN_STR8: u8 = 23;
+
+        pub const OUT_HEX: u8 = 4;
+        pub const OUT_SOCKADDR: u8 = 10;
+        pub const OUT_WIN32ERROR: u8 = 13;
+        pub const OUT_NTSTATUS: u8 = 14;
+        pub const OUT_HRESULT: u8 = 15;
+        pub const OUT_UTF8: u8 = 35;
+        pub const OUT_CODEPOINTER: u8 = 37;
+        pub const OUT_DATETIMEUTC: u8 = 38;
+    }
+
+    /// One field of a synthetic TraceLogging event: its metadata descriptor
+    /// (NUL-terminated name, in type, optional out type with bit 0x80 set on
+    /// the in type), its value bytes, and the TDH types it must decode to
+    struct TlgField {
+        name: &'static str,
+        in_type: u8,
+        out_type: Option<u8>,
+        value: &'static [u8],
+        expected: (TdhInType, TdhOutType),
+    }
+
+    /// Builds the user data of a TraceLogging event: the two metadata blobs
+    /// TDH expects (provider then event metadata), each with a `u16` size
+    /// prefix, followed by the field values. Values are irrelevant here: this
+    /// only exercises schema decoding, but they must be present so that the
+    /// total size is plausible.
+    fn tlg_user_data(event_meta: &[u8], values: &[u8]) -> Vec<u8> {
+        let sized = |payload: &[u8]| -> Vec<u8> {
+            (u16::try_from(payload.len() + 2).unwrap())
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .collect()
+        };
+
+        let provider_name = b"ferrisETW.TraceLoggingTest";
+        let mut provider = provider_name.to_vec();
+        provider.push(0);
+
+        let mut event_name = b"Event1".to_vec();
+        event_name.push(0);
+        event_name.extend_from_slice(event_meta);
+
+        sized(&provider)
+            .into_iter()
+            .chain(sized(&event_name))
+            .chain(values.iter().copied())
+            .collect()
+    }
+
+    /// Decodes a synthetic TraceLogging event through the real
+    /// `TdhGetEventInformation`, no ETW session or admin rights required:
+    /// these events are self-describing, TDH reads the schema from the
+    /// metadata embedded in the user data
+    fn tlg_schema(user_data: &[u8]) -> Schema {
+        // Header size and user data length always fit: synthetic test data
+        #[allow(clippy::cast_possible_truncation)]
+        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
+        let header = Etw::EVENT_HEADER {
+            Size: header_size,
+            Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+            EventDescriptor: Etw::EVENT_DESCRIPTOR {
+                Channel: 11, // TraceLogging channel
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let record = EventRecord(Etw::EVENT_RECORD {
+            EventHeader: header,
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            ..Default::default()
+        });
+        let info = TraceEventInfo::build_from_event(&record)
+            .expect("TDH should decode the synthetic TraceLogging event");
+        Schema::new(info)
+    }
+
+    /// The metadata descriptor of a [`TlgField`]: NUL-terminated name, then
+    /// the in type with bit 0x80 set when an out type byte follows
+    fn tlg_field_meta(field: &TlgField) -> Vec<u8> {
+        let mut meta = field.name.as_bytes().to_vec();
+        meta.push(0);
+        meta.push(field.in_type | u8::from(field.out_type.is_some()) << 7);
+        meta.extend(field.out_type);
+        meta
+    }
+
+    /// Pins down how TDH maps TraceLogging metadata to its own in/out types:
+    /// this is the ground truth the parser and the serializer rely on
+    /// (e.g. `str8` only becomes readable through the counted-Ansi in type)
+    #[test]
+    fn tracelogging_types_decode_through_tdh() {
+        use tlg::*;
+
+        let cases = [
+            TlgField {
+                name: "Str8",
+                in_type: IN_STR8,
+                out_type: Some(OUT_UTF8),
+                value: &[9, 0],
+                expected: (TdhInType::InTypeCountedAnsiString, TdhOutType::OutTypeUtf8),
+            },
+            TlgField {
+                name: "Str16",
+                in_type: IN_STR16,
+                out_type: None,
+                value: &[4, 0],
+                expected: (TdhInType::InTypeCountedString, TdhOutType::OutTypeNull),
+            },
+            TlgField {
+                name: "Win32Error",
+                in_type: IN_U32,
+                out_type: Some(OUT_WIN32ERROR),
+                value: &[5, 0, 0, 0],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeWin32Error),
+            },
+            TlgField {
+                name: "NtStatus",
+                in_type: IN_U32,
+                out_type: Some(OUT_NTSTATUS),
+                value: &[0; 4],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeNtStatus),
+            },
+            TlgField {
+                name: "HResult",
+                in_type: IN_I32,
+                out_type: Some(OUT_HRESULT),
+                value: &[5, 0, 7, 128], // 0x80070005
+                expected: (TdhInType::InTypeInt32, TdhOutType::OutTypeHResult),
+            },
+            TlgField {
+                name: "CodePointer",
+                in_type: IN_HEX64,
+                out_type: Some(OUT_CODEPOINTER),
+                value: &[0; 8],
+                expected: (TdhInType::InTypeHexInt64, TdhOutType::OutTypeCodePointer),
+            },
+            TlgField {
+                name: "HexU32",
+                in_type: IN_U32,
+                out_type: Some(OUT_HEX),
+                value: &[0x78, 0x56, 0x34, 0x12],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeHexInt32),
+            },
+            TlgField {
+                name: "DateTimeUtc",
+                in_type: IN_FILETIME,
+                out_type: Some(OUT_DATETIMEUTC),
+                value: &[0; 8],
+                expected: (TdhInType::InTypeFileTime, TdhOutType::OutTypeDatetimeUtc),
+            },
+            TlgField {
+                name: "SockAddr",
+                in_type: IN_BINARY,
+                out_type: Some(OUT_SOCKADDR),
+                value: &[16, 0],
+                expected: (TdhInType::InTypeBinary, TdhOutType::OutTypeSocketAddress),
+            },
+            TlgField {
+                name: "Port",
+                in_type: IN_U16,
+                out_type: None,
+                value: &[80, 0],
+                expected: (TdhInType::InTypeUInt16, TdhOutType::OutTypeNull),
+            },
+        ];
+
+        let meta: Vec<u8> = cases.iter().flat_map(tlg_field_meta).collect();
+        let values: Vec<u8> = cases.iter().flat_map(|f| f.value.iter().copied()).collect();
+
+        let schema = tlg_schema(&tlg_user_data(&meta, &values));
+        // TDH synthesizes extra properties (e.g. a "FieldName.Length"
+        // companion for TraceLogging binary fields): match by name
+        let props = schema.properties();
+
+        for case in &cases {
+            // Only the type mapping is pinned down: the reported length
+            // varies (fixed sizes, 0 for counted strings, an index into a
+            // synthesized count property for TraceLogging binary fields)
+            let prop = props
+                .iter()
+                .find(|p| p.name == case.name)
+                .expect("TDH should report the field");
+            let PropertyInfo::Value {
+                in_type: actual_in,
+                out_type: actual_out,
+                ..
+            } = &prop.info
+            else {
+                panic!("{} should decode as a scalar value", case.name);
+            };
+            assert_eq!((*actual_in, *actual_out), case.expected);
+        }
     }
 }

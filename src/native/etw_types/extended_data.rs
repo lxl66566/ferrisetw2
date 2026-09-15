@@ -5,8 +5,9 @@ use std::{convert::TryInto, ffi::CStr};
 use windows::{
     Win32::System::Diagnostics::Etw::{
         EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID, EVENT_EXTENDED_ITEM_TS_ID,
-        EVENT_HEADER_EXT_TYPE_EVENT_KEY, EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
-        EVENT_HEADER_EXT_TYPE_INSTANCE_INFO, EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY,
+        EVENT_HEADER_EXT_TYPE_CONTAINER_ID, EVENT_HEADER_EXT_TYPE_EVENT_KEY,
+        EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, EVENT_HEADER_EXT_TYPE_INSTANCE_INFO,
+        EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, EVENT_HEADER_EXT_TYPE_PROV_TRAITS,
         EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, EVENT_HEADER_EXT_TYPE_SID,
         EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
         EVENT_HEADER_EXT_TYPE_TS_ID, EVENT_HEADER_EXTENDED_DATA_ITEM,
@@ -160,9 +161,11 @@ pub enum ExtendedDataItem {
     StackTrace64(StackTraceItem<u64>),
     /// TraceLogging event metadata information
     TraceLogging(String),
-    // /// Provider traits data
-    // /// (for example traits set through EventSetInformation(EventProviderSetTraits) or
-    // specified through EVENT_DATA_DESCRIPTOR_TYPE_PROVIDER_METADATA) ProvTraits,
+    /// Opaque provider traits data (set through `EventSetInformation(EventProviderSetTraits)`
+    /// or `EVENT_DATA_DESCRIPTOR_TYPE_PROVIDER_METADATA`)
+    ProvTraits(Vec<u8>),
+    /// Identifier of the container (server silo) the event was logged from
+    ContainerId(GUID),
     /// Unique event identifier
     EventKey(u64),
     /// Unique process identifier (unique across the boot session)
@@ -246,8 +249,35 @@ impl EventHeaderExtendedDataItem {
                 ExtendedDataItem::TraceLogging(unsafe { self.get_event_name().unwrap_or_default() })
             },
 
+            // The traits blob is provider-defined, keep it opaque
+            EVENT_HEADER_EXT_TYPE_PROV_TRAITS => {
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(data_ptr.cast::<u8>(), self.0.DataSize as usize)
+                };
+                ExtendedDataItem::ProvTraits(bytes.to_vec())
+            },
+
+            EVENT_HEADER_EXT_TYPE_CONTAINER_ID => {
+                ExtendedDataItem::ContainerId(unsafe { *data_ptr.cast::<GUID>() })
+            },
+
             _ => ExtendedDataItem::Unsupported,
         }
+    }
+
+    /// Builds an item from an ext type constant and its raw data blob
+    ///
+    /// The blob must outlive the returned item (unit tests only)
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts(ext_type: u32, blob: &[u8]) -> Self {
+        // Test inputs use known-small ext types and blobs
+        #[allow(clippy::cast_possible_truncation)]
+        Self(EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: ext_type as u16,
+            DataSize: blob.len() as u16,
+            DataPtr: blob.as_ptr() as u64,
+            ..Default::default()
+        })
     }
 
     /// This function will parse the event metadata of a TraceLogging event to
@@ -316,6 +346,18 @@ impl EventHeaderExtendedDataItem {
     }
 }
 
+/// In-memory GUID bytes: little-endian data1/2/3, then data4 as-is
+/// (unit tests only)
+#[cfg(test)]
+pub(crate) fn guid_bytes(guid: GUID) -> [u8; 16] {
+    let mut bytes = [0u8; 16];
+    bytes[0..4].copy_from_slice(&guid.data1.to_le_bytes());
+    bytes[4..6].copy_from_slice(&guid.data2.to_le_bytes());
+    bytes[6..8].copy_from_slice(&guid.data3.to_le_bytes());
+    bytes[8..].copy_from_slice(&guid.data4);
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::System::Diagnostics::Etw::{
@@ -323,17 +365,6 @@ mod tests {
     };
 
     use super::*;
-
-    fn item_with_data(ext_type: u32, blob: &[u8]) -> EventHeaderExtendedDataItem {
-        // Test inputs use known-small ext types and blobs
-        #[allow(clippy::cast_possible_truncation)]
-        EventHeaderExtendedDataItem(EVENT_HEADER_EXTENDED_DATA_ITEM {
-            ExtType: ext_type as u16,
-            DataSize: blob.len() as u16,
-            DataPtr: blob.as_ptr() as u64,
-            ..Default::default()
-        })
-    }
 
     #[test]
     fn tlg_event_name_is_parsed() {
@@ -348,7 +379,11 @@ mod tests {
         blob.extend_from_slice(&[0x20, 0x00, 0x00]); // dummy field metadata
 
         let ExtendedDataItem::TraceLogging(event_name) =
-            item_with_data(EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, &blob).to_extended_data_item()
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
+                &blob,
+            )
+            .to_extended_data_item()
         else {
             panic!("expected the TraceLogging variant");
         };
@@ -368,7 +403,11 @@ mod tests {
         blob.resize(usize::from(total), 0xab); // dummy field metadata
 
         let ExtendedDataItem::TraceLogging(event_name) =
-            item_with_data(EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, &blob).to_extended_data_item()
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
+                &blob,
+            )
+            .to_extended_data_item()
         else {
             panic!("expected the TraceLogging variant");
         };
@@ -390,7 +429,8 @@ mod tests {
         let sid_bytes = sample_sid_bytes();
 
         let ExtendedDataItem::Sid(sid) =
-            item_with_data(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes).to_extended_data_item()
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes)
+                .to_extended_data_item()
         else {
             panic!("expected the Sid variant");
         };
@@ -408,7 +448,8 @@ mod tests {
         let mut sid_bytes = sample_sid_bytes();
 
         let ExtendedDataItem::Sid(sid) =
-            item_with_data(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes).to_extended_data_item()
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes)
+                .to_extended_data_item()
         else {
             panic!("expected the Sid variant");
         };
@@ -417,5 +458,36 @@ mod tests {
         // the original buffer must not affect our deep copy
         sid_bytes.fill(0xaa);
         assert_eq!(sid.sub_authority(4), Some(999));
+    }
+
+    #[test]
+    fn prov_traits_blob_is_copied_verbatim() {
+        let blob = [1u8, 2, 3, 4];
+
+        let ExtendedDataItem::ProvTraits(bytes) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_PROV_TRAITS, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the ProvTraits variant");
+        };
+
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn container_id_is_parsed() {
+        let guid = GUID::from_u128(0x56781234_abcd_4609_0102_030405060708);
+
+        let ExtendedDataItem::ContainerId(container_id) =
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_CONTAINER_ID,
+                &guid_bytes(guid),
+            )
+            .to_extended_data_item()
+        else {
+            panic!("expected the ContainerId variant");
+        };
+
+        assert_eq!(container_id, guid);
     }
 }

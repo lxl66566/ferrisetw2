@@ -81,11 +81,13 @@ fn tlg_multiple_events(provider_guid: GUID) {
                     assert_eq!(record.level(), tlg::Level::Warning.as_int());
                     assert_eq!(record.keyword(), 0x13);
 
-                    // Tracelogging crate sets OutTypeUtf8 for str8 which we don't handle at the
-                    // moment.
-                    let _data = parser.try_parse::<String>("String");
-                    // assert!(data.is_ok());
-                    // assert_eq!(data, TEST_STRING_VALUE);
+                    // The tracelogging crate writes str8 fields as a counted
+                    // ANSI string with the Utf8 out type: TDH reports them as
+                    // InTypeCountedAnsiString + OutTypeUtf8, which the parser
+                    // decodes as a UTF-8 string
+                    let data = parser.try_parse::<String>("String");
+                    assert!(data.is_ok());
+                    assert_eq!(data.unwrap(), TEST_STRING_VALUE);
 
                     event1_count += 1;
                 } else if record.event_name() == "Event2" {
