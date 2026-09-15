@@ -3,9 +3,9 @@
 //! This module act as a helper to parse the Buffer from an ETW Event
 
 use std::{
+    cell::RefCell,
     convert::TryInto,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    sync::Mutex,
 };
 
 use windows::core::GUID;
@@ -113,6 +113,10 @@ struct CachedSlices<'schema, 'record> {
 /// Because properties may have variable length (e.g. strings), a `Parser` is only suited to a
 /// single [`EventRecord`]
 ///
+/// A `Parser` is meant to live on the callback stack for a single event: its cache uses
+/// unsynchronized interior mutability (`RefCell`), so it is neither `Send` nor `Sync`
+/// (it already could not be, as it borrows an [`EventRecord`]).
+///
 /// # Example
 /// ```
 /// # use ferrisetw::EventRecord;
@@ -137,7 +141,7 @@ struct CachedSlices<'schema, 'record> {
 pub struct Parser<'schema, 'record> {
     properties: &'schema [Property],
     record: &'record EventRecord,
-    cache: Mutex<CachedSlices<'schema, 'record>>,
+    cache: RefCell<CachedSlices<'schema, 'record>>,
 }
 
 impl<'schema, 'record> Parser<'schema, 'record> {
@@ -160,7 +164,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
         Parser {
             record: event_record,
             properties: schema.properties(),
-            cache: Mutex::new(CachedSlices::default()),
+            cache: RefCell::new(CachedSlices::default()),
         }
     }
 
@@ -192,9 +196,9 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     PropertyLength::Length(l) => l,
                     PropertyLength::Index(_) => {
                         // TODO optimize to cache the lookup, the problem is here this is called
-                        // under an exclusive mutex, so attempting to
+                        // while the cache is mutably borrowed, so attempting to
                         // extract and cache a related property will
-                        // deadlock.
+                        // panic.
                         return Ok(tdh::property_size(self.record, &property.name)? as usize);
                     },
                 };
@@ -267,10 +271,10 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     match length {
                         PropertyLength::Length(l) => l as usize,
                         PropertyLength::Index(_) => {
-                            // TODO optimize to cache the lookup, the problem is here this is called
-                            // under an exclusive mutex, so attempting
-                            // to extract and cache a related property will
-                            // deadlock.
+                            // TODO optimize to cache the lookup, the problem is here this is
+                            // called while the cache is mutably borrowed, so attempting to
+                            // extract and cache a related property will
+                            // panic.
                             return Ok(tdh::property_size(self.record, &property.name)? as usize);
                         },
                     }
@@ -280,9 +284,9 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     PropertyCount::Count(c) => c as usize,
                     PropertyCount::Index(_) => {
                         // TODO optimize to cache the lookup, the problem is here this is called
-                        // under an exclusive mutex, so attempting to
+                        // while the cache is mutably borrowed, so attempting to
                         // extract and cache a related property will
-                        // deadlock.
+                        // panic.
                         return Ok(tdh::property_size(self.record, &property.name)? as usize);
                     },
                 };
@@ -297,7 +301,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     }
 
     fn find_property(&self, name: &str) -> ParserResult<PropertySlice<'schema, 'record>> {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.borrow_mut();
 
         // We may have extracted this property already: probe right after the
         // last hit first, as successive accesses usually advance in schema order
