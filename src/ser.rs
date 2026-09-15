@@ -620,6 +620,13 @@ mod test {
             Some(PropHandler::SocketAddress)
         );
     }
+
+    #[test]
+    fn utf8_out_type_serializes_as_string() {
+        // TraceLogging str8 fields: counted ANSI in type + Utf8 out type
+        let info = value_info_with_out(TdhInType::InTypeCountedAnsiString, TdhOutType::OutTypeUtf8);
+        assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
+    }
 }
 
 trait PropSerable {
@@ -741,6 +748,10 @@ impl PropSerable for PropertyInfo {
                         Some(PropSer(PropHandler::IpAddr))
                     },
                     TdhOutType::OutTypeSocketAddress => Some(PropSer(PropHandler::SocketAddress)),
+                    // TraceLogging str8 fields: the payload is a counted
+                    // string whose bytes are UTF-8 (see the parser tests for
+                    // the TDH type mapping)
+                    TdhOutType::OutTypeUtf8 => Some(PropSer(PropHandler::String)),
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
                         // `try_parse::<String>` is implemented for the counted string

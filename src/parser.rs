@@ -231,6 +231,23 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                         };
                         return Ok((nul_index + 1) * 2);
                     },
+                    TdhInType::InTypeManifestCountedString
+                    | TdhInType::InTypeCountedString
+                    | TdhInType::InTypeManifestCountedAnsiString
+                    | TdhInType::InTypeCountedAnsiString => {
+                        // All counted string variants share the same layout:
+                        // a little-endian u16 byte count then the payload
+                        // (TraceLogging events leave the TDH length at 0, and
+                        // TdhGetPropertySize is a costly round-trip)
+                        let Some(count) = remaining_user_buffer.get(..size_of::<u16>()) else {
+                            return Err(ParserError::PropertyError(
+                                "counted string does not have length".into(),
+                            ));
+                        };
+                        // Guaranteed by the slice length above
+                        let byte_count = u16::from_le_bytes(count.try_into().unwrap()) as usize;
+                        return Ok(size_of::<u16>() + byte_count);
+                    },
                     _ => (),
                 }
 
@@ -1095,5 +1112,215 @@ mod tests {
             parser.try_parse::<TdhSocketAddress>("addr"),
             Err(ParserError::InvalidType)
         ));
+    }
+
+    // ---- TraceLogging (self-describing) events decoded through the real TDH ----
+
+    /// TraceLogging in/out type codes, as encoded in the event metadata
+    /// (values differ from the TDH enums for out types, e.g. Win32Error is 13 here)
+    mod tlg {
+        pub const IN_U16: u8 = 6;
+        pub const IN_I32: u8 = 7;
+        pub const IN_U32: u8 = 8;
+        pub const IN_BINARY: u8 = 14;
+        pub const IN_FILETIME: u8 = 17;
+        pub const IN_HEX64: u8 = 21;
+        pub const IN_STR16: u8 = 22;
+        pub const IN_STR8: u8 = 23;
+
+        pub const OUT_HEX: u8 = 4;
+        pub const OUT_SOCKADDR: u8 = 10;
+        pub const OUT_WIN32ERROR: u8 = 13;
+        pub const OUT_NTSTATUS: u8 = 14;
+        pub const OUT_HRESULT: u8 = 15;
+        pub const OUT_UTF8: u8 = 35;
+        pub const OUT_CODEPOINTER: u8 = 37;
+        pub const OUT_DATETIMEUTC: u8 = 38;
+    }
+
+    /// One field of a synthetic TraceLogging event: its metadata descriptor
+    /// (NUL-terminated name, in type, optional out type with bit 0x80 set on
+    /// the in type), its value bytes, and the TDH types it must decode to
+    struct TlgField {
+        name: &'static str,
+        in_type: u8,
+        out_type: Option<u8>,
+        value: &'static [u8],
+        expected: (TdhInType, TdhOutType),
+    }
+
+    /// Builds the user data of a TraceLogging event: the two metadata blobs
+    /// TDH expects (provider then event metadata), each with a `u16` size
+    /// prefix, followed by the field values. Values are irrelevant here: this
+    /// only exercises schema decoding, but they must be present so that the
+    /// total size is plausible.
+    fn tlg_user_data(event_meta: &[u8], values: &[u8]) -> Vec<u8> {
+        let sized = |payload: &[u8]| -> Vec<u8> {
+            (u16::try_from(payload.len() + 2).unwrap())
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .collect()
+        };
+
+        let provider_name = b"ferrisETW.TraceLoggingTest";
+        let mut provider = provider_name.to_vec();
+        provider.push(0);
+
+        let mut event_name = b"Event1".to_vec();
+        event_name.push(0);
+        event_name.extend_from_slice(event_meta);
+
+        sized(&provider)
+            .into_iter()
+            .chain(sized(&event_name))
+            .chain(values.iter().copied())
+            .collect()
+    }
+
+    /// Decodes a synthetic TraceLogging event through the real
+    /// `TdhGetEventInformation`, no ETW session or admin rights required:
+    /// these events are self-describing, TDH reads the schema from the
+    /// metadata embedded in the user data
+    fn tlg_schema(user_data: &[u8]) -> Schema {
+        // Header size and user data length always fit: synthetic test data
+        #[allow(clippy::cast_possible_truncation)]
+        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
+        let header = Etw::EVENT_HEADER {
+            Size: header_size,
+            Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+            EventDescriptor: Etw::EVENT_DESCRIPTOR {
+                Channel: 11, // TraceLogging channel
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let record = EventRecord(Etw::EVENT_RECORD {
+            EventHeader: header,
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            ..Default::default()
+        });
+        let info = TraceEventInfo::build_from_event(&record)
+            .expect("TDH should decode the synthetic TraceLogging event");
+        Schema::new(info)
+    }
+
+    /// The metadata descriptor of a [`TlgField`]: NUL-terminated name, then
+    /// the in type with bit 0x80 set when an out type byte follows
+    fn tlg_field_meta(field: &TlgField) -> Vec<u8> {
+        let mut meta = field.name.as_bytes().to_vec();
+        meta.push(0);
+        meta.push(field.in_type | u8::from(field.out_type.is_some()) << 7);
+        meta.extend(field.out_type);
+        meta
+    }
+
+    /// Pins down how TDH maps TraceLogging metadata to its own in/out types:
+    /// this is the ground truth the parser and the serializer rely on
+    /// (e.g. `str8` only becomes readable through the counted-Ansi in type)
+    #[test]
+    fn tracelogging_types_decode_through_tdh() {
+        use tlg::*;
+
+        let cases = [
+            TlgField {
+                name: "Str8",
+                in_type: IN_STR8,
+                out_type: Some(OUT_UTF8),
+                value: &[9, 0],
+                expected: (TdhInType::InTypeCountedAnsiString, TdhOutType::OutTypeUtf8),
+            },
+            TlgField {
+                name: "Str16",
+                in_type: IN_STR16,
+                out_type: None,
+                value: &[4, 0],
+                expected: (TdhInType::InTypeCountedString, TdhOutType::OutTypeNull),
+            },
+            TlgField {
+                name: "Win32Error",
+                in_type: IN_U32,
+                out_type: Some(OUT_WIN32ERROR),
+                value: &[5, 0, 0, 0],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeWin32Error),
+            },
+            TlgField {
+                name: "NtStatus",
+                in_type: IN_U32,
+                out_type: Some(OUT_NTSTATUS),
+                value: &[0; 4],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeNtStatus),
+            },
+            TlgField {
+                name: "HResult",
+                in_type: IN_I32,
+                out_type: Some(OUT_HRESULT),
+                value: &[5, 0, 7, 128], // 0x80070005
+                expected: (TdhInType::InTypeInt32, TdhOutType::OutTypeHResult),
+            },
+            TlgField {
+                name: "CodePointer",
+                in_type: IN_HEX64,
+                out_type: Some(OUT_CODEPOINTER),
+                value: &[0; 8],
+                expected: (TdhInType::InTypeHexInt64, TdhOutType::OutTypeCodePointer),
+            },
+            TlgField {
+                name: "HexU32",
+                in_type: IN_U32,
+                out_type: Some(OUT_HEX),
+                value: &[0x78, 0x56, 0x34, 0x12],
+                expected: (TdhInType::InTypeUInt32, TdhOutType::OutTypeHexInt32),
+            },
+            TlgField {
+                name: "DateTimeUtc",
+                in_type: IN_FILETIME,
+                out_type: Some(OUT_DATETIMEUTC),
+                value: &[0; 8],
+                expected: (TdhInType::InTypeFileTime, TdhOutType::OutTypeDatetimeUtc),
+            },
+            TlgField {
+                name: "SockAddr",
+                in_type: IN_BINARY,
+                out_type: Some(OUT_SOCKADDR),
+                value: &[16, 0],
+                expected: (TdhInType::InTypeBinary, TdhOutType::OutTypeSocketAddress),
+            },
+            TlgField {
+                name: "Port",
+                in_type: IN_U16,
+                out_type: None,
+                value: &[80, 0],
+                expected: (TdhInType::InTypeUInt16, TdhOutType::OutTypeNull),
+            },
+        ];
+
+        let meta: Vec<u8> = cases.iter().flat_map(tlg_field_meta).collect();
+        let values: Vec<u8> = cases.iter().flat_map(|f| f.value.iter().copied()).collect();
+
+        let schema = tlg_schema(&tlg_user_data(&meta, &values));
+        // TDH synthesizes extra properties (e.g. a "FieldName.Length"
+        // companion for TraceLogging binary fields): match by name
+        let props = schema.properties();
+
+        for case in &cases {
+            // Only the type mapping is pinned down: the reported length
+            // varies (fixed sizes, 0 for counted strings, an index into a
+            // synthesized count property for TraceLogging binary fields)
+            let prop = props
+                .iter()
+                .find(|p| p.name == case.name)
+                .expect("TDH should report the field");
+            let PropertyInfo::Value {
+                in_type: actual_in,
+                out_type: actual_out,
+                ..
+            } = &prop.info
+            else {
+                panic!("{} should decode as a scalar value", case.name);
+            };
+            assert_eq!((*actual_in, *actual_out), case.expected);
+        }
     }
 }
