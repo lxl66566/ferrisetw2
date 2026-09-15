@@ -1,3 +1,9 @@
+//! Test events from a TraceLogging (self-describing) provider
+//!
+//! Registering the provider and starting an ETW trace session require administrator
+//! privileges, so this test is gated behind the `admin_tests` feature.
+#![cfg(feature = "admin_tests")]
+
 use ferrisetw::{
     EventRecord, GUID,
     parser::Parser,
@@ -17,7 +23,6 @@ const PROVIDER_NAME: &str = "ferrisETW.TraceLoggingTest";
 
 tlg::define_provider!(FERRIS_PROVIDER, "ferrisETW.TraceLoggingTest");
 
-#[ignore = "requires an administrator session to register the provider and start a trace"]
 #[test]
 fn tlg_tests() {
     use std::convert::TryInto;

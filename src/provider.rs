@@ -304,7 +304,7 @@ impl ProviderBuilder {
     /// function).
     ///
     /// # Example
-    /// ```
+    /// ```no_run
     /// # use ferrisetw::provider::Provider;
     /// # use ferrisetw::trace::UserTrace;
     /// # use ferrisetw::EventRecord;

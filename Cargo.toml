@@ -50,8 +50,8 @@ serde_json   = "1.0"
 tracelogging = "1.2"
 
 [features]
-# Gate for integration tests that require administrator privileges
-# (creating an ETW trace session is admin-only).
+# Gate for tests that require administrator privileges
+# (creating an ETW trace session is admin-only), including the lib.rs doctest.
 # Run them with: cargo test --features admin_tests
 admin_tests = []
 serde       = ["dep:serde", "time?/serde", "time?/serde-human-readable"]
