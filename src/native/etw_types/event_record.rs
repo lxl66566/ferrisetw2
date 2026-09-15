@@ -66,10 +66,30 @@ impl EventRecord {
         self.0.EventHeader.EventDescriptor.Version
     }
 
+    /// The `Channel` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Manifest-defined channel the event is written to (e.g. Admin, Operational, Analytic),
+    /// see [ChannelType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-channeltype-complextype).
+    /// `0` means the event is not written to any channel.
+    #[must_use]
+    pub fn channel(&self) -> u8 {
+        self.0.EventHeader.EventDescriptor.Channel
+    }
+
     /// The `Level` field from the wrapped `EVENT_RECORD`
     #[must_use]
     pub fn level(&self) -> u8 {
         self.0.EventHeader.EventDescriptor.Level
+    }
+
+    /// The `Task` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Identifies the logical unit of work (manifest-defined) the event relates to,
+    /// see [TaskType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-tasktype-complextype).
+    /// `0` means the event does not specify a task.
+    #[must_use]
+    pub fn task(&self) -> u16 {
+        self.0.EventHeader.EventDescriptor.Task
     }
 
     /// The `Keyword` field from the wrapped `EVENT_RECORD`
