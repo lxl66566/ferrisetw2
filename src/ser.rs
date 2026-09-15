@@ -29,12 +29,13 @@
 
 use std::net::IpAddr;
 
-use serde::ser::{SerializeMap, SerializeStruct};
+use serde::ser::{SerializeMap, SerializeSeq, SerializeStruct};
 use windows::Win32::System::Diagnostics::Etw::{EVENT_DESCRIPTOR, EVENT_HEADER};
 
 use crate::{
     GUID,
     native::{
+        EVENT_EXTENDED_ITEM_INSTANCE, EventHeaderExtendedDataItem, ExtendedDataItem,
         etw_types::event_record::EventRecord,
         tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType},
         time::{FileTime, SystemTime},
@@ -53,7 +54,8 @@ pub struct EventSerializerOptions {
     pub include_schema: bool,
     /// Includes the [EVENT_HEADER](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/fa4f7836-06ee-4ab6-8688-386a5a85f8c5) in the serialized output.
     pub include_header: bool,
-    /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output.
+    /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output,
+    /// as an `Extended` array of `{"Type", "Data"}` entries.
     pub include_extended_data: bool,
     /// When `true` unimplemented serialization fails with an error, otherwise unimplemented
     /// serialization is skipped and will not be present in the serialized output.
@@ -116,13 +118,13 @@ impl serde::ser::Serialize for EventSerializer<'_> {
             state.skip_field("Header")?;
         }
 
-        if self.options.include_extended_data && self.options.fail_unimplemented {
-            // TODO
-            return Err(serde::ser::Error::custom(
-                "not implemented for extended data",
-            ));
+        if self.options.include_extended_data {
+            let extended =
+                ExtendedSer::new(self.record.extended_data(), self.options.fail_unimplemented);
+            state.serialize_field("Extended", &extended)?;
+        } else {
+            state.skip_field("Extended")?;
         }
-        state.skip_field("Extended")?;
 
         let event = EventSer::new(self.record, self.schema, &self.parser, &self.options);
         state.serialize_field("Event", &event)?;
@@ -261,6 +263,153 @@ impl serde::ser::Serialize for DescriptorSer<'_> {
     }
 }
 
+/// Serializes the extended data items of an event as an array
+///
+/// Unsupported items are skipped, or fail the serialization when `fail_unimplemented` is set,
+/// mirroring how unimplemented event properties are handled.
+struct ExtendedSer<'a> {
+    items: &'a [EventHeaderExtendedDataItem],
+    fail_unimplemented: bool,
+}
+
+impl<'a> ExtendedSer<'a> {
+    fn new(items: &'a [EventHeaderExtendedDataItem], fail_unimplemented: bool) -> Self {
+        Self {
+            items,
+            fail_unimplemented,
+        }
+    }
+}
+
+impl serde::ser::Serialize for ExtendedSer<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_seq(None)?;
+        for item in self.items {
+            // to_extended_data_item is called exactly once per item: it may
+            // allocate (SID copy, stack trace, event name), don't repeat it
+            let data = item.to_extended_data_item();
+            if matches!(data, ExtendedDataItem::Unsupported) {
+                if self.fail_unimplemented {
+                    return Err(serde::ser::Error::custom(format!(
+                        "not implemented extended data ExtType {}",
+                        item.data_type()
+                    )));
+                }
+                continue;
+            }
+            state.serialize_element(&ExtendedDataItemSer(&data))?;
+        }
+        state.end()
+    }
+}
+
+/// Serializes one [`ExtendedDataItem`] as `{"Type": <variant name>, "Data": <payload>}`
+struct ExtendedDataItemSer<'a>(&'a ExtendedDataItem);
+
+impl serde::ser::Serialize for ExtendedDataItemSer<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ExtendedDataItem", 2)?;
+        match self.0 {
+            // Only reachable outside ExtendedSer's filtering: emit a marker
+            ExtendedDataItem::Unsupported => {
+                state.serialize_field("Type", "Unsupported")?;
+                let none: Option<u8> = None;
+                state.serialize_field("Data", &none)?;
+            },
+            ExtendedDataItem::RelatedActivityId(guid) => {
+                state.serialize_field("Type", "RelatedActivityId")?;
+                state.serialize_field("Data", &GUIDExt(*guid))?;
+            },
+            ExtendedDataItem::Sid(sid) => {
+                state.serialize_field("Type", "Sid")?;
+                let sddl = sid.to_sddl_string().map_err(serde::ser::Error::custom)?;
+                state.serialize_field("Data", &sddl)?;
+            },
+            ExtendedDataItem::TsId(id) => {
+                state.serialize_field("Type", "TsId")?;
+                state.serialize_field("Data", id)?;
+            },
+            ExtendedDataItem::InstanceInfo(info) => {
+                state.serialize_field("Type", "InstanceInfo")?;
+                state.serialize_field("Data", &InstanceInfoSer(*info))?;
+            },
+            ExtendedDataItem::StackTrace32(trace) => {
+                state.serialize_field("Type", "StackTrace32")?;
+                state.serialize_field("Data", &StackTraceSer {
+                    match_id: trace.match_id(),
+                    addresses: trace.addresses(),
+                })?;
+            },
+            ExtendedDataItem::StackTrace64(trace) => {
+                state.serialize_field("Type", "StackTrace64")?;
+                state.serialize_field("Data", &StackTraceSer {
+                    match_id: trace.match_id(),
+                    addresses: trace.addresses(),
+                })?;
+            },
+            ExtendedDataItem::TraceLogging(name) => {
+                state.serialize_field("Type", "TraceLogging")?;
+                state.serialize_field("Data", name)?;
+            },
+            ExtendedDataItem::ProvTraits(bytes) => {
+                state.serialize_field("Type", "ProvTraits")?;
+                state.serialize_field("Data", &bytes.as_slice())?;
+            },
+            ExtendedDataItem::ContainerId(guid) => {
+                state.serialize_field("Type", "ContainerId")?;
+                state.serialize_field("Data", &GUIDExt(*guid))?;
+            },
+            ExtendedDataItem::EventKey(key) => {
+                state.serialize_field("Type", "EventKey")?;
+                state.serialize_field("Data", key)?;
+            },
+            ExtendedDataItem::ProcessStartKey(key) => {
+                state.serialize_field("Type", "ProcessStartKey")?;
+                state.serialize_field("Data", key)?;
+            },
+        }
+        state.end()
+    }
+}
+
+struct InstanceInfoSer(EVENT_EXTENDED_ITEM_INSTANCE);
+
+impl serde::ser::Serialize for InstanceInfoSer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("InstanceInfo", 3)?;
+        state.serialize_field("InstanceId", &self.0.InstanceId)?;
+        state.serialize_field("ParentInstanceId", &self.0.ParentInstanceId)?;
+        state.serialize_field("ParentGuid", &GUIDExt(self.0.ParentGuid))?;
+        state.end()
+    }
+}
+
+struct StackTraceSer<'a, Address> {
+    match_id: u64,
+    addresses: &'a [Address],
+}
+
+impl<Address: serde::ser::Serialize> serde::ser::Serialize for StackTraceSer<'_, Address> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("StackTrace", 2)?;
+        state.serialize_field("MatchId", &self.match_id)?;
+        state.serialize_field("Addresses", self.addresses)?;
+        state.end()
+    }
+}
+
 struct EventSer<'a, 'b> {
     record: &'a EventRecord,
     schema: &'a Schema,
@@ -342,8 +491,14 @@ struct PropSer(PropHandler);
 
 #[cfg(test)]
 mod test {
+    use windows::Win32::System::Diagnostics::Etw::{
+        EVENT_HEADER_EXT_TYPE_PEBS_INDEX, EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+        EVENT_HEADER_EXT_TYPE_SID, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+        EVENT_HEADER_EXT_TYPE_TS_ID,
+    };
+
     use super::*;
-    use crate::native::tdh_types::PropertyLength;
+    use crate::native::{etw_types::extended_data::guid_bytes, tdh_types::PropertyLength};
 
     #[test]
     fn guid_serializes_like_its_debug_representation() {
@@ -373,6 +528,57 @@ mod test {
         let value = serde_json::to_value(HeaderSer::new(&header)).unwrap();
         assert_eq!(value["Flags"], serde_json::json!(0x0001));
         assert_eq!(value["EventProperty"], serde_json::json!(0x0002));
+    }
+
+    #[test]
+    fn extended_data_serializes_supported_items() {
+        let guid = GUID::from_u128(0x56781234_abcd_4609_0102_030405060708);
+        // S-1-5-18 (Local System): revision 1, 1 sub-authority, authority 5, RID 18
+        let mut sid_blob = vec![1u8, 1, 0, 0, 0, 0, 0, 5];
+        sid_blob.extend_from_slice(&18u32.to_le_bytes());
+        let mut stack_blob = 42u64.to_le_bytes().to_vec(); // MatchId
+        stack_blob.extend_from_slice(&0x1000u64.to_le_bytes());
+        stack_blob.extend_from_slice(&0x2000u64.to_le_bytes());
+        let items = vec![
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+                &guid_bytes(guid),
+            ),
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &sid_blob),
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_TS_ID,
+                &7u32.to_le_bytes(),
+            ),
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+                &stack_blob,
+            ),
+        ];
+
+        let value = serde_json::to_value(ExtendedSer::new(&items, false)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {"Type": "RelatedActivityId", "Data": "56781234-ABCD-4609-0102-030405060708"},
+                {"Type": "Sid", "Data": "S-1-5-18"},
+                {"Type": "TsId", "Data": 7},
+                {"Type": "StackTrace64", "Data": {"MatchId": 42, "Addresses": [0x1000, 0x2000]}},
+            ])
+        );
+    }
+
+    #[test]
+    fn unsupported_extended_data_is_skipped_or_fails() {
+        // PEBS indexes are not parsed into an ExtendedDataItem variant
+        let items = [EventHeaderExtendedDataItem::from_raw_parts(
+            EVENT_HEADER_EXT_TYPE_PEBS_INDEX,
+            &[0u8; 8],
+        )];
+
+        let value = serde_json::to_value(ExtendedSer::new(&items, false)).unwrap();
+        assert_eq!(value, serde_json::json!([]));
+
+        assert!(serde_json::to_value(ExtendedSer::new(&items, true)).is_err());
     }
 
     fn value_info(in_type: TdhInType) -> PropertyInfo {
