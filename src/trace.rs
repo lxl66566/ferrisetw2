@@ -10,7 +10,7 @@ use windows::{
 };
 
 use self::private::{PrivateRealTimeTraceTrait, PrivateTraceTrait};
-pub use crate::native::etw_types::{DumpFileLoggingMode, LoggingMode};
+pub use crate::native::etw_types::{ClockType, DumpFileLoggingMode, LoggingMode};
 use crate::{
     EventRecord, SchemaLocator,
     native::{
@@ -68,6 +68,10 @@ pub struct TraceProperties {
     pub flush_timer: Duration,
     /// Represents the ETW Session [Logging Mode](https://docs.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
     pub log_file_mode: LoggingMode,
+    /// Represents the ETW Session clock resolution used to timestamp events.
+    ///
+    /// Defaults to [`ClockType::Qpc`] (the Windows default)
+    pub clock_type: ClockType,
 }
 
 impl Default for TraceProperties {
@@ -80,6 +84,7 @@ impl Default for TraceProperties {
             flush_timer: Duration::from_secs(1),
             log_file_mode: LoggingMode::EVENT_TRACE_REAL_TIME_MODE
                 | LoggingMode::EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING,
+            clock_type: ClockType::default(),
         }
     }
 }
@@ -466,6 +471,16 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Define several low-level properties of the trace at once.
     ///
     /// These are part of [`EVENT_TRACE_PROPERTIES`](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
+    ///
+    /// # Example
+    /// ```
+    /// # use ferrisetw::trace::{ClockType, TraceProperties, UserTrace};
+    /// let props = TraceProperties {
+    ///     clock_type: ClockType::SystemTime,
+    ///     ..Default::default()
+    /// };
+    /// let builder = UserTrace::new().set_trace_properties(props);
+    /// ```
     #[must_use]
     pub fn set_trace_properties(mut self, props: TraceProperties) -> Self {
         self.properties = props;

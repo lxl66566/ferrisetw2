@@ -173,6 +173,28 @@ bitflags! {
     }
 }
 
+/// The clock resolution used to timestamp the events of a session
+///
+/// Maps to the `Wnode.ClientContext` field of [EVENT_TRACE_PROPERTIES](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
+/// (see the [WNODE_HEADER clock types](https://learn.microsoft.com/en-us/windows/win32/etw/wnode-header)).
+///
+/// The third Windows clock type, the CPU cycle counter, is deliberately not
+/// exposed: Microsoft deems it unreliable on modern CPUs (frequency scaling,
+/// idle states) and unsupported hardware silently falls back to system time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ClockType {
+    /// Query performance counter: high-resolution and unaffected by system
+    /// clock adjustments. Best for high event rates, or when ordering events
+    /// coming from different buffers. This is the Windows default.
+    #[default]
+    Qpc = 1,
+    /// System time: tracks system clock adjustments (e.g. an NTP
+    /// synchronization jumping the clock forward). Required when appending to
+    /// an existing sequential dump file
+    /// (see [`DumpFileLoggingMode::EVENT_TRACE_FILE_MODE_APPEND`]).
+    SystemTime = 2,
+}
+
 impl Default for DumpFileLoggingMode {
     fn default() -> Self {
         Self::EVENT_TRACE_FILE_MODE_NONE
@@ -237,7 +259,7 @@ impl EventTraceProperties {
         etw_trace_properties.Wnode.BufferSize = buffer_size;
         etw_trace_properties.Wnode.Guid = T::trace_guid();
         etw_trace_properties.Wnode.Flags = Etw::WNODE_FLAG_TRACED_GUID;
-        etw_trace_properties.Wnode.ClientContext = 1; // QPC clock resolution
+        etw_trace_properties.Wnode.ClientContext = trace_properties.clock_type as u32;
         etw_trace_properties.BufferSize = trace_properties.buffer_size;
         etw_trace_properties.MinimumBuffers = trace_properties.min_buffer;
         etw_trace_properties.MaximumBuffers = trace_properties.max_buffer;
@@ -519,6 +541,32 @@ mod tests {
             Etw::EVENT_TRACE_FLAG::default(),
         );
         etw_properties.etw_trace_properties.FlushTimer
+    }
+
+    fn computed_client_context(clock_type: ClockType) -> u32 {
+        let properties = TraceProperties {
+            clock_type,
+            ..Default::default()
+        };
+        let etw_properties = EventTraceProperties::new::<UserTrace>(
+            &U16CString::from_str("test-trace").unwrap(),
+            None,
+            &properties,
+            Etw::EVENT_TRACE_FLAG::default(),
+        );
+        etw_properties.etw_trace_properties.Wnode.ClientContext
+    }
+
+    #[test]
+    fn clock_type_maps_to_its_native_value() {
+        // WNODE_HEADER documentation: 1 = QPC, 2 = system time
+        assert_eq!(computed_client_context(ClockType::Qpc), 1);
+        assert_eq!(computed_client_context(ClockType::SystemTime), 2);
+        // The Windows default (unset ClientContext behaves as QPC)
+        assert_eq!(
+            computed_client_context(TraceProperties::default().clock_type),
+            1
+        );
     }
 
     #[test]
