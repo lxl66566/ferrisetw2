@@ -384,15 +384,18 @@ mod test {
     }
 
     #[test]
-    fn counted_ansi_string_serializes_as_string() {
-        let info = value_info(TdhInType::InTypeCountedAnsiString);
-        assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
-    }
-
-    #[test]
-    fn counted_string_is_not_serialized_yet() {
-        let info = value_info(TdhInType::InTypeCountedString);
-        assert!(info.get_parser().is_none());
+    fn counted_strings_serialize_as_string() {
+        // The WBEM (300+) and manifest (22/23) counted string variants share the
+        // same layout, and must all go through the String handler
+        for in_type in [
+            TdhInType::InTypeManifestCountedString,
+            TdhInType::InTypeCountedString,
+            TdhInType::InTypeManifestCountedAnsiString,
+            TdhInType::InTypeCountedAnsiString,
+        ] {
+            let info = value_info(in_type);
+            assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
+        }
     }
 }
 
@@ -514,11 +517,14 @@ impl PropSerable for PropertyInfo {
                     },
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
-                        // `try_parse::<String>` is implemented for CountedAnsiString (see
-                        // parser.rs)
+                        // `try_parse::<String>` is implemented for the counted string
+                        // in types (see parser.rs)
                         TdhInType::InTypeUnicodeString
                         | TdhInType::InTypeAnsiString
                         | TdhInType::InTypeSid
+                        | TdhInType::InTypeManifestCountedString
+                        | TdhInType::InTypeCountedString
+                        | TdhInType::InTypeManifestCountedAnsiString
                         | TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
@@ -540,7 +546,6 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypePointer => Some(PropSer(PropHandler::Pointer)),
                         TdhInType::InTypeFileTime => Some(PropSer(PropHandler::FileTime)),
                         TdhInType::InTypeSystemTime => Some(PropSer(PropHandler::SystemTime)),
-                        TdhInType::InTypeCountedString => None, // TODO
                     },
                 }
             },

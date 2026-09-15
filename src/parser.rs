@@ -448,11 +448,40 @@ impl_try_parse_primitive_array!(i32);
 impl_try_parse_primitive_array!(u64);
 impl_try_parse_primitive_array!(i64);
 
+/// Parses a count-prefixed string: a little-endian `u16` byte count followed by
+/// the payload (UTF-16 code units when `wide`, bytes otherwise)
+fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
+    const COUNT_LEN: usize = size_of::<u16>();
+    let Some(count_bytes) = buffer.get(..COUNT_LEN) else {
+        return Err(ParserError::PropertyError(
+            "counted string does not have length".into(),
+        ));
+    };
+    // Guaranteed by the slice length above
+    let byte_count = u16::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
+    let Some(data) = buffer.get(COUNT_LEN..COUNT_LEN + byte_count) else {
+        return Err(ParserError::PropertyError(
+            "invalid counted string length".into(),
+        ));
+    };
+
+    if wide {
+        Ok(widestring::decode_utf16_lossy(
+            data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
+        )
+        .collect())
+    } else {
+        Ok(std::str::from_utf8(data)?.to_string())
+    }
+}
+
 /// The `String` impl of the `TryParse` trait should be used to retrieve the following [TdhInTypes]:
 ///
 /// * InTypeUnicodeString
 /// * InTypeAnsiString
-/// * InTypeCountedString
+/// * InTypeCountedString (+ its manifest twin)
+/// * InTypeCountedAnsiString (+ its manifest twin)
 /// * InTypeGuid
 ///
 /// On success a `String` with the with the data from the `name` property will be returned
@@ -515,25 +544,11 @@ impl private::TryParse<String> for Parser<'_, '_> {
                     let string = sddl::convert_sid_to_string(prop_slice.buffer.as_ptr().cast())?;
                     Ok(string)
                 },
-                TdhInType::InTypeCountedString => unimplemented!(),
-                TdhInType::InTypeCountedAnsiString => {
-                    if prop_slice.buffer.len() < 2 {
-                        return Err(ParserError::PropertyError(
-                            "counted string does not have length".into(),
-                        ));
-                    }
-                    let str_length = u16::from_le_bytes(
-                        prop_slice.buffer[..size_of::<u16>()].try_into().unwrap(),
-                    ) as usize;
-                    if prop_slice.buffer[size_of::<u16>()..].len() < str_length {
-                        return Err(ParserError::PropertyError(
-                            "invalid counted string length".into(),
-                        ));
-                    }
-                    let string = std::str::from_utf8(
-                        &prop_slice.buffer[size_of::<u16>()..size_of::<u16>() + str_length],
-                    )?;
-                    Ok(string.to_string())
+                TdhInType::InTypeManifestCountedString | TdhInType::InTypeCountedString => {
+                    parse_counted_string(prop_slice.buffer, true)
+                },
+                TdhInType::InTypeManifestCountedAnsiString | TdhInType::InTypeCountedAnsiString => {
+                    parse_counted_string(prop_slice.buffer, false)
                 },
                 _ => Err(ParserError::InvalidType),
             },
@@ -741,6 +756,7 @@ mod tests {
     struct PropSpec {
         name: &'static str,
         in_type: TdhInType,
+        out_type: TdhOutType,
         /// `EVENT_PROPERTY_INFO.Flags` (e.g. `PropertyParamCount`)
         flags: u32,
         /// Value written to the count/countPropertyIndex union member
@@ -754,6 +770,7 @@ mod tests {
             Self {
                 name,
                 in_type,
+                out_type: TdhOutType::OutTypeNull,
                 flags: 0,
                 count: 0,
                 length,
@@ -796,6 +813,7 @@ mod tests {
                 (*prop).Flags = flags;
                 (*prop).NameOffset = name_offset;
                 (*prop).Anonymous1.nonStructType.InType = spec.in_type as u16;
+                (*prop).Anonymous1.nonStructType.OutType = spec.out_type as u16;
                 (*prop).Anonymous2.count = spec.count;
                 (*prop).Anonymous3.length = spec.length;
 
@@ -946,5 +964,60 @@ mod tests {
         // The u32 sits right after the 3-byte string: this verifies the string
         // size computation (NUL included)
         assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn counted_strings_parse_and_advance_the_offset() {
+        // Layout: little-endian u16 BYTE count, then the payload
+        let wide: Vec<u8> = "hï".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ansi = b"hi".to_vec();
+
+        // The WBEM (300+) and manifest (22/23) variants share the same layout
+        let cases = [
+            (
+                TdhInType::InTypeManifestCountedString,
+                wide.as_slice(),
+                "hï",
+            ),
+            (TdhInType::InTypeCountedString, wide.as_slice(), "hï"),
+            (
+                TdhInType::InTypeManifestCountedAnsiString,
+                ansi.as_slice(),
+                "hi",
+            ),
+            (TdhInType::InTypeCountedAnsiString, ansi.as_slice(), "hi"),
+        ];
+
+        for (in_type, payload, expected) in cases {
+            let user_data: Vec<u8> = u16::try_from(payload.len())
+                .unwrap()
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .chain(0x1122_3344u32.to_ne_bytes())
+                .collect();
+
+            let record = synthetic_record(&user_data);
+            let schema = synthetic_schema(&[
+                PropSpec::new("s", in_type, u16::try_from(2 + payload.len()).unwrap()),
+                PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+            ]);
+            let parser = Parser::create(&record, &schema);
+
+            assert_eq!(parser.try_parse::<String>("s").unwrap(), expected);
+            // The u32 sits right after the counted string: this verifies the
+            // property size computation
+            assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+        }
+    }
+
+    #[test]
+    fn counted_strings_with_invalid_length_are_an_error() {
+        // The byte count exceeds what the buffer holds
+        let user_data = 42u16.to_le_bytes();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new("s", TdhInType::InTypeCountedString, 2)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(parser.try_parse::<String>("s").is_err());
     }
 }

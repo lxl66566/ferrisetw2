@@ -197,7 +197,15 @@ pub enum TdhInType {
     InTypeSid,        // Field size determined by the first few bytes of the field
     InTypeHexInt32,
     InTypeHexInt64,
+    /// Little-endian 16-bit byte count followed by UTF-16 data
+    /// (TDH_INTYPE_MANIFEST_COUNTEDSTRING, a.k.a. win:CountedUnicodeString)
+    InTypeManifestCountedString,
+    /// Little-endian 16-bit byte count followed by 8-bit characters
+    /// (TDH_INTYPE_MANIFEST_COUNTEDANSISTRING, a.k.a. win:CountedAnsiString)
+    InTypeManifestCountedAnsiString,
+    /// WBEM twin of [`TdhInType::InTypeManifestCountedString`], same layout
     InTypeCountedString = 300,
+    /// WBEM twin of [`TdhInType::InTypeManifestCountedAnsiString`], same layout
     InTypeCountedAnsiString,
 }
 
