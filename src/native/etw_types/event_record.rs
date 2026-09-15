@@ -1,9 +1,11 @@
 //! Safe wrappers over the EVENT_RECORD type
 
+use std::borrow::Cow;
+
 use windows::{Win32::System::Diagnostics::Etw::EVENT_RECORD, core::GUID};
 
 use super::EVENT_HEADER_FLAG_32_BIT_HEADER;
-use crate::native::{ExtendedDataItem, etw_types::extended_data::EventHeaderExtendedDataItem};
+use crate::native::etw_types::extended_data::EventHeaderExtendedDataItem;
 
 /// A read-only wrapper over an [EVENT_RECORD](https://docs.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_record)
 #[repr(transparent)]
@@ -236,19 +238,24 @@ impl EventRecord {
     /// Returns the `eventName` for manifest-free events
     #[must_use]
     pub fn event_name(&self) -> String {
+        self.event_name_cow().into_owned()
+    }
+
+    /// [`EventRecord::event_name`], without the mandatory copy: the returned
+    /// string borrows the TraceLogging metadata embedded in the event whenever
+    /// it is valid UTF-8, so probing a cache with it does not allocate
+    pub(crate) fn event_name_cow(&self) -> Cow<'_, str> {
         if self.event_id() != 0 {
-            return String::new();
+            return Cow::Borrowed("");
         }
 
-        if let Some(ExtendedDataItem::TraceLogging(name)) = self
+        match self
             .extended_data()
             .iter()
             .find(|ext_data| ext_data.is_tlg())
-            .map(EventHeaderExtendedDataItem::to_extended_data_item)
         {
-            name
-        } else {
-            String::new()
+            Some(tlg_item) => unsafe { tlg_item.get_event_name() }.unwrap_or_default(),
+            None => Cow::Borrowed(""),
         }
     }
 }

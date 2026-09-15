@@ -1,6 +1,6 @@
 //! A module to handle Extended Data from ETW traces
 
-use std::{convert::TryInto, ffi::CStr};
+use std::{borrow::Cow, convert::TryInto, ffi::CStr};
 
 use windows::{
     Win32::System::Diagnostics::Etw::{
@@ -245,9 +245,11 @@ impl EventHeaderExtendedDataItem {
                 ExtendedDataItem::EventKey(unsafe { *data_ptr })
             },
 
-            EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL => {
-                ExtendedDataItem::TraceLogging(unsafe { self.get_event_name().unwrap_or_default() })
-            },
+            EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL => ExtendedDataItem::TraceLogging(
+                unsafe { self.get_event_name() }
+                    .unwrap_or_default()
+                    .into_owned(),
+            ),
 
             // The traits blob is provider-defined, keep it opaque
             EVENT_HEADER_EXT_TYPE_PROV_TRAITS => {
@@ -297,12 +299,18 @@ impl EventHeaderExtendedDataItem {
     ///
     /// We are only interested in `EventName`, so we skip `TotalSize` and `Tags`.
     ///
+    /// The name borrows from the metadata blob whenever it is valid UTF-8
+    /// (the common case), so probing a cache with it does not allocate.
+    ///
     /// # Safety
+    ///
+    /// The returned string borrows the metadata blob: it must stay valid and
+    /// unmodified as long as the borrow is alive.
     ///
     /// As per the MS header 'This structure may change in future revisions of this header.'
     /// **Keep an eye on it!**
     // TODO: Make this function more robust
-    unsafe fn get_event_name(&self) -> Option<String> {
+    pub(crate) unsafe fn get_event_name(&self) -> Option<Cow<'_, str>> {
         const TAGS_SIZE: usize = 1;
         debug_assert!(self.is_tlg());
 
@@ -320,6 +328,7 @@ impl EventHeaderExtendedDataItem {
         let mut n = 0;
         while n < size {
             // Read until you hit a byte with high bit unset.
+            // Safety: n < size <= DataSize bytes are readable from the blob
             let tag = unsafe { data_ptr.read_unaligned() };
             data_ptr = unsafe { data_ptr.add(TAGS_SIZE) };
 
@@ -336,13 +345,8 @@ impl EventHeaderExtendedDataItem {
             return None;
         }
 
-        Some(String::from(
-            unsafe {
-                // Safety: same extended data item, the name follows the tags
-                CStr::from_ptr(data_ptr.cast())
-            }
-            .to_string_lossy(),
-        ))
+        // Safety: the name starts within the blob and the blob is NUL-terminated
+        Some(unsafe { CStr::from_ptr(data_ptr.cast()) }.to_string_lossy())
     }
 }
 
