@@ -66,10 +66,30 @@ impl EventRecord {
         self.0.EventHeader.EventDescriptor.Version
     }
 
+    /// The `Channel` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Manifest-defined channel the event is written to (e.g. Admin, Operational, Analytic),
+    /// see [ChannelType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-channeltype-complextype).
+    /// `0` means the event is not written to any channel.
+    #[must_use]
+    pub fn channel(&self) -> u8 {
+        self.0.EventHeader.EventDescriptor.Channel
+    }
+
     /// The `Level` field from the wrapped `EVENT_RECORD`
     #[must_use]
     pub fn level(&self) -> u8 {
         self.0.EventHeader.EventDescriptor.Level
+    }
+
+    /// The `Task` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Identifies the logical unit of work (manifest-defined) the event relates to,
+    /// see [TaskType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-tasktype-complextype).
+    /// `0` means the event does not specify a task.
+    #[must_use]
+    pub fn task(&self) -> u16 {
+        self.0.EventHeader.EventDescriptor.Task
     }
 
     /// The `Keyword` field from the wrapped `EVENT_RECORD`
@@ -100,6 +120,43 @@ impl EventRecord {
     #[must_use]
     pub fn activity_id(&self) -> GUID {
         self.0.EventHeader.ActivityId
+    }
+
+    /// The `KernelTime` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Elapsed execution time for kernel-mode instructions, in CPU time units, charged to the
+    /// thread at the time of logging (compute deltas between consecutive events of a thread to
+    /// measure CPU cost, see [Microsoft's remarks](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header#remarks)).
+    ///
+    /// Only meaningful when [`EventRecord::event_flags`] contains neither
+    /// `EVENT_HEADER_FLAG_NO_CPUTIME` nor `EVENT_HEADER_FLAG_PRIVATE_SESSION`: the underlying
+    /// union then holds a processor tick count instead, see [`EventRecord::processor_time`].
+    #[must_use]
+    pub fn kernel_time(&self) -> u32 {
+        // Safety: union read of a plain u32, valid whatever the active union member
+        unsafe { self.0.EventHeader.Anonymous.Anonymous.KernelTime }
+    }
+
+    /// The `UserTime` field from the wrapped `EVENT_RECORD`
+    ///
+    /// Elapsed execution time for user-mode instructions, in CPU time units. See
+    /// [`EventRecord::kernel_time`] for the semantics and validity conditions.
+    #[must_use]
+    pub fn user_time(&self) -> u32 {
+        // Safety: union read of a plain u32, valid whatever the active union member
+        unsafe { self.0.EventHeader.Anonymous.Anonymous.UserTime }
+    }
+
+    /// The `ProcessorTime` member of the wrapped `EVENT_RECORD`'s union
+    ///
+    /// Elapsed execution time in CPU ticks. This is the active union member whenever
+    /// [`EventRecord::event_flags`] contains `EVENT_HEADER_FLAG_NO_CPUTIME` or
+    /// `EVENT_HEADER_FLAG_PRIVATE_SESSION`; for other events read
+    /// [`EventRecord::kernel_time`]/[`EventRecord::user_time`] instead.
+    #[must_use]
+    pub fn processor_time(&self) -> u64 {
+        // Safety: union read of a plain u64, valid whatever the active union member
+        unsafe { self.0.EventHeader.Anonymous.ProcessorTime }
     }
 
     /// The `TimeStamp` field from the wrapped `EVENT_RECORD`
