@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub(crate) mod event_filter;
-pub use event_filter::EventFilter;
+pub use event_filter::{EventFilter, EventNamesFilter};
 
 pub mod kernel_providers;
 mod trace_flags;
@@ -378,17 +378,24 @@ impl ProviderBuilder {
     /// Adding multiple filters will bind them with an `AND` relationship.<br/>
     /// If you want an `OR` relationship, include them in the same `EventFilter`.<br/>
     /// Note that Windows allows at most one filter of each type per provider
-    /// (e.g. only one `EventFilter::ByEventIds`): adding more will make trace creation fail.
+    /// (e.g. only one event ID filter, whether inclusive or exclusive): adding
+    /// more will make trace creation fail.
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::{EventFilter, Provider};
+    /// # use ferrisetw::provider::{EventFilter, EventNamesFilter, Provider};
     /// let only_events_18_or_42 = EventFilter::ByEventIds(vec![18, 42]);
     /// let only_pid_1234 = EventFilter::ByPids(vec![1234]);
+    /// let only_cmd_exe = EventFilter::ByExecutableNames(vec!["cmd.exe".into()]);
+    /// let drop_my_event =
+    ///     EventFilter::ByEventNames(EventNamesFilter::new(vec!["MyEventName".into()]).exclude());
     ///
     /// Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
     ///     .add_filter(only_events_18_or_42)
     ///     .add_filter(only_pid_1234)
+    ///     // each additional filter type narrows the events down further
+    ///     .add_filter(only_cmd_exe)
+    ///     .add_filter(drop_my_event)
     ///     .build();
     /// ```
     #[must_use]

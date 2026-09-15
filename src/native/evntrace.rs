@@ -19,7 +19,7 @@ use windows::{
             Etw,
             Etw::{
                 EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                TRACE_QUERY_INFO_CLASS,
+                EVENT_FILTER_TYPE_STACKWALK, TRACE_QUERY_INFO_CLASS,
             },
         },
     },
@@ -29,7 +29,7 @@ use windows::{
 use super::etw_types::*;
 use crate::{
     native::etw_types::event_record::EventRecord,
-    provider::{Provider, event_filter::EventFilterDescriptor},
+    provider::{Provider, TraceFlags, event_filter::EventFilterDescriptor},
     trace::{RealTimeTraceTrait, TraceProperties, callback_data::CallbackData},
 };
 
@@ -298,9 +298,20 @@ pub(crate) fn enable_provider(
         Some(handle) => {
             let owned_event_filter_descriptors = build_event_filter_descriptors(provider)?;
 
+            // A stackwalk filter is inert unless the provider is enabled with
+            // the STACK_TRACE property, so add it on the user's behalf
+            // (https://learn.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor)
+            let mut enable_property = provider.trace_flags();
+            if owned_event_filter_descriptors
+                .iter()
+                .any(|d| d.filter_type() == EVENT_FILTER_TYPE_STACKWALK)
+            {
+                enable_property |= TraceFlags::EVENT_ENABLE_PROPERTY_STACK_TRACE;
+            }
+
             let parameters = EnableTraceParameters::create(
                 provider.guid(),
-                provider.trace_flags(),
+                enable_property,
                 &owned_event_filter_descriptors,
             );
 
