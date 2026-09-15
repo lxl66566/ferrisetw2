@@ -239,6 +239,8 @@ pub enum TdhOutType {
     OutTypePort,
     OutTypeIpv4,
     OutTypeIpv6,
+    /// The field is a `SOCKADDR` structure (TDH_OUTTYPE_SOCKETADDRESS)
+    OutTypeSocketAddress = 25,
     OutTypeWin32Error = 30,
     OutTypeNtStatus = 31,
     OutTypeHResult = 32,

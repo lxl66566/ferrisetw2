@@ -85,6 +85,10 @@ impl std::fmt::Display for ParserError {
 
 type ParserResult<T> = Result<T, ParserError>;
 
+mod socket_address;
+
+pub use socket_address::{AddressFamily, TdhSocketAddress};
+
 #[derive(Default)]
 /// Cache of the properties we've extracted already
 ///
@@ -637,6 +641,37 @@ impl private::TryParse<bool> for Parser<'_, '_> {
     }
 }
 
+/// The `TdhSocketAddress` impl of the `TryParse` trait should be used to retrieve
+/// a `win:SocketAddress` property (OutType = [`TdhOutType::OutTypeSocketAddress`])
+///
+/// # Example
+/// ```
+/// # use ferrisetw::EventRecord;
+/// # use ferrisetw::parser::{Parser, TdhSocketAddress};
+/// # use ferrisetw::schema_locator::SchemaLocator;
+/// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
+///     let schema = schema_locator.event_schema(record).unwrap();
+///     let parser = Parser::create(record, &schema);
+///     let addr: TdhSocketAddress = parser.try_parse("RemoteAddress").unwrap();
+/// };
+/// ```
+impl private::TryParse<TdhSocketAddress> for Parser<'_, '_> {
+    fn try_parse_impl(&self, name: &str) -> ParserResult<TdhSocketAddress> {
+        let prop_slice = self.find_property(name)?;
+
+        match prop_slice.property.info {
+            PropertyInfo::Value { out_type, .. } => {
+                if out_type != TdhOutType::OutTypeSocketAddress {
+                    return Err(ParserError::InvalidType);
+                }
+
+                TdhSocketAddress::from_property_buffer(prop_slice.buffer)
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+        }
+    }
+}
+
 impl private::TryParse<FileTime> for Parser<'_, '_> {
     fn try_parse_impl(&self, name: &str) -> ParserResult<FileTime> {
         let prop_slice = self.find_property(name)?;
@@ -736,7 +771,6 @@ impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
     }
 }
 
-// TODO: Implement SocketAddress
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
 
 #[cfg(test)]
@@ -775,6 +809,11 @@ mod tests {
                 count: 0,
                 length,
             }
+        }
+
+        const fn with_out_type(mut self, out_type: TdhOutType) -> Self {
+            self.out_type = out_type;
+            self
         }
     }
 
@@ -1019,5 +1058,42 @@ mod tests {
         let schema = synthetic_schema(&[PropSpec::new("s", TdhInType::InTypeCountedString, 2)]);
         let parser = Parser::create(&record, &schema);
         assert!(parser.try_parse::<String>("s").is_err());
+    }
+
+    #[test]
+    fn socket_address_property_decodes_and_advances_the_offset() {
+        // sockaddr_in (AF_INET, port 80, 127.0.0.1) padded to 16 bytes
+        let mut sockaddr: Vec<u8> = Vec::new();
+        sockaddr.extend_from_slice(&2u16.to_ne_bytes());
+        sockaddr.extend_from_slice(&80u16.to_be_bytes());
+        sockaddr.extend_from_slice(&[127, 0, 0, 1]);
+        sockaddr.resize(16, 0);
+
+        let user_data: Vec<u8> = sockaddr
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("addr", TdhInType::InTypeBinary, 16)
+                .with_out_type(TdhOutType::OutTypeSocketAddress),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        let addr = parser
+            .try_parse::<TdhSocketAddress>("addr")
+            .expect("socket address should parse");
+        assert_eq!(addr.to_string(), "127.0.0.1:80");
+        // The u32 sits right after the 16-byte sockaddr
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+
+        // A property without the SocketAddress out type is not a socket address
+        let schema = synthetic_schema(&[PropSpec::new("addr", TdhInType::InTypeBinary, 16)]);
+        let parser = Parser::create(&record, &schema);
+        assert!(matches!(
+            parser.try_parse::<TdhSocketAddress>("addr"),
+            Err(ParserError::InvalidType)
+        ));
     }
 }

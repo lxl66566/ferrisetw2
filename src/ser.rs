@@ -40,7 +40,7 @@ use crate::{
         tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType},
         time::{FileTime, SystemTime},
     },
-    parser::Parser,
+    parser::{Parser, TdhSocketAddress},
     schema::Schema,
 };
 
@@ -589,6 +589,14 @@ mod test {
         }
     }
 
+    fn value_info_with_out(in_type: TdhInType, out_type: TdhOutType) -> PropertyInfo {
+        PropertyInfo::Value {
+            in_type,
+            out_type,
+            length: PropertyLength::Length(0),
+        }
+    }
+
     #[test]
     fn counted_strings_serialize_as_string() {
         // The WBEM (300+) and manifest (22/23) counted string variants share the
@@ -602,6 +610,15 @@ mod test {
             let info = value_info(in_type);
             assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
         }
+    }
+
+    #[test]
+    fn socket_address_serializes_via_dedicated_handler() {
+        let info = value_info_with_out(TdhInType::InTypeBinary, TdhOutType::OutTypeSocketAddress);
+        assert_eq!(
+            info.get_parser().map(|p| p.0),
+            Some(PropHandler::SocketAddress)
+        );
     }
 }
 
@@ -630,6 +647,7 @@ enum PropHandler {
     Guid,
     Binary,
     IpAddr,
+    SocketAddress,
     ArrayInt16,
     ArrayUInt16,
     ArrayInt32,
@@ -674,6 +692,7 @@ impl PropHandler {
             PropHandler::String => prop_ser_type!(String, map, prop, parser),
             PropHandler::Binary => prop_ser_type!(Vec<u8>, map, prop, parser),
             PropHandler::IpAddr => prop_ser_type!(IpAddr, map, prop, parser),
+            PropHandler::SocketAddress => prop_ser_type!(TdhSocketAddress, map, prop, parser),
             PropHandler::FileTime => prop_ser_type!(FileTime, map, prop, parser),
             PropHandler::SystemTime => prop_ser_type!(SystemTime, map, prop, parser),
             PropHandler::ArrayInt16 => prop_ser_type!(&[i16], map, prop, parser),
@@ -721,6 +740,7 @@ impl PropSerable for PropertyInfo {
                     TdhOutType::OutTypeIpv4 | TdhOutType::OutTypeIpv6 => {
                         Some(PropSer(PropHandler::IpAddr))
                     },
+                    TdhOutType::OutTypeSocketAddress => Some(PropSer(PropHandler::SocketAddress)),
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
                         // `try_parse::<String>` is implemented for the counted string
