@@ -238,9 +238,14 @@ pub(crate) fn open_trace(
         EventTraceLogfile::create(callback_data, subscription_source, trace_callback_thunk);
 
     if let Err(ContextError::AlreadyExist) = UNIQUE_VALID_CONTEXTS.insert(log_file.context_ptr()) {
-        // That's probably possible to get multiple handles to the same trace, by opening them
-        // multiple times. But that's left as a future TODO. Making things right and safe is
-        // difficult enough with a single opening of the trace already.
+        // Multiple consumers of the same session or ETL file are supported the
+        // usual way: one `open_trace` (hence one context) per trace. Reusing a
+        // single context for a second open is rejected on purpose: `close_trace`
+        // removes the context from the validity registry, so the first close
+        // would silently discard the other trace's callbacks. Supporting it
+        // would require refcounted validity plus shared, address-stable
+        // ownership of the CallbackData (the `Context` pointer must never
+        // move), for no use case reachable through the public API.
         return Err(EvntraceNativeError::AlreadyExist);
     }
 
