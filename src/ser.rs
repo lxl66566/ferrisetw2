@@ -627,6 +627,35 @@ mod test {
         let info = value_info_with_out(TdhInType::InTypeCountedAnsiString, TdhOutType::OutTypeUtf8);
         assert_eq!(info.get_parser().map(|p| p.0), Some(PropHandler::String));
     }
+
+    #[test]
+    fn hex_int_fields_serialize_as_hex_strings() {
+        // Manifest-style hex fields: the hex semantics come from the in type
+        for (in_type, handler) in [
+            (TdhInType::InTypeHexInt32, PropHandler::HexInt32),
+            (TdhInType::InTypeHexInt64, PropHandler::HexInt64),
+        ] {
+            assert_eq!(value_info(in_type).get_parser().map(|p| p.0), Some(handler));
+        }
+
+        // TraceLogging hex fields: plain integer in type + hex out type
+        for (out_type, handler) in [
+            (TdhOutType::OutTypeHexInt32, PropHandler::HexInt32),
+            (TdhOutType::OutTypeHexInt64, PropHandler::HexInt64),
+        ] {
+            let info = value_info_with_out(TdhInType::InTypeUInt32, out_type);
+            assert_eq!(info.get_parser().map(|p| p.0), Some(handler));
+        }
+
+        assert_eq!(
+            serde_json::to_value(HexDisplay(0x8007_0005u32)).unwrap(),
+            serde_json::json!("0x80070005")
+        );
+        assert_eq!(
+            serde_json::to_value(HexDisplay(u64::MAX)).unwrap(),
+            serde_json::json!("0xffffffffffffffff")
+        );
+    }
 }
 
 trait PropSerable {
@@ -645,6 +674,8 @@ enum PropHandler {
     UInt32,
     Int64,
     UInt64,
+    HexInt32,
+    HexInt64,
     Pointer,
     Float,
     Double,
@@ -662,6 +693,26 @@ enum PropHandler {
     ArrayInt64,
     ArrayUInt64,
     ArrayPointer,
+}
+
+/// Serializes an integer with a hex out type as a `"0x..."` string, keeping
+/// the display semantics of `win:HexInt32`/`win:HexInt64` fields (krabsetw
+/// parity) instead of a plain number
+struct HexDisplay<T: std::fmt::LowerHex>(T);
+
+impl<T: std::fmt::LowerHex> std::fmt::Display for HexDisplay<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:x}", self.0)
+    }
+}
+
+impl<T: std::fmt::LowerHex> serde::ser::Serialize for HexDisplay<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        serializer.collect_str(self)
+    }
 }
 
 macro_rules! prop_ser_type {
@@ -694,6 +745,18 @@ impl PropHandler {
             PropHandler::UInt32 => prop_ser_type!(u32, map, prop, parser),
             PropHandler::Int64 => prop_ser_type!(i64, map, prop, parser),
             PropHandler::UInt64 => prop_ser_type!(u64, map, prop, parser),
+            PropHandler::HexInt32 => {
+                let v = parser
+                    .try_parse::<u32>(&prop.name)
+                    .map_err(serde::ser::Error::custom)?;
+                map.serialize_entry(&prop.name, &HexDisplay(v))
+            },
+            PropHandler::HexInt64 => {
+                let v = parser
+                    .try_parse::<u64>(&prop.name)
+                    .map_err(serde::ser::Error::custom)?;
+                map.serialize_entry(&prop.name, &HexDisplay(v))
+            },
             PropHandler::Float => prop_ser_type!(f32, map, prop, parser),
             PropHandler::Double => prop_ser_type!(f64, map, prop, parser),
             PropHandler::String => prop_ser_type!(String, map, prop, parser),
@@ -752,6 +815,10 @@ impl PropSerable for PropertyInfo {
                     // string whose bytes are UTF-8 (see the parser tests for
                     // the TDH type mapping)
                     TdhOutType::OutTypeUtf8 => Some(PropSer(PropHandler::String)),
+                    // TraceLogging `hex` fields: the hex semantic comes from
+                    // the out type, the in type stays a plain integer
+                    TdhOutType::OutTypeHexInt32 => Some(PropSer(PropHandler::HexInt32)),
+                    TdhOutType::OutTypeHexInt64 => Some(PropSer(PropHandler::HexInt64)),
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
                         // `try_parse::<String>` is implemented for the counted string
@@ -767,14 +834,14 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
                         TdhInType::InTypeInt16 => Some(PropSer(PropHandler::Int16)),
                         TdhInType::InTypeUInt16 => Some(PropSer(PropHandler::UInt16)),
-                        TdhInType::InTypeInt32 | TdhInType::InTypeHexInt32 => {
-                            Some(PropSer(PropHandler::Int32))
-                        },
+                        TdhInType::InTypeInt32 => Some(PropSer(PropHandler::Int32)),
                         TdhInType::InTypeUInt32 => Some(PropSer(PropHandler::UInt32)),
-                        TdhInType::InTypeInt64 | TdhInType::InTypeHexInt64 => {
-                            Some(PropSer(PropHandler::Int64))
-                        },
+                        TdhInType::InTypeInt64 => Some(PropSer(PropHandler::Int64)),
                         TdhInType::InTypeUInt64 => Some(PropSer(PropHandler::UInt64)),
+                        // Hex display semantics, whatever the width of the
+                        // underlying integer
+                        TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::HexInt32)),
+                        TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::HexInt64)),
                         TdhInType::InTypeFloat => Some(PropSer(PropHandler::Float)),
                         TdhInType::InTypeDouble => Some(PropSer(PropHandler::Double)),
                         TdhInType::InTypeBoolean => Some(PropSer(PropHandler::Bool)),
