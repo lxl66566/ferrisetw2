@@ -14,7 +14,10 @@ use once_cell::sync::Lazy;
 use widestring::U16CStr;
 use windows::{
     Win32::{
-        Foundation::{ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_SUCCESS, FILETIME},
+        Foundation::{
+            ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_INSUFFICIENT_BUFFER,
+            ERROR_SUCCESS, FILETIME,
+        },
         System::Diagnostics::{
             Etw,
             Etw::{
@@ -499,25 +502,78 @@ pub(crate) fn close_trace(
     }
 }
 
-/// Queries the system for system-wide ETW information (that does not require an active session).
-pub(crate) fn query_info(class: TraceInformation, buf: &mut [u8]) -> EvntraceNativeResult<()> {
+fn win32_error(err: &windows::core::Error) -> EvntraceNativeError {
+    EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
+}
+
+/// Calls `TraceQueryInformation`, returning its status along with the number of bytes
+/// the API reports as needed (filled even when the call fails with a too-small buffer)
+fn trace_query_raw(
+    session: ControlHandle,
+    class: TraceInformation,
+    buf: &mut [u8],
+) -> (windows::core::Result<()>, u32) {
     // Query buffers hold small fixed-size structs: cannot overflow a u32
     #[allow(clippy::cast_possible_truncation)]
     let buf_len = buf.len() as u32;
+    let mut needed = 0u32;
     let result = unsafe {
+        // Safety:
+        //  * the buffer is valid for reads and writes over `buf_len` bytes
+        //  * `needed` is a valid out-parameter
         Etw::TraceQueryInformation(
-            Etw::CONTROLTRACE_HANDLE { Value: 0 },
+            session,
             TRACE_QUERY_INFO_CLASS(class as i32),
             buf.as_mut_ptr().cast(),
             buf_len,
-            None,
+            Some(&raw mut needed),
         )
     }
     .ok();
 
-    result.map_err(|err| {
-        EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-    })
+    (result, needed)
+}
+
+/// Queries the system for system-wide ETW information (that does not require an active session).
+pub(crate) fn query_info(class: TraceInformation, buf: &mut [u8]) -> EvntraceNativeResult<()> {
+    trace_query_raw(ControlHandle::default(), class, buf)
+        .0
+        .map_err(|err| win32_error(&err))
+}
+
+/// Queries a system-wide, variable-sized info class (an array of structures).
+///
+/// The ETW API is first called with `initial_capacity` bytes, then retried with the
+/// size it reports as required. The returned buffer is truncated to the reported size.
+pub(crate) fn query_array_info(
+    class: TraceInformation,
+    initial_capacity: usize,
+) -> EvntraceNativeResult<Vec<u8>> {
+    let mut capacity = initial_capacity;
+    for _ in 0..4 {
+        let mut buf = vec![0u8; capacity];
+        let (result, needed) = trace_query_raw(ControlHandle::default(), class, &mut buf);
+        match result {
+            Ok(()) => {
+                let written = (needed as usize).min(buf.len());
+                buf.truncate(written);
+                return Ok(buf);
+            },
+            Err(err) => {
+                let required = needed as usize;
+                if err.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && required > capacity {
+                    capacity = required;
+                } else {
+                    return Err(win32_error(&err));
+                }
+            },
+        }
+    }
+
+    Err(EvntraceNativeError::IoError(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "the ETW API kept asking for a larger query buffer",
+    )))
 }
 
 #[cfg(test)]
