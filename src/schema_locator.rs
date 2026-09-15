@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use rustc_hash::FxHashMap;
 use windows::core::GUID;
 
-use crate::native::etw_types::event_record::EventRecord;
-use crate::native::tdh;
-use crate::native::tdh::TraceEventInfo;
-use crate::schema::Schema;
+use crate::{
+    native::{etw_types::event_record::EventRecord, tdh, tdh::TraceEventInfo},
+    schema::Schema,
+};
 
 /// Schema module errors
 #[derive(Debug)]
@@ -30,8 +30,10 @@ pub(crate) type SchemaResult<T> = Result<T, SchemaError>;
 /// A way to group events that share the same [`Schema`]
 ///
 /// From the [docs](https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_descriptor):
-/// > For manifest-based ETW, the combination Provider.DecodeGuid + Event.Id + Event.Version should uniquely identify an event,
-/// > i.e. all events with the same DecodeGuid, Id, and Version should have the same set of fields with no changes in field names, field types, or field ordering.
+/// > For manifest-based ETW, the combination Provider.DecodeGuid + Event.Id + Event.Version should
+/// > uniquely identify an event,
+/// > i.e. all events with the same DecodeGuid, Id, and Version should have the same set of fields
+/// > with no changes in field names, field types, or field ordering.
 #[derive(Debug, Eq, PartialEq, Hash)]
 struct SchemaKey {
     provider: GUID,
@@ -46,16 +48,14 @@ struct SchemaKey {
 
     // TODO: not sure why these ones are required in a SchemaKey. If they are, document why.
     //       note that krabsetw also uses these fields (without an explanation)
-    //       however, krabsetw's `schema::operator==` do not use them to compare schemas for equality.
-    //       see https://github.com/microsoft/krabsetw/issues/195
+    //       however, krabsetw's `schema::operator==` do not use them to compare schemas for
+    // equality.       see https://github.com/microsoft/krabsetw/issues/195
     opcode: u8,
     level: u8,
-    //
     // From MS documentation `evntprov.h`
     // For manifest-free events (i.e. TraceLogging), Event.Id and Event.Version are not useful
     // and should be ignored. Use Event name, level, keyword, and opcode for event filtering and
     // identification.
-    //
     event_name: String,
 }
 
@@ -74,8 +74,8 @@ impl SchemaKey {
 
 /// Represents a cache of Schemas already located
 ///
-/// This cache is implemented as a [FxHashMap] where the key is a combination of the following elements
-/// of an [Event Record](https://docs.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_record)
+/// This cache is implemented as a [FxHashMap] where the key is a combination of the following
+/// elements of an [Event Record](https://docs.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_record)
 /// * EventHeader.ProviderId
 /// * EventHeader.EventDescriptor.Id
 /// * EventHeader.EventDescriptor.Opcode
@@ -99,6 +99,8 @@ pub struct SchemaLocator {
 /// would grow the cache forever. Once full, new schemas are still built and
 /// returned, they are just not cached anymore.
 const MAX_CACHED_SCHEMAS: usize = 4096;
+// The test suite iterates the cache bound as a u16 key
+const _: () = assert!(MAX_CACHED_SCHEMAS <= u16::MAX as usize);
 
 impl std::fmt::Debug for SchemaLocator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -163,14 +165,16 @@ impl SchemaLocator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::alloc::Layout;
+
     use windows::Win32::System::Diagnostics::Etw;
+
+    use super::*;
 
     fn synthetic_tei() -> TraceEventInfo {
         // An all-zero TRACE_EVENT_INFO: the schema content does not matter here
-        let size = std::mem::size_of::<Etw::TRACE_EVENT_INFO>();
-        let layout = Layout::from_size_align(size, std::mem::align_of::<Etw::TRACE_EVENT_INFO>())
+        let size = size_of::<Etw::TRACE_EVENT_INFO>();
+        let layout = Layout::from_size_align(size, align_of::<Etw::TRACE_EVENT_INFO>())
             .expect("valid layout");
         unsafe {
             let buffer = std::alloc::alloc(layout);
@@ -181,7 +185,7 @@ mod tests {
 
     fn key(n: u16) -> SchemaKey {
         SchemaKey {
-            provider: GUID::from_u128(n as u128),
+            provider: GUID::from_u128(u128::from(n)),
             id: n,
             opcode: 0,
             version: 0,
@@ -195,6 +199,8 @@ mod tests {
         let locator = SchemaLocator::new();
         let schema = Arc::new(Schema::new(synthetic_tei()));
 
+        // Compile-time-checked to fit in a u16 (see the const assertion below)
+        #[allow(clippy::cast_possible_truncation)]
         for n in 0..MAX_CACHED_SCHEMAS as u16 {
             let stored = locator.store(key(n), Arc::clone(&schema));
             assert!(Arc::ptr_eq(&stored, &schema));

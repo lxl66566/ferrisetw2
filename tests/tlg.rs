@@ -1,11 +1,11 @@
+use ferrisetw::{
+    EventRecord, GUID,
+    parser::Parser,
+    provider::Provider,
+    schema_locator::SchemaLocator,
+    trace::{TraceTrait, UserTrace},
+};
 use tracelogging as tlg;
-
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::Provider;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::TraceTrait;
-use ferrisetw::trace::UserTrace;
-use ferrisetw::{EventRecord, GUID};
 
 mod utils;
 use utils::{Status, TestKind};
@@ -17,7 +17,7 @@ const PROVIDER_NAME: &str = "ferrisETW.TraceLoggingTest";
 
 tlg::define_provider!(FERRIS_PROVIDER, "ferrisETW.TraceLoggingTest");
 
-#[ignore]
+#[ignore = "requires an administrator session to register the provider and start a trace"]
 #[test]
 fn tlg_tests() {
     use std::convert::TryInto;
@@ -71,10 +71,7 @@ fn tlg_multiple_events(provider_guid: GUID) {
                 // Test event_name function is working as expected & we can handle multiple
                 // different events.
                 if record.event_name() == "Event1" {
-                    println!(
-                        "Received Event1({}) from ferrisETW.TraceLoggingTest",
-                        event1_count
-                    );
+                    println!("Received Event1({event1_count}) from ferrisETW.TraceLoggingTest");
 
                     assert_eq!(record.level(), tlg::Level::Warning.as_int());
                     assert_eq!(record.keyword(), 0x13);
@@ -87,10 +84,7 @@ fn tlg_multiple_events(provider_guid: GUID) {
 
                     event1_count += 1;
                 } else if record.event_name() == "Event2" {
-                    println!(
-                        "Received Event2({}) from ferrisETW.TraceLoggingTest",
-                        event2_count
-                    );
+                    println!("Received Event2({event2_count}) from ferrisETW.TraceLoggingTest");
 
                     assert_eq!(record.level(), tlg::Level::Informational.as_int());
                     assert_eq!(record.keyword(), 0x6);

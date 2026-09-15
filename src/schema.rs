@@ -1,10 +1,13 @@
 //! ETW Event Schema and handler
 //!
 //! This module contains the means needed to interact with the Schema of an ETW event
-use crate::native::etw_types::DecodingSource;
-use crate::native::tdh::TraceEventInfo;
-use crate::native::tdh_types::{Property, PropertyError};
 use once_cell::sync::OnceCell;
+
+use crate::native::{
+    etw_types::DecodingSource,
+    tdh::TraceEventInfo,
+    tdh_types::{Property, PropertyError},
+};
 
 /// A schema suitable for parsing a given kind of event.
 ///
@@ -34,7 +37,8 @@ impl Schema {
         }
     }
 
-    /// Use the `decoding_source` function to obtain the [DecodingSource] from the `TRACE_EVENT_INFO`
+    /// Use the `decoding_source` function to obtain the [DecodingSource] from the
+    /// `TRACE_EVENT_INFO`
     ///
     /// This getter returns the DecodingSource from the event, this value identifies the source used
     /// parse the event data
@@ -125,7 +129,7 @@ impl Schema {
             Err(PropertyError::UnimplementedType(_)) => {
                 log::error!("Unable to list properties: a type is not implemented");
                 &[]
-            }
+            },
             Ok(p) => p,
         }
     }
@@ -134,7 +138,7 @@ impl Schema {
         let cache = self.cached_properties.get_or_init(|| {
             let mut cache = Vec::new();
             for property in self.te_info.properties() {
-                cache.push(property?)
+                cache.push(property?);
             }
             Ok(cache)
         });

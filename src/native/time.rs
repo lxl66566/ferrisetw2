@@ -1,5 +1,6 @@
 //! Implements wrappers for various Windows time structures.
 use std::convert::TryInto;
+
 use windows::Win32::Foundation::{FILETIME, SYSTEMTIME};
 
 /// Wrapper for [FILETIME](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime)
@@ -16,7 +17,11 @@ const MS_IN_SECOND: i64 = 1_000;
 /// Howard Hinnant's `days_from_civil` algorithm
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = y - i64::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let era = if y >= 0 {
+        y
+    } else {
+        y - 399
+    } / 400;
     let yoe = y - era * 400; // [0, 399]
     let mp = (m + 9) % 12; // [0, 11], March-aligned
     let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
@@ -26,41 +31,47 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 impl FileTime {
     /// Converts to a unix timestamp with millisecond granularity.
+    #[must_use]
     pub fn as_unix_timestamp(&self) -> i64 {
         self.as_quad() / 10_000 - (SECONDS_BETWEEN_1601_AND_1970 * MS_IN_SECOND)
     }
 
     /// Converts to a unix timestamp with nanosecond granularity.
+    #[must_use]
     pub fn as_unix_timestamp_nanos(&self) -> i128 {
-        self.as_quad() as i128 * 100
-            - (SECONDS_BETWEEN_1601_AND_1970 as i128 * NS_IN_SECOND as i128)
+        i128::from(self.as_quad()) * 100
+            - (i128::from(SECONDS_BETWEEN_1601_AND_1970) * i128::from(NS_IN_SECOND))
     }
 
     /// Converts to OffsetDateTime
     #[cfg(feature = "time_rs")]
+    #[must_use]
     pub fn as_date_time(&self) -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp_nanos(self.as_unix_timestamp_nanos()).unwrap()
     }
 
-    fn as_quad(&self) -> i64 {
-        let mut quad = self.0.dwHighDateTime as i64;
+    fn as_quad(self) -> i64 {
+        let mut quad = i64::from(self.0.dwHighDateTime);
         quad <<= 32;
-        quad |= self.0.dwLowDateTime as i64;
+        quad |= i64::from(self.0.dwLowDateTime);
         quad
     }
 
     #[cfg(any(feature = "time_rs", feature = "serde"))]
+    // The i64 timestamp is split into its two DWORD halves: bit-pattern split,
+    // the sign bit of the quad never matters here
+    #[allow(clippy::cast_sign_loss)]
     pub(crate) fn from_quad(quad: i64) -> Self {
-        let mut file_time: FileTime = Default::default();
+        let mut file_time = FileTime::default();
         file_time.0.dwHighDateTime = (quad >> 32) as u32;
-        file_time.0.dwLowDateTime = (quad & 0xffffffff) as u32;
+        file_time.0.dwLowDateTime = (quad & 0xffff_ffff) as u32;
         file_time
     }
 
-    pub(crate) fn from_slice(slice: &[u8; std::mem::size_of::<FileTime>()]) -> Self {
+    pub(crate) fn from_slice(slice: [u8; size_of::<FileTime>()]) -> Self {
         // ETW user data is packed: it is not guaranteed to be aligned for a
         // FILETIME, so copy the fields one by one instead of dereferencing
-        let mut file_time: FileTime = Default::default();
+        let mut file_time = FileTime::default();
         file_time.0.dwLowDateTime = u32::from_ne_bytes(slice[0..4].try_into().unwrap());
         file_time.0.dwHighDateTime = u32::from_ne_bytes(slice[4..8].try_into().unwrap());
         file_time
@@ -119,23 +130,26 @@ impl SystemTime {
     }
 
     /// Converts to a unix timestamp with millisecond granularity.
+    #[must_use]
     pub fn as_unix_timestamp(&self) -> i64 {
         self.as_filetime_quad() / 10_000 - (SECONDS_BETWEEN_1601_AND_1970 * MS_IN_SECOND)
     }
 
     /// Converts to a unix timestamp with nanosecond granularity.
+    #[must_use]
     pub fn as_unix_timestamp_nanos(&self) -> i128 {
-        self.as_filetime_quad() as i128 * 100
-            - (SECONDS_BETWEEN_1601_AND_1970 as i128 * NS_IN_SECOND as i128)
+        i128::from(self.as_filetime_quad()) * 100
+            - (i128::from(SECONDS_BETWEEN_1601_AND_1970) * i128::from(NS_IN_SECOND))
     }
 
     /// Converts to OffsetDateTime
     #[cfg(feature = "time_rs")]
+    #[must_use]
     pub fn as_date_time(&self) -> time::OffsetDateTime {
         time::OffsetDateTime::from_unix_timestamp_nanos(self.as_unix_timestamp_nanos()).unwrap()
     }
 
-    pub(crate) fn from_slice(slice: &[u8; std::mem::size_of::<SystemTime>()]) -> Self {
+    pub(crate) fn from_slice(slice: [u8; size_of::<SystemTime>()]) -> Self {
         // ETW user data is packed: it is not guaranteed to be aligned for a
         // SYSTEMTIME, so copy the fields one by one instead of dereferencing
         let read_u16 = |offset: usize| -> u16 {
@@ -188,9 +202,9 @@ mod tests {
     fn file_time_from_slice_copies_both_dwords() {
         // 0x0102030405060708 as it would be laid out in (packed) ETW user data
         let bytes = [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01];
-        let file_time = FileTime::from_slice(&bytes);
-        assert_eq!(file_time.0.dwLowDateTime, 0x05060708);
-        assert_eq!(file_time.0.dwHighDateTime, 0x01020304);
+        let file_time = FileTime::from_slice(bytes);
+        assert_eq!(file_time.0.dwLowDateTime, 0x0506_0708);
+        assert_eq!(file_time.0.dwHighDateTime, 0x0102_0304);
     }
 
     #[test]
@@ -206,7 +220,7 @@ mod tests {
             0x05, 0x00, // wSecond = 5 (was silently dropped before the fix)
             0x06, 0x00, // wMilliseconds = 6
         ];
-        let system_time = SystemTime::from_slice(&bytes);
+        let system_time = SystemTime::from_slice(bytes);
         assert_eq!(system_time.0.wYear, 2026);
         assert_eq!(system_time.0.wMonth, 1);
         assert_eq!(system_time.0.wDayOfWeek, 5);
@@ -273,7 +287,7 @@ mod tests {
             0xea, 0x07, 0x01, 0x00, 0x05, 0x00, 0x02, 0x00, //
             0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00,
         ];
-        let system_time = SystemTime::from_slice(&bytes);
+        let system_time = SystemTime::from_slice(bytes);
         assert_eq!(system_time.as_unix_timestamp(), 1_767_323_045_006);
     }
 }

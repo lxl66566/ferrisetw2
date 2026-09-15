@@ -1,7 +1,7 @@
 //! Kernel Providers module
 //!
-//! Provides an easy way to create a Kernel Provider. Multiple providers are pre-created statically with
-//! their appropriate GUID and flags
+//! Provides an easy way to create a Kernel Provider. Multiple providers are pre-created statically
+//! with their appropriate GUID and flags
 //! Credits: [KrabsETW::kernel_providers](https://github.com/microsoft/krabsetw/blob/master/krabs/krabs/kernel_providers.hpp)
 // TODO: Extremely Verbose and cumbersome, think a way to do this in a more clean way
 #![allow(dead_code)]
@@ -13,175 +13,106 @@ use super::GUID;
 /// Credits: [KrabsETW::kernel_guids](https://github.com/microsoft/krabsetw/blob/master/krabs/krabs/kernel_guids.hpp)
 mod kernel_guids {
     use super::GUID;
-    pub const ALPC_GUID: GUID = GUID::from_values(
-        0x45d8cccd,
-        0x539f,
-        0x4b72,
-        [0xa8, 0xb7, 0x5c, 0x68, 0x31, 0x42, 0x60, 0x9a],
-    );
-    pub const POWER_GUID: GUID = GUID::from_values(
-        0xe43445e0,
-        0x0903,
-        0x48c3,
-        [0xb8, 0x78, 0xff, 0x0f, 0xcc, 0xeb, 0xdd, 0x04],
-    );
-    pub const DEBUG_GUID: GUID = GUID::from_values(
-        0x13976d09,
-        0xa327,
-        0x438c,
-        [0x95, 0x0b, 0x7f, 0x03, 0x19, 0x28, 0x15, 0xc7],
-    );
-    pub const TCP_IP_GUID: GUID = GUID::from_values(
-        0x9a280ac0,
-        0xc8e0,
-        0x11d1,
-        [0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2],
-    );
-    pub const UDP_IP_GUID: GUID = GUID::from_values(
-        0xbf3a50c5,
-        0xa9c9,
-        0x4988,
-        [0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80],
-    );
-    pub const THREAD_GUID: GUID = GUID::from_values(
-        0x3d6fa8d1,
-        0xfe05,
-        0x11d0,
-        [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
-    );
-    pub const DISK_IO_GUID: GUID = GUID::from_values(
-        0x3d6fa8d4,
-        0xfe05,
-        0x11d0,
-        [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
-    );
-    pub const FILE_IO_GUID: GUID = GUID::from_values(
-        0x90cbdc39,
-        0x4a3e,
-        0x11d1,
-        [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
-    );
-    pub const PROCESS_GUID: GUID = GUID::from_values(
-        0x3d6fa8d0,
-        0xfe05,
-        0x11d0,
-        [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
-    );
-    pub const REGISTRY_GUID: GUID = GUID::from_values(
-        0xae53722e,
-        0xc863,
-        0x11d2,
-        [0x86, 0x59, 0x00, 0xc0, 0x4f, 0xa3, 0x21, 0xa1],
-    );
-    pub const SPLIT_IO_GUID: GUID = GUID::from_values(
-        0xd837ca92,
-        0x12b9,
-        0x44a5,
-        [0xad, 0x6a, 0x3a, 0x65, 0xb3, 0x57, 0x8a, 0xa8],
-    );
-    pub const OB_TRACE_GUID: GUID = GUID::from_values(
-        0x89497f50,
-        0xeffe,
-        0x4440,
-        [0x8c, 0xf2, 0xce, 0x6b, 0x1c, 0xdc, 0xac, 0xa7],
-    );
-    pub const UMS_EVENT_GUID: GUID = GUID::from_values(
-        0x9aec974b,
-        0x5b8e,
-        0x4118,
-        [0x9b, 0x92, 0x31, 0x86, 0xd8, 0x00, 0x2c, 0xe5],
-    );
-    pub const PERF_INFO_GUID: GUID = GUID::from_values(
-        0xce1dbfb4,
-        0x137e,
-        0x4da6,
-        [0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc],
-    );
-    pub const PAGE_FAULT_GUID: GUID = GUID::from_values(
-        0x3d6fa8d3,
-        0xfe05,
-        0x11d0,
-        [0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c],
-    );
-    pub const IMAGE_LOAD_GUID: GUID = GUID::from_values(
-        0x2cb15d1d,
-        0x5fc1,
-        0x11d2,
-        [0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18],
-    );
-    pub const POOL_TRACE_GUID: GUID = GUID::from_values(
-        0x0268a8b6,
-        0x74fd,
-        0x4302,
-        [0x9d, 0xd0, 0x6e, 0x8f, 0x17, 0x95, 0xc0, 0xcf],
-    );
-    pub const LOST_EVENT_GUID: GUID = GUID::from_values(
-        0x6a399ae0,
-        0x4bc6,
-        0x4de9,
-        [0x87, 0x0b, 0x36, 0x57, 0xf8, 0x94, 0x7e, 0x7e],
-    );
-    pub const STACK_WALK_GUID: GUID = GUID::from_values(
-        0xdef2fe46,
-        0x7bd6,
-        0x4b80,
-        [0xbd, 0x94, 0xf5, 0x7f, 0xe2, 0x0d, 0x0c, 0xe3],
-    );
-    pub const EVENT_TRACE_GUID: GUID = GUID::from_values(
-        0x68fdd900,
-        0x4a3e,
-        0x11d1,
-        [0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3],
-    );
-    pub const MMCSS_TRACE_GUID: GUID = GUID::from_values(
-        0xf8f10121,
-        0xb617,
-        0x4a56,
-        [0x86, 0x8b, 0x9d, 0xf1, 0xb2, 0x7f, 0xe3, 0x2c],
-    );
-    pub const SYSTEM_TRACE_GUID: GUID = GUID::from_values(
-        0x9e814aad,
-        0x3204,
-        0x11d2,
-        [0x9a, 0x82, 0x00, 0x60, 0x08, 0xa8, 0x69, 0x39],
-    );
-    pub const EVENT_TRACE_CONFIG_GUID: GUID = GUID::from_values(
-        0x01853a65,
-        0x418f,
-        0x4f36,
-        [0xae, 0xfc, 0xdc, 0x0f, 0x1d, 0x2f, 0xd2, 0x35],
-    );
+    pub const ALPC_GUID: GUID = GUID::from_values(0x45d8_cccd, 0x539f, 0x4b72, [
+        0xa8, 0xb7, 0x5c, 0x68, 0x31, 0x42, 0x60, 0x9a,
+    ]);
+    pub const POWER_GUID: GUID = GUID::from_values(0xe434_45e0, 0x0903, 0x48c3, [
+        0xb8, 0x78, 0xff, 0x0f, 0xcc, 0xeb, 0xdd, 0x04,
+    ]);
+    pub const DEBUG_GUID: GUID = GUID::from_values(0x1397_6d09, 0xa327, 0x438c, [
+        0x95, 0x0b, 0x7f, 0x03, 0x19, 0x28, 0x15, 0xc7,
+    ]);
+    pub const TCP_IP_GUID: GUID = GUID::from_values(0x9a28_0ac0, 0xc8e0, 0x11d1, [
+        0x84, 0xe2, 0x00, 0xc0, 0x4f, 0xb9, 0x98, 0xa2,
+    ]);
+    pub const UDP_IP_GUID: GUID = GUID::from_values(0xbf3a_50c5, 0xa9c9, 0x4988, [
+        0xa0, 0x05, 0x2d, 0xf0, 0xb7, 0xc8, 0x0f, 0x80,
+    ]);
+    pub const THREAD_GUID: GUID = GUID::from_values(0x3d6f_a8d1, 0xfe05, 0x11d0, [
+        0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c,
+    ]);
+    pub const DISK_IO_GUID: GUID = GUID::from_values(0x3d6f_a8d4, 0xfe05, 0x11d0, [
+        0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c,
+    ]);
+    pub const FILE_IO_GUID: GUID = GUID::from_values(0x90cb_dc39, 0x4a3e, 0x11d1, [
+        0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3,
+    ]);
+    pub const PROCESS_GUID: GUID = GUID::from_values(0x3d6f_a8d0, 0xfe05, 0x11d0, [
+        0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c,
+    ]);
+    pub const REGISTRY_GUID: GUID = GUID::from_values(0xae53_722e, 0xc863, 0x11d2, [
+        0x86, 0x59, 0x00, 0xc0, 0x4f, 0xa3, 0x21, 0xa1,
+    ]);
+    pub const SPLIT_IO_GUID: GUID = GUID::from_values(0xd837_ca92, 0x12b9, 0x44a5, [
+        0xad, 0x6a, 0x3a, 0x65, 0xb3, 0x57, 0x8a, 0xa8,
+    ]);
+    pub const OB_TRACE_GUID: GUID = GUID::from_values(0x8949_7f50, 0xeffe, 0x4440, [
+        0x8c, 0xf2, 0xce, 0x6b, 0x1c, 0xdc, 0xac, 0xa7,
+    ]);
+    pub const UMS_EVENT_GUID: GUID = GUID::from_values(0x9aec_974b, 0x5b8e, 0x4118, [
+        0x9b, 0x92, 0x31, 0x86, 0xd8, 0x00, 0x2c, 0xe5,
+    ]);
+    pub const PERF_INFO_GUID: GUID = GUID::from_values(0xce1d_bfb4, 0x137e, 0x4da6, [
+        0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc,
+    ]);
+    pub const PAGE_FAULT_GUID: GUID = GUID::from_values(0x3d6f_a8d3, 0xfe05, 0x11d0, [
+        0x9d, 0xda, 0x00, 0xc0, 0x4f, 0xd7, 0xba, 0x7c,
+    ]);
+    pub const IMAGE_LOAD_GUID: GUID = GUID::from_values(0x2cb1_5d1d, 0x5fc1, 0x11d2, [
+        0xab, 0xe1, 0x00, 0xa0, 0xc9, 0x11, 0xf5, 0x18,
+    ]);
+    pub const POOL_TRACE_GUID: GUID = GUID::from_values(0x0268_a8b6, 0x74fd, 0x4302, [
+        0x9d, 0xd0, 0x6e, 0x8f, 0x17, 0x95, 0xc0, 0xcf,
+    ]);
+    pub const LOST_EVENT_GUID: GUID = GUID::from_values(0x6a39_9ae0, 0x4bc6, 0x4de9, [
+        0x87, 0x0b, 0x36, 0x57, 0xf8, 0x94, 0x7e, 0x7e,
+    ]);
+    pub const STACK_WALK_GUID: GUID = GUID::from_values(0xdef2_fe46, 0x7bd6, 0x4b80, [
+        0xbd, 0x94, 0xf5, 0x7f, 0xe2, 0x0d, 0x0c, 0xe3,
+    ]);
+    pub const EVENT_TRACE_GUID: GUID = GUID::from_values(0x68fd_d900, 0x4a3e, 0x11d1, [
+        0x84, 0xf4, 0x00, 0x00, 0xf8, 0x04, 0x64, 0xe3,
+    ]);
+    pub const MMCSS_TRACE_GUID: GUID = GUID::from_values(0xf8f1_0121, 0xb617, 0x4a56, [
+        0x86, 0x8b, 0x9d, 0xf1, 0xb2, 0x7f, 0xe3, 0x2c,
+    ]);
+    pub const SYSTEM_TRACE_GUID: GUID = GUID::from_values(0x9e81_4aad, 0x3204, 0x11d2, [
+        0x9a, 0x82, 0x00, 0x60, 0x08, 0xa8, 0x69, 0x39,
+    ]);
+    pub const EVENT_TRACE_CONFIG_GUID: GUID = GUID::from_values(0x0185_3a65, 0x418f, 0x4f36, [
+        0xae, 0xfc, 0xdc, 0x0f, 0x1d, 0x2f, 0xd2, 0x35,
+    ]);
 }
 
 /// List of Kernel Providers flags
 ///
 /// More info: [EVENT_TRACE_PROPERTIES->EnableFlags](https://docs.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
 mod kernel_flags {
-    pub const EVENT_TRACE_FLAG_PROCESS: u32 = 0x00000001;
-    pub const EVENT_TRACE_FLAG_THREAD: u32 = 0x00000002;
-    pub const EVENT_TRACE_FLAG_IMAGE_LOAD: u32 = 0x00000004;
-    pub const EVENT_TRACE_FLAG_PROCESS_COUNTERS: u32 = 0x00000008;
-    pub const EVENT_TRACE_FLAG_CSWITCH: u32 = 0x00000010;
-    pub const EVENT_TRACE_FLAG_DPC: u32 = 0x00000020;
-    pub const EVENT_TRACE_FLAG_INTERRUPT: u32 = 0x00000040;
-    pub const EVENT_TRACE_FLAG_SYSTEMCALL: u32 = 0x00000080;
-    pub const EVENT_TRACE_FLAG_DISK_IO: u32 = 0x00000100;
-    pub const EVENT_TRACE_FLAG_DISK_FILE_IO: u32 = 0x00000200;
-    pub const EVENT_TRACE_FLAG_DISK_IO_INIT: u32 = 0x00000400;
-    pub const EVENT_TRACE_FLAG_DISPATCHER: u32 = 0x00000800;
-    pub const EVENT_TRACE_FLAG_MEMORY_PAGE_FAULTS: u32 = 0x00001000;
-    pub const EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS: u32 = 0x00002000;
-    pub const EVENT_TRACE_FLAG_VIRTUAL_ALLOC: u32 = 0x00004000;
-    pub const EVENT_TRACE_FLAG_VAMAP: u32 = 0x00008000;
-    pub const EVENT_TRACE_FLAG_NETWORK_TCPIP: u32 = 0x00010000;
-    pub const EVENT_TRACE_FLAG_REGISTRY: u32 = 0x00020000;
-    pub const EVENT_TRACE_FLAG_DBGPRINT: u32 = 0x00040000;
-    pub const EVENT_TRACE_FLAG_ALPC: u32 = 0x00100000;
-    pub const EVENT_TRACE_FLAG_SPLIT_IO: u32 = 0x00200000;
-    pub const EVENT_TRACE_FLAG_DRIVER: u32 = 0x00800000;
-    pub const EVENT_TRACE_FLAG_PROFILE: u32 = 0x01000000;
-    pub const EVENT_TRACE_FLAG_FILE_IO: u32 = 0x02000000;
-    pub const EVENT_TRACE_FLAG_FILE_IO_INIT: u32 = 0x04000000;
+    pub const EVENT_TRACE_FLAG_PROCESS: u32 = 0x0000_0001;
+    pub const EVENT_TRACE_FLAG_THREAD: u32 = 0x0000_0002;
+    pub const EVENT_TRACE_FLAG_IMAGE_LOAD: u32 = 0x0000_0004;
+    pub const EVENT_TRACE_FLAG_PROCESS_COUNTERS: u32 = 0x0000_0008;
+    pub const EVENT_TRACE_FLAG_CSWITCH: u32 = 0x0000_0010;
+    pub const EVENT_TRACE_FLAG_DPC: u32 = 0x0000_0020;
+    pub const EVENT_TRACE_FLAG_INTERRUPT: u32 = 0x0000_0040;
+    pub const EVENT_TRACE_FLAG_SYSTEMCALL: u32 = 0x0000_0080;
+    pub const EVENT_TRACE_FLAG_DISK_IO: u32 = 0x0000_0100;
+    pub const EVENT_TRACE_FLAG_DISK_FILE_IO: u32 = 0x0000_0200;
+    pub const EVENT_TRACE_FLAG_DISK_IO_INIT: u32 = 0x0000_0400;
+    pub const EVENT_TRACE_FLAG_DISPATCHER: u32 = 0x0000_0800;
+    pub const EVENT_TRACE_FLAG_MEMORY_PAGE_FAULTS: u32 = 0x0000_1000;
+    pub const EVENT_TRACE_FLAG_MEMORY_HARD_FAULTS: u32 = 0x0000_2000;
+    pub const EVENT_TRACE_FLAG_VIRTUAL_ALLOC: u32 = 0x0000_4000;
+    pub const EVENT_TRACE_FLAG_VAMAP: u32 = 0x0000_8000;
+    pub const EVENT_TRACE_FLAG_NETWORK_TCPIP: u32 = 0x0001_0000;
+    pub const EVENT_TRACE_FLAG_REGISTRY: u32 = 0x0002_0000;
+    pub const EVENT_TRACE_FLAG_DBGPRINT: u32 = 0x0004_0000;
+    pub const EVENT_TRACE_FLAG_ALPC: u32 = 0x0010_0000;
+    pub const EVENT_TRACE_FLAG_SPLIT_IO: u32 = 0x0020_0000;
+    pub const EVENT_TRACE_FLAG_DRIVER: u32 = 0x0080_0000;
+    pub const EVENT_TRACE_FLAG_PROFILE: u32 = 0x0100_0000;
+    pub const EVENT_TRACE_FLAG_FILE_IO: u32 = 0x0200_0000;
+    pub const EVENT_TRACE_FLAG_FILE_IO_INIT: u32 = 0x0400_0000;
 }
 
 /// Contains kernel provider identifiers.
@@ -197,6 +128,7 @@ pub struct KernelProvider {
 
 impl KernelProvider {
     /// Use the `new` function to create a Kernel Provider which can be then tied into a Provider
+    #[must_use]
     pub const fn new(guid: GUID, flags: u32) -> KernelProvider {
         KernelProvider { guid, flags }
     }
@@ -328,10 +260,7 @@ pub static ALPC_PROVIDER: KernelProvider =
 
 #[cfg(test)]
 mod test {
-    use super::kernel_flags::*;
-    use super::kernel_guids::*;
-    use super::*;
-
+    use super::{kernel_flags::*, kernel_guids::*, *};
     use crate::provider::Provider;
 
     #[test]

@@ -3,18 +3,24 @@
 //! The `tdh` module is an abstraction layer for the Windows tdh library. This module act as a
 //! internal API that holds all `unsafe` calls to functions exported by the `tdh` Windows library.
 //!
-//! This module shouldn't be accessed directly. Modules from the the crate level provide a safe API to interact
-//! with the crate
+//! This module shouldn't be accessed directly. Modules from the the crate level provide a safe API
+//! to interact with the crate
 use std::alloc::Layout;
 
-use super::etw_types::*;
-use crate::native::etw_types::event_record::EventRecord;
-use crate::native::tdh_types::Property;
-use crate::traits::*;
 use widestring::U16CStr;
-use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-use windows::Win32::System::Diagnostics::Etw::{self, EVENT_PROPERTY_INFO, TRACE_EVENT_INFO};
-use windows::core::GUID;
+use windows::{
+    Win32::{
+        Foundation::ERROR_INSUFFICIENT_BUFFER,
+        System::Diagnostics::Etw::{self, TRACE_EVENT_INFO},
+    },
+    core::GUID,
+};
+
+use super::etw_types::*;
+use crate::{
+    native::{etw_types::event_record::EventRecord, tdh_types::Property},
+    traits::*,
+};
 
 /// Tdh native module errors
 #[derive(Debug)]
@@ -31,9 +37,15 @@ impl std::fmt::Display for TdhNativeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::AllocationError => write!(f, "allocation error"),
-            Self::IoError(e) => write!(f, "i/o error {}", e),
+            Self::IoError(e) => write!(f, "i/o error {e}"),
         }
     }
+}
+
+// Win32 error codes always fit in an i32
+#[allow(clippy::cast_possible_wrap)]
+fn io_error_from_win32(status: u32) -> TdhNativeError {
+    TdhNativeError::IoError(std::io::Error::from_raw_os_error(status as i32))
 }
 
 /// Read-only wrapper over an [TRACE_EVENT_INFO]
@@ -48,26 +60,29 @@ pub struct TraceEventInfo {
     layout: Layout,
 }
 
-// Safety: TraceEventInfo contains a pointer to data that is never mutated (except on deallocation), and that itself does not contain pointers
+// Safety: TraceEventInfo contains a pointer to data that is never mutated (except on deallocation),
+// and that itself does not contain pointers
 unsafe impl Send for TraceEventInfo {}
 // Safety: see above
 unsafe impl Sync for TraceEventInfo {}
 
 macro_rules! extract_utf16_string {
-    ($self: ident, $member_name: ident) => {
+    ($self:ident, $member_name:ident) => {
         let provider_name_offset = $self.as_raw().$member_name;
         let provider_name_ptr = unsafe {
             // Safety: we trust Microsoft for providing correctly aligned data
-            $self.data.offset(provider_name_offset as isize)
+            $self.data.add(provider_name_offset as usize)
         };
         if provider_name_offset == 0 || provider_name_ptr.is_null() {
             return String::new();
         }
+        // UTF-16 strings sit at 2-byte-aligned offsets inside the TRACE_EVENT_INFO buffer
+        #[allow(clippy::cast_ptr_alignment)]
         let provider_name = unsafe {
             // Safety:
             //  * we trust Microsoft for providing correctly aligned data
             //  * we will copy into a String before the buffer gets invalid
-            U16CStr::from_ptr_str(provider_name_ptr as *const u16)
+            U16CStr::from_ptr_str(provider_name_ptr.cast::<u16>())
         };
         return provider_name.to_string_lossy();
     };
@@ -91,24 +106,20 @@ impl TraceEventInfo {
         let mut buffer_size = 0;
         let status = unsafe {
             // Safety:
-            //  * the `EVENT_RECORD` was passed by Microsoft and has not been modified: it is thus valid and correctly aligned
-            Etw::TdhGetEventInformation(event.as_raw_ptr(), None, None, &mut buffer_size)
+            //  * the `EVENT_RECORD` was passed by Microsoft and has not been modified: it is thus
+            //    valid and correctly aligned
+            Etw::TdhGetEventInformation(event.as_raw_ptr(), None, None, &raw mut buffer_size)
         };
         if status != ERROR_INSUFFICIENT_BUFFER.0 {
-            return Err(TdhNativeError::IoError(std::io::Error::from_raw_os_error(
-                status as i32,
-            )));
+            return Err(io_error_from_win32(status));
         }
 
         if buffer_size == 0 {
             return Err(TdhNativeError::AllocationError);
         }
 
-        let layout = Layout::from_size_align(
-            buffer_size as usize,
-            std::mem::align_of::<Etw::TRACE_EVENT_INFO>(),
-        )
-        .map_err(|_| TdhNativeError::AllocationError)?;
+        let layout = Layout::from_size_align(buffer_size as usize, align_of::<TRACE_EVENT_INFO>())
+            .map_err(|_| TdhNativeError::AllocationError)?;
         let data = unsafe {
             // Safety: size is not zero
             std::alloc::alloc(layout)
@@ -119,20 +130,21 @@ impl TraceEventInfo {
 
         let status = unsafe {
             // Safety:
-            //  * the `EVENT_RECORD` was passed by Microsoft and has not been modified: it is thus valid and correctly aligned
-            //  * `data` has been successfully allocated, with the required size and the correct alignment
+            //  * the `EVENT_RECORD` was passed by Microsoft and has not been modified: it is thus
+            //    valid and correctly aligned
+            //  * `data` has been successfully allocated, with the required size and the correct
+            //    alignment
+            #[allow(clippy::cast_ptr_alignment)] // allocated with the alignment of TRACE_EVENT_INFO
             Etw::TdhGetEventInformation(
                 event.as_raw_ptr(),
                 None,
                 Some(data.cast::<TRACE_EVENT_INFO>()),
-                &mut buffer_size,
+                &raw mut buffer_size,
             )
         };
 
         if status != 0 {
-            return Err(TdhNativeError::IoError(std::io::Error::from_raw_os_error(
-                status as i32,
-            )));
+            return Err(io_error_from_win32(status));
         }
 
         Ok(Self {
@@ -142,6 +154,9 @@ impl TraceEventInfo {
         })
     }
 
+    // The buffer is allocated with the alignment of TRACE_EVENT_INFO, so this
+    // pointer cast is valid
+    #[allow(clippy::cast_ptr_alignment)]
     fn as_raw(&self) -> &TRACE_EVENT_INFO {
         let p = self.data.cast::<TRACE_EVENT_INFO>();
         unsafe {
@@ -212,7 +227,7 @@ impl<'info> PropertyIterator<'info> {
     }
 }
 
-impl<'info> Iterator for PropertyIterator<'info> {
+impl Iterator for PropertyIterator<'_> {
     type Item = Result<Property, crate::native::tdh_types::PropertyError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -220,43 +235,50 @@ impl<'info> Iterator for PropertyIterator<'info> {
             return None;
         }
 
-        let properties_array = &self.te_info.as_raw().EventPropertyInfoArray;
-        let properties_array = properties_array as *const EVENT_PROPERTY_INFO;
+        let properties_array = self.te_info.as_raw().EventPropertyInfoArray.as_ptr();
         let cur_property_ptr = unsafe {
             // Safety:
-            //  * index being in the right bounds, this guarantees the resulting pointer lies in the same allocated object
-            properties_array.offset(self.next_index as isize) // we assume there will not be more than 2 billion properties for an event
+            //  * index being in the right bounds, this guarantees the resulting pointer lies in the
+            //    same allocated object
+            // (we assume there will not be more than 4 billion properties for an event)
+            properties_array.add(self.next_index as usize)
         };
         let curr_prop = unsafe {
             // Safety:
             //  * this pointer has been allocated by a Microsoft API
             match cur_property_ptr.as_ref() {
                 None => {
-                    // This should not happen, as there is no reason the Microsoft API has put a null pointer at an index below self.count
-                    // Ideally, I probably should return an `Err` here. But I prefer keeping a simple return type, and stop the iteration here in case this (normally impossible error) happens
+                    // This should not happen, as there is no reason the Microsoft API has put a
+                    // null pointer at an index below self.count Ideally, I
+                    // probably should return an `Err` here. But I prefer keeping a simple return
+                    // type, and stop the iteration here in case this (normally impossible error)
+                    // happens
                     return None;
-                }
+                },
                 Some(r) => r,
             }
         };
 
-        let te_info_data = self.te_info.as_raw() as *const TRACE_EVENT_INFO as *const u8;
+        let te_info_data = std::ptr::from_ref(self.te_info.as_raw()).cast::<u8>();
         let property_name_offset = curr_prop.NameOffset;
         let property_name_ptr = unsafe {
             // Safety: offset comes from a Microsoft API
-            te_info_data.offset(property_name_offset as isize)
+            te_info_data.add(property_name_offset as usize)
         };
         if property_name_ptr.is_null() {
             // This is really a safety net, there is no reason the offset nullifies the base pointer
-            // This is not supposed to happen, so a simple `None` (instead of a proper `Err`) will do
+            // This is not supposed to happen, so a simple `None` (instead of a proper `Err`) will
+            // do
             return None;
         }
 
+        // UTF-16 strings sit at 2-byte-aligned offsets inside the TRACE_EVENT_INFO buffer
+        #[allow(clippy::cast_ptr_alignment)]
         let property_name = unsafe {
             // Safety:
             //  * we trust Microsoft for providing correctly aligned data
             //  * we will copy into a String before the buffer gets invalid
-            U16CStr::from_ptr_str(property_name_ptr as *const u16)
+            U16CStr::from_ptr_str(property_name_ptr.cast::<u16>())
         };
         let property_name = property_name.to_string_lossy();
 
@@ -276,11 +298,10 @@ pub fn property_size(event: &EventRecord, name: &str) -> TdhNativeResult<u32> {
     };
 
     unsafe {
-        let status = Etw::TdhGetPropertySize(event.as_raw_ptr(), None, &[desc], &mut property_size);
+        let status =
+            Etw::TdhGetPropertySize(event.as_raw_ptr(), None, &[desc], &raw mut property_size);
         if status != 0 {
-            return Err(TdhNativeError::IoError(std::io::Error::from_raw_os_error(
-                status as i32,
-            )));
+            return Err(io_error_from_win32(status));
         }
     }
 

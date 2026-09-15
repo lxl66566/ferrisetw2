@@ -6,12 +6,12 @@
 
 use std::process::Command;
 
-use ferrisetw::EventRecord;
-use ferrisetw::provider::Provider;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::RealTimeTraceTrait;
-use ferrisetw::trace::TraceTrait;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::{
+    EventRecord,
+    provider::Provider,
+    schema_locator::SchemaLocator,
+    trace::{RealTimeTraceTrait, TraceTrait, UserTrace},
+};
 
 #[derive(Clone, Copy, Debug)]
 enum HowToProcess {
@@ -28,7 +28,10 @@ fn trace_lifetime() {
         ("998877", "998877"),
         ("My Ütf-8 tråce", "tf-8 tr"),
         (
-            "My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS). My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is even longer than TRACE_NAME_MAX_CHARS).",
+            "My Ütf-8 tråce name, that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ \
+             name indeed (which is even longer than TRACE_NAME_MAX_CHARS). My Ütf-8 tråce name, \
+             that has quite a løøøøøøøøøøøøøøøøøøøøøng name, 😎 a very λονɣ name indeed (which is \
+             even longer than TRACE_NAME_MAX_CHARS).",
             "that has quite a",
         ),
     ];
@@ -61,7 +64,8 @@ fn trace_lifetime() {
                         how_to_process,
                     );
 
-                    // Regardless of whether we explicitly stopped it, trace has been dropped and must no longer run
+                    // Regardless of whether we explicitly stopped it, trace has been dropped and
+                    // must no longer run
                     assert_trace_exists(ascii_part_to_look_for, false);
                 }
             }
@@ -77,15 +81,15 @@ fn test_wordpad_trace(
     how_to_process: HowToProcess,
 ) {
     println!(
-        "Testing a trace with {} providers, processed as {:?}, stopped:{}, name contains {}...",
-        provider_count, how_to_process, explicit_stop, ascii_part_of_the_trace_name
+        "Testing a trace with {provider_count} providers, processed as {how_to_process:?}, \
+         stopped:{explicit_stop}, name contains {ascii_part_of_the_trace_name}..."
     );
 
     // Create a provider
     let mut provider_builder = Provider::by_guid(0x54ffd262_99fe_4576_96e7_1adb500370dc); // Microsoft-Windows-Wordpad
     for _i in 0..provider_count {
         provider_builder =
-            provider_builder.add_callback(|_record: &EventRecord, _locator: &SchemaLocator| {})
+            provider_builder.add_callback(|_record: &EventRecord, _locator: &SchemaLocator| {});
     }
     let wordpad_provider = provider_builder.build();
     assert_trace_exists(requested_trace_name, false);
@@ -99,12 +103,12 @@ fn test_wordpad_trace(
         HowToProcess::StartOnly => {
             let (trace, _handle) = trace_builder.start().unwrap();
             trace // the trace is running, but not processing anything
-        }
+        },
         HowToProcess::ProcessFromHandle => {
             let (trace, handle) = trace_builder.start().unwrap();
             std::thread::spawn(move || UserTrace::process_from_handle(handle));
             trace
-        }
+        },
         HowToProcess::StartAndProcess => trace_builder.start_and_process().unwrap(),
     };
 
@@ -120,7 +124,8 @@ fn test_wordpad_trace(
 
 /// Call `logman` and check if the expected trace is part of the output
 ///
-/// This is limited to the ASCII part of the trace name, because Windows really sucks when it comes to encodings from sub processes (codepage issues, etc.)
+/// This is limited to the ASCII part of the trace name, because Windows really sucks when it comes
+/// to encodings from sub processes (codepage issues, etc.)
 #[track_caller]
 fn assert_trace_exists(ascii_part_of_the_trace_name: &str, expected: bool) {
     for _attempt in 0..3 {
@@ -140,13 +145,14 @@ fn assert_trace_exists(ascii_part_of_the_trace_name: &str, expected: bool) {
 
         if status.success() {
             if res != expected {
-                println!("logman output (returned {}): {}", status, stdout);
+                println!("logman output (returned {status}): {stdout}");
                 unreachable!();
             }
         } else {
-            // Not sure why, but logman sometimes fails to list current traces (with "The GUID passed was not recognized as valid by a WMI data provider.")
-            println!("logman hit an error (returned {}).", status);
-            println!("logman output: {}", stdout);
+            // Not sure why, but logman sometimes fails to list current traces (with "The GUID
+            // passed was not recognized as valid by a WMI data provider.")
+            println!("logman hit an error (returned {status}).");
+            println!("logman output: {stdout}");
             println!("Let's try again");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }

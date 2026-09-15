@@ -1,32 +1,34 @@
 //! Safe wrappers for the native ETW API
 //!
-//! This module makes sure the calls are safe memory-wise, but does not attempt to ensure they are called in the right order.<br/>
-//! Thus, you should prefer using `UserTrace`s, `KernelTrace`s and `TraceBuilder`s, that will ensure these API are correctly used.
-use std::collections::HashSet;
-use std::ffi::c_void;
-use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::sync::RwLock;
+//! This module makes sure the calls are safe memory-wise, but does not attempt to ensure they are
+//! called in the right order.<br/> Thus, you should prefer using `UserTrace`s, `KernelTrace`s and
+//! `TraceBuilder`s, that will ensure these API are correctly used.
+use std::{
+    collections::HashSet,
+    ffi::c_void,
+    panic::AssertUnwindSafe,
+    sync::{Arc, RwLock},
+};
 
 use once_cell::sync::Lazy;
-
 use widestring::U16CStr;
-use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
-use windows::Win32::Foundation::ERROR_CTX_CLOSE_PENDING;
-use windows::Win32::Foundation::ERROR_SUCCESS;
-use windows::Win32::Foundation::FILETIME;
-use windows::Win32::System::Diagnostics::Etw;
-use windows::Win32::System::Diagnostics::Etw::EVENT_CONTROL_CODE_ENABLE_PROVIDER;
-use windows::Win32::System::Diagnostics::Etw::TRACE_QUERY_INFO_CLASS;
-use windows::core::GUID;
-use windows::core::PCWSTR;
+use windows::{
+    Win32::{
+        Foundation::{ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_SUCCESS, FILETIME},
+        System::Diagnostics::{
+            Etw,
+            Etw::{EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_QUERY_INFO_CLASS},
+        },
+    },
+    core::{GUID, PCWSTR},
+};
 
 use super::etw_types::*;
-use crate::native::etw_types::event_record::EventRecord;
-use crate::provider::Provider;
-use crate::provider::event_filter::EventFilterDescriptor;
-use crate::trace::callback_data::CallbackData;
-use crate::trace::{RealTimeTraceTrait, TraceProperties};
+use crate::{
+    native::etw_types::event_record::EventRecord,
+    provider::{Provider, event_filter::EventFilterDescriptor},
+    trace::{RealTimeTraceTrait, TraceProperties, callback_data::CallbackData},
+};
 
 pub type TraceHandle = Etw::PROCESSTRACE_HANDLE;
 pub type ControlHandle = Etw::CONTROLTRACE_HANDLE;
@@ -77,11 +79,13 @@ impl UniqueValidContexts {
     pub const fn new() -> Self {
         Self(Lazy::new(|| RwLock::new(HashSet::new())))
     }
+
     /// Insert if it did not exist previously
     fn insert(&self, ctx_ptr: *const c_void) -> Result<(), ContextError> {
-        match self.0.write().unwrap().insert(ctx_ptr as u64) {
-            true => Ok(()),
-            false => Err(ContextError::AlreadyExist),
+        if self.0.write().unwrap().insert(ctx_ptr as u64) {
+            Ok(())
+        } else {
+            Err(ContextError::AlreadyExist)
         }
     }
 
@@ -100,7 +104,8 @@ impl UniqueValidContexts {
 extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         let record_from_ptr = unsafe {
-            // Safety: lifetime is valid at least until the end of the callback. A correct lifetime will be attached when we pass the reference to the child function
+            // Safety: lifetime is valid at least until the end of the callback. A correct lifetime
+            // will be attached when we pass the reference to the child function
             EventRecord::from_ptr(p_record)
         };
 
@@ -112,35 +117,43 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
             let p_callback_data = p_user_context.cast::<Arc<CallbackData>>();
             let callback_data = unsafe {
                 // Safety:
-                //  * the API of this create guarantees this points to a `CallbackData` already allocated and created
-                //  * we've just checked using UNIQUE_VALID_CONTEXTS that this `CallbackData` has not been dropped
-                //  * the API of this crate guarantees this `CallbackData` is not mutated from another thread during the trace:
-                //      * we're the only one to change CallbackData::events_handled (and that's an atomic, so it's fine)
+                //  * the API of this create guarantees this points to a `CallbackData` already
+                //    allocated and created
+                //  * we've just checked using UNIQUE_VALID_CONTEXTS that this `CallbackData` has
+                //    not been dropped
+                //  * the API of this crate guarantees this `CallbackData` is not mutated from
+                //    another thread during the trace:
+                //      * we're the only one to change CallbackData::events_handled (and that's an
+                //        atomic, so it's fine)
                 //      * the list of Providers is a constant (may change in the future with #54)
                 //      * the schema_locator only has interior mutability
                 p_callback_data.as_ref()
             };
             if let Some(callback_data) = callback_data {
-                // The UserContext is owned by the `Trace` object. When it is dropped, so will the UserContext.
-                // We clone it now, so that the original Arc can be safely dropped at all times, but the callback data (including the closure captured context) will still be alive until the callback ends.
+                // The UserContext is owned by the `Trace` object. When it is dropped, so will the
+                // UserContext. We clone it now, so that the original Arc can be
+                // safely dropped at all times, but the callback data (including the closure
+                // captured context) will still be alive until the callback ends.
                 let cloned_arc = Arc::clone(callback_data);
                 cloned_arc.on_event(event_record);
             }
         }
     })) {
-        Ok(_) => {}
+        Ok(()) => {},
         Err(e) => {
             log::error!("UNIMPLEMENTED PANIC: {e:?}");
             std::process::exit(1);
-        }
+        },
     }
 }
 
 fn filter_invalid_trace_handles(h: TraceHandle) -> Option<TraceHandle> {
     // See https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-opentracew#return-value
-    // We're conservative and we always filter out u32::MAX, although it could be valid on 64-bit setups.
-    // But it turns out runtime detection of the current OS bitness is not that easy. Plus, it is not clear whether this depends on how the architecture the binary is compiled for, or the actual OS architecture.
-    if h.Value == u64::MAX || h.Value == u32::MAX as u64 {
+    // We're conservative and we always filter out u32::MAX, although it could be valid on 64-bit
+    // setups. But it turns out runtime detection of the current OS bitness is not that easy.
+    // Plus, it is not clear whether this depends on how the architecture the binary is compiled
+    // for, or the actual OS architecture.
+    if h.Value == u64::MAX || h.Value == u64::from(u32::MAX) {
         None
     } else {
         Some(h)
@@ -150,12 +163,17 @@ fn filter_invalid_trace_handles(h: TraceHandle) -> Option<TraceHandle> {
 fn filter_invalid_control_handle(h: ControlHandle) -> Option<ControlHandle> {
     // The control handle is 0 if the handle is not valid.
     // (https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew)
-    if h.Value == 0 { None } else { Some(h) }
+    if h.Value == 0 {
+        None
+    } else {
+        Some(h)
+    }
 }
 
 /// Create a new session.
 ///
-/// This builds an `EventTraceProperties`, calls `StartTraceW` and returns the built `EventTraceProperties` as well as the trace ControlHandle
+/// This builds an `EventTraceProperties`, calls `StartTraceW` and returns the built
+/// `EventTraceProperties` as well as the trace ControlHandle
 pub(crate) fn start_trace<T>(
     trace_name: &U16CStr,
     etl_dump_file: Option<(&U16CStr, DumpFileLoggingMode, Option<u32>)>,
@@ -171,12 +189,16 @@ where
     let mut control_handle = ControlHandle::default();
     let status = unsafe {
         // Safety:
-        //  * first argument points to a valid and allocated address (this is an output and will be modified)
-        //  * second argument is a valid, null terminated widestring (note that it will be copied to the EventTraceProperties...from where it already comes. This will probably be overwritten by Windows, but heck.)
+        //  * first argument points to a valid and allocated address (this is an output and will be
+        //    modified)
+        //  * second argument is a valid, null terminated widestring (note that it will be copied to
+        //    the EventTraceProperties...from where it already comes. This will probably be
+        //    overwritten by Windows, but heck.)
         //  * third argument is a valid, allocated EVENT_TRACE_PROPERTIES (and will be mutated)
-        //  * Note: the string (that will be overwritten to itself) ends with a null widechar before the end of its buffer (see EventTraceProperties::new())
+        //  * Note: the string (that will be overwritten to itself) ends with a null widechar before
+        //    the end of its buffer (see EventTraceProperties::new())
         Etw::StartTraceW(
-            &mut control_handle,
+            &raw mut control_handle,
             PCWSTR::from_raw(properties.trace_name_array().as_ptr()),
             properties.as_mut_ptr(),
         )
@@ -213,8 +235,9 @@ pub(crate) fn open_trace(
         EventTraceLogfile::create(callback_data, subscription_source, trace_callback_thunk);
 
     if let Err(ContextError::AlreadyExist) = UNIQUE_VALID_CONTEXTS.insert(log_file.context_ptr()) {
-        // That's probably possible to get multiple handles to the same trace, by opening them multiple times.
-        // But that's left as a future TODO. Making things right and safe is difficult enough with a single opening of the trace already.
+        // That's probably possible to get multiple handles to the same trace, by opening them
+        // multiple times. But that's left as a future TODO. Making things right and safe is
+        // difficult enough with a single opening of the trace already.
         return Err(EvntraceNativeError::AlreadyExist);
     }
 
@@ -281,7 +304,7 @@ pub(crate) fn enable_provider(
             let res = unsafe {
                 Etw::EnableTraceEx2(
                     handle,
-                    &provider.guid() as *const GUID,
+                    std::ptr::from_ref::<GUID>(&provider.guid()),
                     EVENT_CONTROL_CODE_ENABLE_PROVIDER.0,
                     provider.level(),
                     provider.any(),
@@ -295,7 +318,7 @@ pub(crate) fn enable_provider(
             res.map_err(|err| {
                 EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
             })
-        }
+        },
     }
 }
 
@@ -309,9 +332,10 @@ pub(crate) fn process_trace(trace_handle: TraceHandle) -> EvntraceNativeResult<(
         let result = unsafe {
             // We want to start processing events as soon as January 1601.
             // * for ETL file traces, this is fine, this means "process everything from the file"
-            // * for real-time traces, this means we might process a few events already waiting in the buffers when the processing is starting. This is fine, I suppose.
+            // * for real-time traces, this means we might process a few events already waiting in
+            //   the buffers when the processing is starting. This is fine, I suppose.
             let mut start = FILETIME::default();
-            Etw::ProcessTrace(&[trace_handle], Some(&mut start as *mut FILETIME), None)
+            Etw::ProcessTrace(&[trace_handle], Some(&raw mut start), None)
         }
         .ok();
 
@@ -325,9 +349,10 @@ pub(crate) fn process_trace(trace_handle: TraceHandle) -> EvntraceNativeResult<(
 ///
 /// # Notes
 ///
-/// In case you want to stop the trace, you probably want to drop the instance rather than calling `control(EVENT_TRACE_CONTROL_STOP)` yourself,
-/// because stop the trace makes the trace handle invalid.
-/// A stopped trace could theoretically(?) be re-used, but the trace handle should be re-created, so `open` should be called again.
+/// In case you want to stop the trace, you probably want to drop the instance rather than calling
+/// `control(EVENT_TRACE_CONTROL_STOP)` yourself, because stop the trace makes the trace handle
+/// invalid. A stopped trace could theoretically(?) be re-used, but the trace handle should be
+/// re-created, so `open` should be called again.
 pub(crate) fn control_trace(
     properties: &mut EventTraceProperties,
     control_handle: ControlHandle,
@@ -339,7 +364,10 @@ pub(crate) fn control_trace(
             let result = unsafe {
                 // Safety:
                 //  * the trace handle is valid (by construction)
-                //  * depending on the control code, the `Properties` can be mutated. This is fine because properties is declared as `&mut` in this function, which means no other Rust function has a reference to it, and the mutation can only happen in the call to `ControlTraceW`, which returns immediately.
+                //  * depending on the control code, the `Properties` can be mutated. This is fine
+                //    because properties is declared as `&mut` in this function, which means no
+                //    other Rust function has a reference to it, and the mutation can only happen in
+                //    the call to `ControlTraceW`, which returns immediately.
                 Etw::ControlTraceW(
                     handle,
                     PCWSTR::null(),
@@ -352,7 +380,7 @@ pub(crate) fn control_trace(
             result.map_err(|err| {
                 EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
             })
-        }
+        },
     }
 }
 
@@ -364,7 +392,10 @@ pub(crate) fn control_trace_by_name(
 ) -> windows::core::Result<()> {
     unsafe {
         // Safety:
-        //  * depending on the control code, the `Properties` can be mutated. This is fine because properties is declared as `&mut` in this function, which means no other Rust function has a reference to it, and the mutation can only happen in the call to `ControlTraceW`, which returns immediately.
+        //  * depending on the control code, the `Properties` can be mutated. This is fine because
+        //    properties is declared as `&mut` in this function, which means no other Rust function
+        //    has a reference to it, and the mutation can only happen in the call to
+        //    `ControlTraceW`, which returns immediately.
         Etw::ControlTraceW(
             Etw::CONTROLTRACE_HANDLE { Value: 0 },
             PCWSTR::from_raw(trace_name.as_ptr()),
@@ -377,11 +408,13 @@ pub(crate) fn control_trace_by_name(
 
 /// Close the trace
 ///
-/// It is suggested to stop the trace immediately after `close`ing it (that's what it done in the `impl Drop`), because I'm not sure how sensible it is to call other methods (apart from `stop`) afterwards
+/// It is suggested to stop the trace immediately after `close`ing it (that's what it done in the
+/// `impl Drop`), because I'm not sure how sensible it is to call other methods (apart from `stop`)
+/// afterwards
 ///
-/// In case ETW reports there are still events in the queue that are still to trigger callbacks, this returns Ok(true).<br/>
-/// If no further event callback will be invoked, this returns Ok(false)<br/>
-/// On error, this returns an `Err`
+/// In case ETW reports there are still events in the queue that are still to trigger callbacks,
+/// this returns Ok(true).<br/> If no further event callback will be invoked, this returns
+/// Ok(false)<br/> On error, this returns an `Err`
 #[allow(clippy::borrowed_box)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer
 pub(crate) fn close_trace(
     trace_handle: TraceHandle,
@@ -390,9 +423,10 @@ pub(crate) fn close_trace(
     match filter_invalid_trace_handles(trace_handle) {
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
-            // By contruction, only one Provider used this context in its callback. It is safe to remove it, it won't be used by anyone else.
+            // By contruction, only one Provider used this context in its callback. It is safe to
+            // remove it, it won't be used by anyone else.
             UNIQUE_VALID_CONTEXTS
-                .remove(callback_data.as_ref() as *const Arc<CallbackData> as *const c_void);
+                .remove(std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>());
 
             let status = unsafe { Etw::CloseTrace(handle) }.ok();
 
@@ -403,18 +437,21 @@ pub(crate) fn close_trace(
                     std::io::Error::from_raw_os_error(err.code().0),
                 )),
             }
-        }
+        },
     }
 }
 
 /// Queries the system for system-wide ETW information (that does not require an active session).
 pub(crate) fn query_info(class: TraceInformation, buf: &mut [u8]) -> EvntraceNativeResult<()> {
+    // Query buffers hold small fixed-size structs: cannot overflow a u32
+    #[allow(clippy::cast_possible_truncation)]
+    let buf_len = buf.len() as u32;
     let result = unsafe {
         Etw::TraceQueryInformation(
             Etw::CONTROLTRACE_HANDLE { Value: 0 },
             TRACE_QUERY_INFO_CLASS(class as i32),
             buf.as_mut_ptr().cast(),
-            buf.len() as u32,
+            buf_len,
             None,
         )
     }

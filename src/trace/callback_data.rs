@@ -1,20 +1,24 @@
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use rustc_hash::FxHashMap;
-use windows::Win32::System::Diagnostics::Etw;
+use windows::{Win32::System::Diagnostics::Etw, core::GUID};
 
-use crate::EtwCallback;
-use crate::native::etw_types::event_record::EventRecord;
-use crate::provider::Provider;
-use crate::schema_locator::SchemaLocator;
-use crate::trace::RealTimeTraceTrait;
-use windows::core::GUID;
+use crate::{
+    EtwCallback, native::etw_types::event_record::EventRecord, provider::Provider,
+    schema_locator::SchemaLocator, trace::RealTimeTraceTrait,
+};
 
 /// Data used by callbacks when the trace is running
-// NOTE: this structure is accessed in an unsafe block in a separate thread (see the `trace_callback_thunk` function)
-//       Thus, this struct must not be mutated (outside of interior mutability and/or using Mutex and other synchronization mechanisms) when the associated trace is running.
+// NOTE: this structure is accessed in an unsafe block in a separate thread (see the
+// `trace_callback_thunk` function)       Thus, this struct must not be mutated (outside of interior
+// mutability and/or using Mutex and other synchronization mechanisms) when the associated trace is
+// running.
 #[derive(Debug)]
 pub enum CallbackData {
     RealTime(RealTimeCallbackData),
@@ -26,7 +30,8 @@ pub struct RealTimeCallbackData {
     /// Represents how many events have been handled so far
     events_handled: AtomicUsize,
     schema_locator: SchemaLocator,
-    /// List of Providers associated with the Trace. This also owns the callback closures and their state
+    /// List of Providers associated with the Trace. This also owns the callback closures and their
+    /// state
     providers: Vec<Provider>,
     /// Maps a provider GUID to the indices of `providers` with that GUID, so
     /// that `on_event` does not linearly scan every provider on each event
@@ -59,7 +64,7 @@ impl CallbackData {
     }
 }
 
-impl std::default::Default for RealTimeCallbackData {
+impl Default for RealTimeCallbackData {
     fn default() -> Self {
         Self {
             events_handled: AtomicUsize::new(0),
@@ -72,7 +77,7 @@ impl std::default::Default for RealTimeCallbackData {
 
 impl RealTimeCallbackData {
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
 
     pub fn add_provider(&mut self, provider: Provider) {
@@ -80,7 +85,7 @@ impl RealTimeCallbackData {
             .entry(provider.guid())
             .or_default()
             .push(self.providers.len());
-        self.providers.push(provider)
+        self.providers.push(provider);
     }
 
     pub fn providers(&self) -> &[Provider] {
@@ -131,9 +136,10 @@ impl CallbackDataFromFile {
 
 impl std::fmt::Debug for CallbackDataFromFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `callback` holds function objects, which cannot be Debug-formatted
         f.debug_struct("CallbackDataFromFile")
             .field("events_handled", &self.events_handled)
             .field("schema_locator", &self.schema_locator)
-            .finish()
+            .finish_non_exhaustive()
     }
 }

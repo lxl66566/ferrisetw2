@@ -1,10 +1,15 @@
-use ferrisetw::EventRecord;
-use ferrisetw::parser::{Parser, Pointer};
-use ferrisetw::provider::*;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::*;
-use std::net::{IpAddr, Ipv4Addr};
-use std::time::Duration;
+use std::{
+    net::{IpAddr, Ipv4Addr},
+    time::Duration,
+};
+
+use ferrisetw::{
+    EventRecord,
+    parser::{Parser, Pointer},
+    provider::*,
+    schema_locator::SchemaLocator,
+    trace::*,
+};
 
 fn registry_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
     match schema_locator.event_schema(record) {
@@ -16,13 +21,13 @@ fn registry_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
                 let status: u32 = parser.try_parse("Status").unwrap_or(0);
                 let value_name: String = parser.try_parse("ValueName").unwrap_or_default();
                 println!(
-                    "QueryValueKey (PID: {}) -> KeyObj: {:#08x}, ValueName: {}, Status: {:#04X}",
-                    pid, key_obj, value_name, status,
+                    "QueryValueKey (PID: {pid}) -> KeyObj: {key_obj:#08x}, ValueName: \
+                     {value_name}, Status: {status:#04X}",
                 );
             }
-        }
-        Err(err) => println!("Error {:?}", err),
-    };
+        },
+        Err(err) => println!("Error {err:?}"),
+    }
 }
 
 fn tcpip_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
@@ -33,20 +38,17 @@ fn tcpip_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
                 let size: u32 = parser.try_parse("size").unwrap_or(0);
                 let daddr: IpAddr = parser
                     .try_parse("daddr")
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 let dport: u16 = parser.try_parse("dport").unwrap_or(0);
                 let saddr: IpAddr = parser
                     .try_parse("saddr")
-                    .unwrap_or(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                 let sport: u16 = parser.try_parse("sport").unwrap_or(0);
-                println!(
-                    "{} bytes received from {}:{} to {}:{}",
-                    size, saddr, sport, daddr, dport
-                );
+                println!("{size} bytes received from {saddr}:{sport} to {daddr}:{dport}");
             }
-        }
-        Err(err) => println!("Error {:?}", err),
-    };
+        },
+        Err(err) => println!("Error {err:?}"),
+    }
 }
 
 fn main() {

@@ -1,13 +1,17 @@
 //! ETW Providers abstraction.
 //!
 //! Provides an abstraction over an [ETW Provider](https://docs.microsoft.com/en-us/windows/win32/etw/about-event-tracing#providers)
-use crate::native::etw_types::event_record::EventRecord;
-use crate::native::pla;
-use crate::schema_locator::SchemaLocator;
+use std::{
+    convert::TryFrom,
+    sync::{Arc, Mutex},
+};
 
-use std::convert::TryFrom;
-use std::sync::{Arc, Mutex};
 use windows::core::GUID;
+
+use crate::{
+    native::{etw_types::event_record::EventRecord, pla},
+    schema_locator::SchemaLocator,
+};
 
 pub(crate) mod event_filter;
 pub use event_filter::EventFilter;
@@ -108,7 +112,7 @@ impl IntoGuid for u128 {
 
 impl IntoGuid for &str {
     fn into_guid(self) -> GUID {
-        GUID::try_from(self).unwrap_or_else(|_| panic!("invalid GUID string: {:?}", self))
+        GUID::try_from(self).unwrap_or_else(|_| panic!("invalid GUID string: {self:?}"))
     }
 }
 
@@ -133,7 +137,9 @@ impl Provider {
 
     /// Create a Kernel Provider
     ///
-    /// You can pass either a KernelProvider you have created yourself, or one of the standard providers from [`crate::provider::kernel_providers`].
+    /// You can pass either a KernelProvider you have created yourself, or one of the standard
+    /// providers from [`crate::provider::kernel_providers`].
+    #[must_use]
     pub fn kernel(kernel_provider: &kernel_providers::KernelProvider) -> ProviderBuilder {
         let mut builder = Self::by_guid(kernel_provider.guid);
         builder.kernel_flags = kernel_provider.flags;
@@ -151,7 +157,9 @@ impl Provider {
     /// # Example
     /// ```
     /// # use ferrisetw::provider::Provider;
-    /// let my_provider = Provider::by_name("Microsoft-Windows-WinINet").unwrap().build();
+    /// let my_provider = Provider::by_name("Microsoft-Windows-WinINet")
+    ///     .unwrap()
+    ///     .build();
     /// ```
     pub fn by_name(name: &str) -> Result<ProviderBuilder, crate::native::PlaError> {
         let guid = unsafe { pla::get_provider_guid(name) }?;
@@ -161,32 +169,45 @@ impl Provider {
 
 // Actually use the Provider
 impl Provider {
+    #[must_use]
     pub fn guid(&self) -> GUID {
         self.guid
     }
+
+    #[must_use]
     pub fn any(&self) -> u64 {
         self.any
     }
+
+    #[must_use]
     pub fn all(&self) -> u64 {
         self.all
     }
+
+    #[must_use]
     pub fn level(&self) -> u8 {
         self.level
     }
+
+    #[must_use]
     pub fn trace_flags(&self) -> TraceFlags {
         self.trace_flags
     }
+
+    #[must_use]
     pub fn kernel_flags(&self) -> u32 {
         self.kernel_flags
     }
+
+    #[must_use]
     pub fn filters(&self) -> &[EventFilter] {
         &self.filters
     }
 
     pub(crate) fn on_event(&self, record: &EventRecord, locator: &SchemaLocator) {
         if let Ok(mut callbacks) = self.callbacks.lock() {
-            callbacks.iter_mut().for_each(|cb| cb(record, locator))
-        };
+            callbacks.iter_mut().for_each(|cb| cb(record, locator));
+        }
     }
 }
 
@@ -212,8 +233,11 @@ impl ProviderBuilder {
     /// # Example
     /// ```
     /// # use ferrisetw::provider::Provider;
-    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F").any(0xf0010000000003ff).build();
+    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
+    ///     .any(0xf0010000000003ff)
+    ///     .build();
     /// ```
+    #[must_use]
     pub fn any(mut self, any: u64) -> Self {
         self.any = any;
         self
@@ -225,8 +249,11 @@ impl ProviderBuilder {
     /// # Example
     /// ```
     /// # use ferrisetw::provider::Provider;
-    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F").all(0x4000000000000000).build();
+    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
+    ///     .all(0x4000000000000000)
+    ///     .build();
     /// ```
+    #[must_use]
     pub fn all(mut self, all: u64) -> Self {
         self.all = all;
         self
@@ -243,8 +270,11 @@ impl ProviderBuilder {
     /// // Warning (0x3)
     /// // Information (0x4)
     /// // Verbose (0x5)
-    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F").level(0x5).build();
+    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
+    ///     .level(0x5)
+    ///     .build();
     /// ```
+    #[must_use]
     pub fn level(mut self, level: u8) -> Self {
         self.level = level;
         self
@@ -256,8 +286,11 @@ impl ProviderBuilder {
     /// # Example
     /// ```
     /// # use ferrisetw::provider::{Provider, TraceFlags};
-    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F").trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_SID).build();
+    /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
+    ///     .trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_SID)
+    ///     .build();
     /// ```
+    #[must_use]
     pub fn trace_flags(mut self, trace_flags: TraceFlags) -> Self {
         self.trace_flags = trace_flags;
         self
@@ -267,7 +300,8 @@ impl ProviderBuilder {
     ///
     /// # Notes
     ///
-    /// The callback will be run on a background thread (the one that is blocked on the `process` function).
+    /// The callback will be run on a background thread (the one that is blocked on the `process`
+    /// function).
     ///
     /// # Example
     /// ```
@@ -275,13 +309,16 @@ impl ProviderBuilder {
     /// # use ferrisetw::trace::UserTrace;
     /// # use ferrisetw::EventRecord;
     /// # use ferrisetw::schema_locator::SchemaLocator;
-    /// let provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F").add_callback(|record: &EventRecord, schema_locator: &SchemaLocator| {
-    ///     // Handle Event
-    /// }).build();
+    /// let provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
+    ///     .add_callback(|record: &EventRecord, schema_locator: &SchemaLocator| {
+    ///         // Handle Event
+    ///     })
+    ///     .build();
     /// UserTrace::new().enable(provider).start().unwrap();
     /// ```
     ///
     /// [SchemaLocator]: crate::schema_locator::SchemaLocator
+    #[must_use]
     pub fn add_callback<T>(self, callback: T) -> Self
     where
         T: FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static,
@@ -310,6 +347,7 @@ impl ProviderBuilder {
     ///     .add_filter(only_pid_1234)
     ///     .build();
     /// ```
+    #[must_use]
     pub fn add_filter(mut self, filter: EventFilter) -> Self {
         self.filters.push(filter);
         self
@@ -324,10 +362,11 @@ impl ProviderBuilder {
     /// # use ferrisetw::schema_locator::SchemaLocator;
     /// # let process_callback = |_event: &EventRecord, _locator: &SchemaLocator| {};
     /// Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716") // Microsoft-Windows-Kernel-Process
-    ///   .add_callback(process_callback)
-    ///   .build();
+    ///     .add_callback(process_callback)
+    ///     .build();
     /// ```
     // TODO: should we check if callbacks is empty ???
+    #[must_use]
     pub fn build(self) -> Provider {
         Provider {
             guid: self.guid,

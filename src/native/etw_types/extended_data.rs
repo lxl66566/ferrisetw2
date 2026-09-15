@@ -1,17 +1,18 @@
 //! A module to handle Extended Data from ETW traces
 
-use std::{convert::TryInto, ffi::CStr, mem};
-use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID, EVENT_EXTENDED_ITEM_TS_ID,
+use std::{convert::TryInto, ffi::CStr};
+
+use windows::{
+    Win32::System::Diagnostics::Etw::{
+        EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID, EVENT_EXTENDED_ITEM_TS_ID,
+        EVENT_HEADER_EXT_TYPE_EVENT_KEY, EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
+        EVENT_HEADER_EXT_TYPE_INSTANCE_INFO, EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY,
+        EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, EVENT_HEADER_EXT_TYPE_SID,
+        EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+        EVENT_HEADER_EXT_TYPE_TS_ID, EVENT_HEADER_EXTENDED_DATA_ITEM,
+    },
+    core::GUID,
 };
-use windows::Win32::System::Diagnostics::Etw::{
-    EVENT_HEADER_EXT_TYPE_EVENT_KEY, EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
-    EVENT_HEADER_EXT_TYPE_INSTANCE_INFO, EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY,
-    EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, EVENT_HEADER_EXT_TYPE_SID,
-    EVENT_HEADER_EXT_TYPE_STACK_TRACE32, EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
-    EVENT_HEADER_EXT_TYPE_TS_ID, EVENT_HEADER_EXTENDED_DATA_ITEM,
-};
-use windows::core::GUID;
 
 // These types are returned by our public API. Let's use their re-exported versions
 use crate::native::{
@@ -51,13 +52,18 @@ where
         self.addresses.as_ref()
     }
 
+    /// Builds a `StackTraceItem` from a raw extended data item
+    ///
+    /// # Safety
+    ///
+    /// `array_size` elements of `Address` must be readable from `first_address`
     unsafe fn from_raw(
         match_id: u64,
         first_address: *const Address,
         item_size: usize,
     ) -> StackTraceItem<Address> {
         let array_size_in_bytes = item_size.saturating_sub(OFFSET_OF_ADDRESS_IN_ITEM);
-        let array_size = array_size_in_bytes / core::mem::size_of::<Address>();
+        let array_size = array_size_in_bytes / size_of::<Address>();
         let addresses = unsafe { std::slice::from_raw_parts(first_address, array_size) }.into();
         StackTraceItem {
             match_id,
@@ -105,16 +111,19 @@ impl Sid {
     }
 
     /// The raw SID bytes, as expected by SID-related Win32 APIs taking a `PSID`
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.data
     }
 
     /// Number of sub-authorities (e.g. 5 for `S-1-5-21-...-...-...-RID`)
+    #[must_use]
     pub fn sub_authority_count(&self) -> u8 {
         self.data[1]
     }
 
     /// The `index`-th sub-authority (0-based), little-endian
+    #[must_use]
     pub fn sub_authority(&self, index: usize) -> Option<u32> {
         if index >= self.sub_authority_count() as usize {
             return None;
@@ -127,7 +136,7 @@ impl Sid {
 
     /// Renders this SID into its string form (e.g. `S-1-5-18`)
     pub fn to_sddl_string(&self) -> Result<String, crate::native::SddlNativeError> {
-        crate::native::sddl::convert_sid_to_string(self.data.as_ptr() as *const _)
+        crate::native::sddl::convert_sid_to_string(self.data.as_ptr().cast())
     }
 }
 
@@ -152,8 +161,8 @@ pub enum ExtendedDataItem {
     /// TraceLogging event metadata information
     TraceLogging(String),
     // /// Provider traits data
-    // /// (for example traits set through EventSetInformation(EventProviderSetTraits) or specified through EVENT_DATA_DESCRIPTOR_TYPE_PROVIDER_METADATA)
-    // ProvTraits,
+    // /// (for example traits set through EventSetInformation(EventProviderSetTraits) or
+    // specified through EVENT_DATA_DESCRIPTOR_TYPE_PROVIDER_METADATA) ProvTraits,
     /// Unique event identifier
     EventKey(u64),
     /// Unique process identifier (unique across the boot session)
@@ -164,81 +173,83 @@ impl EventHeaderExtendedDataItem {
     /// Returns the `ExtType` of this extended data.
     ///
     /// See <https://docs.microsoft.com/en-us/windows/win32/api/relogger/ns-relogger-event_header_extended_data_item> for possible values
+    #[must_use]
     pub fn data_type(&self) -> u16 {
         self.0.ExtType
     }
 
+    #[must_use]
     pub fn is_tlg(&self) -> bool {
-        self.0.ExtType as u32 == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
+        u32::from(self.0.ExtType) == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
     }
 
     /// Returns this extended data as a variant of a Rust enum.
     // TODO: revisit this function
+    #[must_use]
     pub fn to_extended_data_item(&self) -> ExtendedDataItem {
         let data_ptr = self.0.DataPtr as *const std::ffi::c_void;
         if data_ptr.is_null() {
             return ExtendedDataItem::Unsupported;
         }
 
-        match self.0.ExtType as u32 {
+        match u32::from(self.0.ExtType) {
             EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID => {
-                let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID;
+                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID>();
                 ExtendedDataItem::RelatedActivityId(unsafe { *data_ptr }.RelatedActivityId)
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_SID => ExtendedDataItem::Sid(unsafe {
-                Sid::from_raw(data_ptr as *const u8, self.0.DataSize)
+                Sid::from_raw(data_ptr.cast::<u8>(), self.0.DataSize)
             }),
 
             EVENT_HEADER_EXT_TYPE_TS_ID => {
-                let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_TS_ID;
+                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_TS_ID>();
                 ExtendedDataItem::TsId(unsafe { *data_ptr }.SessionId)
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_INSTANCE_INFO => {
-                let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_INSTANCE;
+                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_INSTANCE>();
                 ExtendedDataItem::InstanceInfo(unsafe { *data_ptr })
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_STACK_TRACE32 => {
-                let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_STACK_TRACE32;
+                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_STACK_TRACE32>();
                 ExtendedDataItem::StackTrace32(unsafe {
                     let match_id = (*data_ptr).MatchId;
-                    let first_address = &(*data_ptr).Address[0] as *const _;
+                    let first_address = &raw const (*data_ptr).Address[0];
                     let item_size = self.0.DataSize as usize;
                     StackTraceItem::from_raw(match_id, first_address, item_size)
                 })
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_STACK_TRACE64 => {
-                let data_ptr = data_ptr as *const EVENT_EXTENDED_ITEM_STACK_TRACE64;
+                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_STACK_TRACE64>();
                 ExtendedDataItem::StackTrace64(unsafe {
                     let match_id = (*data_ptr).MatchId;
-                    let first_address = &(*data_ptr).Address[0] as *const _;
+                    let first_address = &raw const (*data_ptr).Address[0];
                     let item_size = self.0.DataSize as usize;
                     StackTraceItem::from_raw(match_id, first_address, item_size)
                 })
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY => {
-                let data_ptr = data_ptr as *const u64;
+                let data_ptr = data_ptr.cast::<u64>();
                 ExtendedDataItem::ProcessStartKey(unsafe { *data_ptr })
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_EVENT_KEY => {
-                let data_ptr = data_ptr as *const u64;
+                let data_ptr = data_ptr.cast::<u64>();
                 ExtendedDataItem::EventKey(unsafe { *data_ptr })
-            }
+            },
 
             EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL => {
                 ExtendedDataItem::TraceLogging(unsafe { self.get_event_name().unwrap_or_default() })
-            }
+            },
 
             _ => ExtendedDataItem::Unsupported,
         }
     }
 
-    ///
     /// This function will parse the event metadata of a TraceLogging event to
     /// retrieve the EventName.
     ///
@@ -260,7 +271,6 @@ impl EventHeaderExtendedDataItem {
     ///
     /// As per the MS header 'This structure may change in future revisions of this header.'
     /// **Keep an eye on it!**
-    ///
     // TODO: Make this function more robust
     unsafe fn get_event_name(&self) -> Option<String> {
         const TAGS_SIZE: usize = 1;
@@ -274,8 +284,8 @@ impl EventHeaderExtendedDataItem {
         // The size is a u16: read both of its bytes (it used to be read as a
         // single byte, so any metadata >= 256 bytes got a bogus size)
         // Safety: reading the 2 first bytes of the extended data item
-        let size = unsafe { (data_ptr as *const u16).read_unaligned() }.min(self.0.DataSize);
-        data_ptr = unsafe { data_ptr.add(mem::size_of::<u16>()) };
+        let size = unsafe { data_ptr.cast::<u16>().read_unaligned() }.min(self.0.DataSize);
+        data_ptr = unsafe { data_ptr.add(size_of::<u16>()) };
 
         let mut n = 0;
         while n < size {
@@ -291,7 +301,7 @@ impl EventHeaderExtendedDataItem {
         }
 
         // If debug let's assert here since this is a case we want to investigate
-        debug_assert!(n != size);
+        debug_assert_ne!(n, size);
         if n == size {
             return None;
         }
@@ -299,7 +309,7 @@ impl EventHeaderExtendedDataItem {
         Some(String::from(
             unsafe {
                 // Safety: same extended data item, the name follows the tags
-                CStr::from_ptr(data_ptr as *const _)
+                CStr::from_ptr(data_ptr.cast())
             }
             .to_string_lossy(),
         ))
@@ -308,12 +318,15 @@ impl EventHeaderExtendedDataItem {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use windows::Win32::System::Diagnostics::Etw::{
         EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, EVENT_HEADER_EXT_TYPE_SID,
     };
 
+    use super::*;
+
     fn item_with_data(ext_type: u32, blob: &[u8]) -> EventHeaderExtendedDataItem {
+        // Test inputs use known-small ext types and blobs
+        #[allow(clippy::cast_possible_truncation)]
         EventHeaderExtendedDataItem(EVENT_HEADER_EXTENDED_DATA_ITEM {
             ExtType: ext_type as u16,
             DataSize: blob.len() as u16,
@@ -327,9 +340,9 @@ mod tests {
         // [u16 total size][tag byte][nul-terminated name][field metadata]
         // (the tags section always holds at least one byte: tag 0 encodes as 0x00)
         let name = b"Event1\0";
-        let total = 2 + 1 + name.len() + 3;
-        let mut blob = Vec::with_capacity(total);
-        blob.extend_from_slice(&(total as u16).to_le_bytes());
+        let total = u16::try_from(2 + 1 + name.len() + 3).unwrap();
+        let mut blob = Vec::with_capacity(usize::from(total));
+        blob.extend_from_slice(&total.to_le_bytes());
         blob.push(0x00); // tag = 0
         blob.extend_from_slice(name);
         blob.extend_from_slice(&[0x20, 0x00, 0x00]); // dummy field metadata
@@ -347,12 +360,12 @@ mod tests {
         // Total size of 256: its low byte is 0, which the (buggy) single-byte
         // size read mistook for an empty metadata, failing to parse the name
         let name = b"MyEvent\0";
-        let total = 256usize;
-        let mut blob = Vec::with_capacity(total);
-        blob.extend_from_slice(&(total as u16).to_le_bytes());
+        let total = 256u16;
+        let mut blob = Vec::with_capacity(usize::from(total));
+        blob.extend_from_slice(&total.to_le_bytes());
         blob.extend_from_slice(&[0x81, 0x02]); // two tag bytes, the second one ends the chain
         blob.extend_from_slice(name);
-        blob.resize(total, 0xab); // dummy field metadata
+        blob.resize(usize::from(total), 0xab); // dummy field metadata
 
         let ExtendedDataItem::TraceLogging(event_name) =
             item_with_data(EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, &blob).to_extended_data_item()
@@ -376,14 +389,8 @@ mod tests {
     fn sid_extended_data_is_deep_copied() {
         let sid_bytes = sample_sid_bytes();
 
-        let item = EVENT_HEADER_EXTENDED_DATA_ITEM {
-            ExtType: EVENT_HEADER_EXT_TYPE_SID as u16,
-            DataSize: sid_bytes.len() as u16,
-            DataPtr: sid_bytes.as_ptr() as u64,
-            ..Default::default()
-        };
-
-        let ExtendedDataItem::Sid(sid) = EventHeaderExtendedDataItem(item).to_extended_data_item()
+        let ExtendedDataItem::Sid(sid) =
+            item_with_data(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes).to_extended_data_item()
         else {
             panic!("expected the Sid variant");
         };
@@ -400,20 +407,15 @@ mod tests {
     fn sid_copy_survives_the_original_buffer() {
         let mut sid_bytes = sample_sid_bytes();
 
-        let item = EVENT_HEADER_EXTENDED_DATA_ITEM {
-            ExtType: EVENT_HEADER_EXT_TYPE_SID as u16,
-            DataSize: sid_bytes.len() as u16,
-            DataPtr: sid_bytes.as_ptr() as u64,
-            ..Default::default()
-        };
-        let ExtendedDataItem::Sid(sid) = EventHeaderExtendedDataItem(item).to_extended_data_item()
+        let ExtendedDataItem::Sid(sid) =
+            item_with_data(EVENT_HEADER_EXT_TYPE_SID, &sid_bytes).to_extended_data_item()
         else {
             panic!("expected the Sid variant");
         };
 
         // The (old) shallow copy only captured the fixed-size prefix: trashing
         // the original buffer must not affect our deep copy
-        sid_bytes.iter_mut().for_each(|byte| *byte = 0xaa);
+        sid_bytes.fill(0xaa);
         assert_eq!(sid.sub_authority(4), Some(999));
     }
 }

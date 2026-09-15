@@ -4,14 +4,21 @@
 //! so they are gated behind the `admin_tests` feature on top of `serde`.
 #![cfg(all(feature = "serde", feature = "admin_tests"))]
 
-use ferrisetw::provider::Provider;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::{TraceBuilder, TraceTrait, UserTrace, stop_trace_by_name};
-use ferrisetw::{EventRecord, EventSerializer, EventSerializerOptions};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+use ferrisetw::{
+    EventRecord, EventSerializer, EventSerializerOptions,
+    provider::Provider,
+    schema_locator::SchemaLocator,
+    trace::{TraceBuilder, TraceTrait, UserTrace, stop_trace_by_name},
+};
 use serde::Serialize;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
 
 static BENCHMARK_PROVIDERS: &[&str] = &[
     "C514638F-7723-485B-BCFC-96565D735D4A",
@@ -69,25 +76,25 @@ static BENCHMARK_PROVIDERS: &[&str] = &[
 ];
 
 struct BenchmarkStatistics {
-    success_count: AtomicU64,
-    error_count: AtomicU64,
-    byte_count: AtomicU64,
+    successes: AtomicU64,
+    failures: AtomicU64,
+    bytes: AtomicU64,
 }
 
 impl BenchmarkStatistics {
     fn new() -> Self {
         Self {
-            success_count: AtomicU64::new(0),
-            error_count: AtomicU64::new(0),
-            byte_count: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            failures: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
         }
     }
 
     fn snap(&self) -> (u64, u64, u64) {
         (
-            self.success_count.load(Ordering::Acquire),
-            self.error_count.load(Ordering::Acquire),
-            self.byte_count.load(Ordering::Acquire),
+            self.successes.load(Ordering::Acquire),
+            self.failures.load(Ordering::Acquire),
+            self.bytes.load(Ordering::Acquire),
         )
     }
 
@@ -99,7 +106,7 @@ impl BenchmarkStatistics {
     ) {
         let res = schema_locator.event_schema(record);
         if res.is_err() {
-            self.error_count.fetch_add(1, Ordering::AcqRel);
+            self.failures.fetch_add(1, Ordering::AcqRel);
             return;
         }
         let schema = res.unwrap();
@@ -107,15 +114,15 @@ impl BenchmarkStatistics {
         let event = EventSerializer::new(record, &schema, options);
         let res = serde_json::to_value(event);
         if res.is_err() {
-            println!("{:?}", res);
-            self.error_count.fetch_add(1, Ordering::AcqRel);
+            println!("{res:?}");
+            self.failures.fetch_add(1, Ordering::AcqRel);
             return;
         }
 
         let json_string = res.unwrap().to_string();
-        //println!("{}", json_string);
-        self.success_count.fetch_add(1, Ordering::AcqRel);
-        self.byte_count
+        // println!("{}", json_string);
+        self.successes.fetch_add(1, Ordering::AcqRel);
+        self.bytes
             .fetch_add(json_string.len() as u64, Ordering::AcqRel);
     }
 
@@ -127,7 +134,7 @@ impl BenchmarkStatistics {
     ) {
         let res = schema_locator.event_schema(record);
         if res.is_err() {
-            self.error_count.fetch_add(1, Ordering::AcqRel);
+            self.failures.fetch_add(1, Ordering::AcqRel);
             return;
         }
         let schema = res.unwrap();
@@ -136,20 +143,20 @@ impl BenchmarkStatistics {
         let mut ser = flexbuffers::FlexbufferSerializer::new();
         let res = event.serialize(&mut ser);
         if res.is_err() {
-            println!("{:?}", res);
-            self.error_count.fetch_add(1, Ordering::AcqRel);
+            println!("{res:?}");
+            self.failures.fetch_add(1, Ordering::AcqRel);
             return;
         }
 
-        self.success_count.fetch_add(1, Ordering::AcqRel);
-        self.byte_count
+        self.successes.fetch_add(1, Ordering::AcqRel);
+        self.bytes
             .fetch_add(ser.view().len() as u64, Ordering::AcqRel);
     }
 }
 
 fn do_benchmark(
     name: &str,
-    stats: Arc<BenchmarkStatistics>,
+    stats: &Arc<BenchmarkStatistics>,
     trace_builder: TraceBuilder<UserTrace>,
     seconds_to_run: u64,
 ) {
@@ -168,9 +175,9 @@ fn do_benchmark(
             println!(
                 "{:<32}: {} b/s {} s/s {} e/s",
                 name,
-                (((b - last_b) * 1_000_000) as u128) / micros,
-                (((s - last_s) * 1_000_000) as u128) / micros,
-                (((e - last_e) * 1_000_000) as u128) / micros,
+                u128::from((b - last_b) * 1_000_000) / micros,
+                u128::from((s - last_s) * 1_000_000) / micros,
+                u128::from((e - last_e) * 1_000_000) / micros,
             );
         }
 
@@ -190,7 +197,7 @@ fn do_benchmark(
         .expect("thread panic")
         .expect("trace processing error");
 
-    println!("{:<32}: {} b {} s {} e", name, last_b, last_s, last_e);
+    println!("{name:<32}: {last_b} b {last_s} s {last_e} e");
     assert_eq!(last_e, 0, "encountered errors when benchmarking");
 }
 
@@ -208,13 +215,13 @@ fn ser_json_test(name: &'static str, options: EventSerializerOptions, seconds_to
         trace_builder = trace_builder.enable(
             Provider::by_guid(*guid)
                 .add_callback(move |record, schema_locator| {
-                    s.json_callback(record, schema_locator, opts)
+                    s.json_callback(record, schema_locator, opts);
                 })
                 .build(),
         );
     }
 
-    do_benchmark(name, stats, trace_builder, seconds_to_run)
+    do_benchmark(name, &stats, trace_builder, seconds_to_run);
 }
 
 fn ser_flexbuffer_test(name: &'static str, options: EventSerializerOptions, seconds_to_run: u64) {
@@ -231,13 +238,13 @@ fn ser_flexbuffer_test(name: &'static str, options: EventSerializerOptions, seco
         trace_builder = trace_builder.enable(
             Provider::by_guid(*guid)
                 .add_callback(move |record, schema_locator| {
-                    s.flexbuffer_callback(record, schema_locator, opts)
+                    s.flexbuffer_callback(record, schema_locator, opts);
                 })
                 .build(),
         );
     }
 
-    do_benchmark(name, stats, trace_builder, seconds_to_run)
+    do_benchmark(name, &stats, trace_builder, seconds_to_run);
 }
 
 const SECONDS_TO_RUN: u64 = 5;
@@ -247,10 +254,10 @@ fn serialize_json() {
     ser_json_test(
         "ferrisetw-json",
         EventSerializerOptions {
-            //include_schema: false,
-            //include_header: false,
-            //include_extended_data: false,
-            //fail_unimplemented: true,
+            // include_schema: false,
+            // include_header: false,
+            // include_extended_data: false,
+            // fail_unimplemented: true,
             ..Default::default()
         },
         SECONDS_TO_RUN,
@@ -262,10 +269,10 @@ fn serialize_flexbuffer() {
     ser_flexbuffer_test(
         "ferrisetw-flex",
         EventSerializerOptions {
-            //include_schema: false,
-            //include_header: false,
-            //include_extended_data: false,
-            //fail_unimplemented: true,
+            // include_schema: false,
+            // include_header: false,
+            // include_extended_data: false,
+            // fail_unimplemented: true,
             ..Default::default()
         },
         SECONDS_TO_RUN,

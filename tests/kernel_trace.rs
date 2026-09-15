@@ -6,15 +6,17 @@
 
 use std::time::Duration;
 
-use ferrisetw::EventRecord;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::kernel_providers;
-use ferrisetw::provider::{EventFilter, Provider};
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::KernelTrace;
-
-use windows::Win32::System::LibraryLoader::{LOAD_LIBRARY_FLAGS, LoadLibraryExW};
-use windows::core::HSTRING;
+use ferrisetw::{
+    EventRecord,
+    parser::Parser,
+    provider::{EventFilter, Provider, kernel_providers},
+    schema_locator::SchemaLocator,
+    trace::KernelTrace,
+};
+use windows::{
+    Win32::System::LibraryLoader::{LOAD_LIBRARY_FLAGS, LoadLibraryExW},
+    core::HSTRING,
+};
 
 mod utils;
 use utils::{Status, StatusNotifier, TestKind};
@@ -26,8 +28,8 @@ fn kernel_trace_tests() {
     let passed1 = Status::new(TestKind::ExpectSuccess);
     let notifier1 = passed1.notifier();
 
-    // Calling a sub-function, and getting the trace back. This ensures we are able to move the Trace around the stack
-    // (see https://github.com/n4r1b/ferrisetw/pull/28)
+    // Calling a sub-function, and getting the trace back. This ensures we are able to move the
+    // Trace around the stack (see https://github.com/n4r1b/ferrisetw/pull/28)
     let moved_trace = create_simple_kernel_trace_trace(notifier1);
 
     generate_image_load_events();
@@ -86,7 +88,7 @@ fn generate_image_load_events() {
 fn has_seen_dll_load(record: &EventRecord, parser: &Parser) -> bool {
     if record.process_id() == std::process::id() {
         let filename = parser.try_parse::<String>("FileName");
-        println!("   this one's for us: {:?}", filename);
+        println!("   this one's for us: {filename:?}");
         if let Ok(filename) = filename
             && filename.ends_with(TEST_LIBRARY_NAME)
         {

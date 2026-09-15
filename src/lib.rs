@@ -2,8 +2,9 @@
 //! This crate provides safe Rust abstractions over the ETW consumer APIs.
 //!
 //! It started as a [KrabsETW](https://github.com/microsoft/krabsetw/) rip-off written in Rust (hence the name [`Ferris`](https://rustacean.net/) 🦀).
-//! All credits go to the team at Microsoft who develop KrabsEtw, without it, this project probably wouldn't be a thing.<br/>
-//! Since version 1.0, the API and internal architecture of this crate is slightly diverging from `krabsetw`, so that it is more Rust-idiomatic.
+//! All credits go to the team at Microsoft who develop KrabsEtw, without it, this project probably
+//! wouldn't be a thing.<br/> Since version 1.0, the API and internal architecture of this crate is
+//! slightly diverging from `krabsetw`, so that it is more Rust-idiomatic.
 //!
 //! # What's ETW
 //! Event Tracing for Windows (ETW) is an efficient kernel-level tracing facility that lets you log
@@ -21,21 +22,21 @@
 //! It is also able to process events from a file instead of a real-time trace session.
 //!
 //! # Motivation
-//! Even though ETW is a extremely powerful tracing mechanism, interacting with it is not easy by any
-//! means. There's a lot of details and caveats that have to be taken into consideration in order
-//! to make it work. On the other hand, once we manage to start consuming a trace session in real-time
-//! we have to deal with the process of finding the Schema and parsing the properties. All this process
-//! can be tedious and cumbersome, therefore tools like KrabsETW come in very handy to simplify the
-//! interaction with ETW.
+//! Even though ETW is a extremely powerful tracing mechanism, interacting with it is not easy by
+//! any means. There's a lot of details and caveats that have to be taken into consideration in
+//! order to make it work. On the other hand, once we manage to start consuming a trace session in
+//! real-time we have to deal with the process of finding the Schema and parsing the properties. All
+//! this process can be tedious and cumbersome, therefore tools like KrabsETW come in very handy to
+//! simplify the interaction with ETW.
 //!
 //! Since lately I've been working very closely with ETW and Rust, I thought that having a tool that
-//! would simplify ETW management written in Rust and available as a crate for other to consume would
-//! be pretty neat and that's where this crate comes into play 🔥
+//! would simplify ETW management written in Rust and available as a crate for other to consume
+//! would be pretty neat and that's where this crate comes into play 🔥
 //!
 //! # Getting started
-//! If you are familiar with KrabsEtw you'll see using the crate is very similar, in case you are not
-//! familiar with it the following example shows the basics on how to build a provider, start a trace
-//! and handle the Event in the callback
+//! If you are familiar with KrabsEtw you'll see using the crate is very similar, in case you are
+//! not familiar with it the following example shows the basics on how to build a provider, start a
+//! trace and handle the Event in the callback
 //!
 //! ```
 //! use ferrisetw::EventRecord;
@@ -128,13 +129,9 @@ mod utils;
 pub(crate) type EtwCallback = Box<dyn FnMut(&EventRecord, &SchemaLocator) + Send + Sync + 'static>;
 
 // Convenience re-exports.
-pub use crate::native::etw_types::event_record::EventRecord;
-pub use crate::schema_locator::SchemaLocator;
-#[cfg(feature = "serde")]
-pub use crate::ser::{EventSerializer, EventSerializerOptions};
-pub use crate::trace::FileTrace;
-pub use crate::trace::KernelTrace;
-pub use crate::trace::UserTrace;
+/// Re-exported `GUID` from `windows-rs`, which is used in return values for some functions of
+/// this crate
+pub use windows::core::GUID;
 
 // These types are returned by some public APIs of this crate.
 // They must be re-exported, so that users of the crate have a way to avoid version conflicts
@@ -142,5 +139,10 @@ pub use crate::trace::UserTrace;
 /// Owned security identifier returned in extended data of some events
 /// (see [`ExtendedDataItem::Sid`](crate::native::ExtendedDataItem::Sid))
 pub use crate::native::Sid;
-/// Re-exported `GUID` from `windows-rs`, which is used in return values for some functions of this crate
-pub use windows::core::GUID;
+#[cfg(feature = "serde")]
+pub use crate::ser::{EventSerializer, EventSerializerOptions};
+pub use crate::{
+    native::etw_types::event_record::EventRecord,
+    schema_locator::SchemaLocator,
+    trace::{FileTrace, KernelTrace, UserTrace},
+};

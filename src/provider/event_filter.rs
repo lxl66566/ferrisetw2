@@ -1,12 +1,8 @@
-use std::alloc::Layout;
-use std::error::Error;
+use std::{alloc::Layout, error::Error};
 
 use windows::Win32::System::Diagnostics::Etw::{
     EVENT_FILTER_DESCRIPTOR, EVENT_FILTER_EVENT_ID, EVENT_FILTER_TYPE_EVENT_ID,
-    EVENT_FILTER_TYPE_PID,
-};
-use windows::Win32::System::Diagnostics::Etw::{
-    MAX_EVENT_FILTER_EVENT_ID_COUNT, MAX_EVENT_FILTER_PID_COUNT,
+    EVENT_FILTER_TYPE_PID, MAX_EVENT_FILTER_EVENT_ID_COUNT, MAX_EVENT_FILTER_PID_COUNT,
 };
 
 /// Specifies how this provider will filter its events
@@ -46,18 +42,18 @@ pub struct EventFilterDescriptor {
 }
 
 impl EventFilterDescriptor {
-    /// Allocates a new instance, where the included data is `data_size` bytes, and is suitably aligned for type `T`
+    /// Allocates a new instance, where the included data is `data_size` bytes, and is suitably
+    /// aligned for type `T`
     fn try_new<T>(data_size: usize) -> Result<Self, Box<dyn Error>> {
-        let data_size = match data_size {
-            0 => return Err("Filter must not be empty".into()),
-            1..=1024 => data_size as u32,
-            _ => {
-                // See https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
-                return Err("Exceeded filter size limits".into());
-            }
+        if data_size == 0 {
+            return Err("Filter must not be empty".into());
+        }
+        let Ok(data_size @ 1..=1024) = u32::try_from(data_size) else {
+            // See https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
+            return Err("Exceeded filter size limits".into());
         };
 
-        let layout = Layout::from_size_align(data_size as usize, std::mem::align_of::<T>())?;
+        let layout = Layout::from_size_align(data_size as usize, align_of::<T>())?;
         let data = unsafe {
             // Safety: layout size is non-zero
             std::alloc::alloc(layout)
@@ -74,35 +70,39 @@ impl EventFilterDescriptor {
 
     /// Build a new instance that will filter by event ID.
     ///
-    /// Returns an `Err` in case the allocation failed, or if either zero or too many filter items were given
+    /// Returns an `Err` in case the allocation failed, or if either zero or too many filter items
+    /// were given
     pub fn try_new_by_event_ids(eids: &[u16]) -> Result<Self, Box<dyn Error>> {
         if eids.len() > MAX_EVENT_FILTER_EVENT_ID_COUNT as usize {
             // See https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
             return Err("Too many event IDs are filtered".into());
         }
 
-        let data_size = std::mem::size_of::<EVENT_FILTER_EVENT_ID>()
-            + ((eids.len().saturating_sub(1)) * std::mem::size_of::<u16>());
+        let data_size = size_of::<EVENT_FILTER_EVENT_ID>()
+            + ((eids.len().saturating_sub(1)) * size_of::<u16>());
         let mut s = Self::try_new::<EVENT_FILTER_EVENT_ID>(data_size)?;
         s.ty = EVENT_FILTER_TYPE_EVENT_ID;
 
         // Fill the data with an array of `EVENT_FILTER_EVENT_ID`s
+        // The allocation is aligned for EVENT_FILTER_EVENT_ID (see try_new)
+        #[allow(clippy::cast_ptr_alignment)]
         let p = s.data.cast::<EVENT_FILTER_EVENT_ID>();
+        // We've checked the array was less than 1024 items
+        #[allow(clippy::cast_possible_truncation)]
+        let count = eids.len() as u16;
         unsafe {
             (*p).FilterIn = true;
             (*p).Reserved = 0;
-            (*p).Count = eids.len() as u16; // we've checked the array was less than 1024 items
+            (*p).Count = count;
         }
 
         let evts = unsafe {
-            std::slice::from_raw_parts_mut(
-                &((*p).Events[0]) as *const u16 as *mut u16,
-                std::cmp::max(1, eids.len()),
-            )
+            std::slice::from_raw_parts_mut(&raw mut ((*p).Events[0]), std::cmp::max(1, eids.len()))
         };
 
         if eids.is_empty() {
-            // Just to avoid an unintialized data, but should never be accessed anyway since p->Count = 0
+            // Just to avoid an unintialized data, but should never be accessed anyway since
+            // p->Count = 0
             evts[0] = 0;
             return Ok(s);
         }
@@ -113,7 +113,8 @@ impl EventFilterDescriptor {
 
     /// Build a new instance that will filter by PIDs.
     ///
-    /// Returns an `Err` in case the allocation failed, or if either zero or too many filter items were given
+    /// Returns an `Err` in case the allocation failed, or if either zero or too many filter items
+    /// were given
     pub fn try_new_by_process_ids(pids: &[u32]) -> Result<Self, Box<dyn Error>> {
         if pids.len() > MAX_EVENT_FILTER_PID_COUNT as usize {
             // See https://docs.microsoft.com/en-us/windows/win32/api/evntprov/ns-evntprov-event_filter_descriptor
@@ -122,12 +123,14 @@ impl EventFilterDescriptor {
 
         // PIDs are DWORDs (see EVENT_FILTER_DESCRIPTOR documentation: Ptr points
         // to "an array of process IDs", i.e. an array of DWORD)
-        let data_size = std::mem::size_of_val(pids);
+        let data_size = size_of_val(pids);
 
         // try_new rejects data_size == 0, so pids cannot be empty here
         let mut s = Self::try_new::<u32>(data_size)?;
         s.ty = EVENT_FILTER_TYPE_PID;
 
+        // The allocation is aligned for u32 (see try_new)
+        #[allow(clippy::cast_ptr_alignment)]
         let mut p = s.data.cast::<u32>();
         for pid in pids {
             unsafe {
@@ -139,7 +142,7 @@ impl EventFilterDescriptor {
                 // * both the starting and resulting pointer are within the same allocated object
                 //   (except for the very last item, but that will not be written to)
                 // * thus, the offset is smaller than an isize
-                p.offset(1)
+                p.add(1)
             };
         }
 
@@ -159,10 +162,13 @@ impl EventFilterDescriptor {
     /// # Safety
     ///
     /// This will often be fed to an unsafe Windows function (e.g. [EnableTraceEx2](https://docs.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2)).
-    /// Note that this contains pointers to the current `EventFilterDescriptor`, that must remain valid until the called function is done.
+    /// Note that this contains pointers to the current `EventFilterDescriptor`, that must remain
+    /// valid until the called function is done.
     pub fn as_event_filter_descriptor(&self) -> EVENT_FILTER_DESCRIPTOR {
         EVENT_FILTER_DESCRIPTOR {
             Ptr: self.data as u64,
+            // Filter sizes are capped to 1024 bytes at construction
+            #[allow(clippy::cast_possible_truncation)]
             Size: self.layout.size() as u32,
             Type: self.ty,
         }
@@ -195,7 +201,7 @@ mod tests {
         // PIDs are DWORDs (4 bytes each), not WORDs
         assert_eq!(
             native.Size,
-            (pids.len() * std::mem::size_of::<u32>()) as u32
+            u32::try_from(pids.len() * size_of::<u32>()).unwrap()
         );
 
         // Safety: `native.Ptr`/`native.Size` describe the allocation owned by `filter`,
@@ -223,10 +229,7 @@ mod tests {
         assert_eq!(native.Type, EVENT_FILTER_TYPE_EVENT_ID);
         // sizeof(EVENT_FILTER_EVENT_ID) already includes one event id,
         // each additional one adds a u16
-        let header_size = std::mem::size_of::<EVENT_FILTER_EVENT_ID>();
-        assert_eq!(
-            native.Size as usize,
-            header_size + std::mem::size_of::<u16>()
-        );
+        let header_size = size_of::<EVENT_FILTER_EVENT_ID>();
+        assert_eq!(native.Size as usize, header_size + size_of::<u16>());
     }
 }

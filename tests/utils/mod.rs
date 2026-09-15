@@ -1,6 +1,7 @@
-use std::sync::mpsc;
-use std::sync::mpsc::{RecvTimeoutError, TrySendError};
-use std::time::Duration;
+use std::{
+    sync::mpsc::{self, RecvTimeoutError},
+    time::Duration,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TestKind {
@@ -19,22 +20,17 @@ pub struct StatusNotifier {
 impl StatusNotifier {
     pub fn notify_success(&self) {
         if self.kind == TestKind::ExpectSuccess {
-            match self.tx.try_send(()) {
-                Ok(()) => (),
-                Err(TrySendError::Full(_)) => (), // this means we've sent a success signal already, we don't care
-                Err(TrySendError::Disconnected(_)) => (), // Receiver disconnected when the test was still running. That's usually expected, since the callback can outlive the function that started the trace
-            }
+            // A full or disconnected receiver is expected: the callback can
+            // outlive the function that started the trace
+            let _ = self.tx.try_send(());
         }
     }
 
     #[allow(dead_code)]
     pub fn notify_failure(&self) {
         if self.kind == TestKind::ExpectNoFailure {
-            match self.tx.try_send(()) {
-                Ok(()) => (),
-                Err(TrySendError::Full(_)) => (), // this means we've sent a failure signal already, we don't care
-                Err(TrySendError::Disconnected(_)) => (), // Receiver disconnected when the test was still running. That's usually expected, since the callback can outlive the function that started the trace
-            }
+            // See notify_success: send errors are expected here
+            let _ = self.tx.try_send(());
         }
     }
 }
@@ -63,18 +59,18 @@ impl Status {
 
         match self.notifier.kind {
             TestKind::ExpectSuccess => match self.rx.recv_timeout(timeout) {
-                Ok(()) => {}
+                Ok(()) => {},
                 Err(RecvTimeoutError::Timeout) => {
                     panic!("Test did not pass within the allowed timeout");
-                }
+                },
                 _ => panic!("Should not happen, the sending end has not hung up."),
             },
 
             TestKind::ExpectNoFailure => match self.rx.recv_timeout(timeout) {
                 Ok(()) => {
                     panic!("Test failed within the allowed timeout");
-                }
-                Err(RecvTimeoutError::Timeout) => {}
+                },
+                Err(RecvTimeoutError::Timeout) => {},
                 _ => panic!("Should not happen, the sending end has not hung up."),
             },
         }

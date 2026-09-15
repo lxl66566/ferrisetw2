@@ -8,20 +8,23 @@
 //! needed by using the functions exposed by the modules at the crate level
 #![allow(clippy::bad_bit_mask)]
 
-use crate::provider::TraceFlags;
-use crate::provider::event_filter::EventFilterDescriptor;
-use crate::trace::callback_data::CallbackData;
-use crate::trace::{RealTimeTraceTrait, TraceProperties};
-use std::ffi::{OsString, c_void};
-use std::fmt::Formatter;
-use std::marker::PhantomData;
-use std::sync::Arc;
+use std::{
+    ffi::{OsString, c_void},
+    fmt::Formatter,
+    marker::PhantomData,
+    sync::Arc,
+};
 
 use widestring::{U16CStr, U16CString};
-use windows::Win32::System::Diagnostics::Etw;
-use windows::Win32::System::Diagnostics::Etw::EVENT_FILTER_DESCRIPTOR;
-use windows::core::GUID;
-use windows::core::PWSTR;
+use windows::{
+    Win32::System::Diagnostics::{Etw, Etw::EVENT_FILTER_DESCRIPTOR},
+    core::{GUID, PWSTR},
+};
+
+use crate::{
+    provider::{TraceFlags, event_filter::EventFilterDescriptor},
+    trace::{RealTimeTraceTrait, TraceProperties, callback_data::CallbackData},
+};
 
 pub(crate) mod event_record;
 pub(crate) mod extended_data;
@@ -170,7 +173,7 @@ bitflags! {
     }
 }
 
-impl std::default::Default for DumpFileLoggingMode {
+impl Default for DumpFileLoggingMode {
     fn default() -> Self {
         Self::EVENT_TRACE_FILE_MODE_NONE
     }
@@ -188,16 +191,18 @@ pub enum SubscriptionSource {
 /// Wrapper over an [EVENT_TRACE_PROPERTIES](https://docs.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties), and its allocated companion members
 ///
 /// The [EventTraceProperties] struct contains the information about a tracing session, this struct
-/// also needs two buffers right after it to hold the log file name and the session name. This struct
-/// provides the full definition of the properties plus the the allocation for both names
+/// also needs two buffers right after it to hold the log file name and the session name. This
+/// struct provides the full definition of the properties plus the the allocation for both names
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct EventTraceProperties {
     etw_trace_properties: Etw::EVENT_TRACE_PROPERTIES,
     /// The trace name to subscribe to
-    wide_trace_name: [u16; TRACE_NAME_MAX_CHARS + 1], // The +1 leaves space for the final null widechar.
+    wide_trace_name: [u16; TRACE_NAME_MAX_CHARS + 1], /* The +1 leaves space for the final null
+                                                       * widechar. */
     /// The file name (if any) we store our events to
-    wide_etl_dump_file_path: [u16; TRACE_NAME_MAX_CHARS + 1], // The +1 leaves space for the final null widechar.
+    wide_etl_dump_file_path: [u16; TRACE_NAME_MAX_CHARS + 1], /* The +1 leaves space for the
+                                                               * final null widechar. */
 }
 
 impl std::fmt::Debug for EventTraceProperties {
@@ -205,7 +210,7 @@ impl std::fmt::Debug for EventTraceProperties {
         let name = U16CString::from_vec_truncate(self.wide_trace_name).to_string_lossy();
         f.debug_struct("EventTraceProperties")
             .field("name", &name)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -226,7 +231,10 @@ impl EventTraceProperties {
     {
         let mut etw_trace_properties = Etw::EVENT_TRACE_PROPERTIES::default();
 
-        etw_trace_properties.Wnode.BufferSize = std::mem::size_of::<EventTraceProperties>() as u32;
+        // BufferSize is expressed in bytes over at most a few buffers: it cannot overflow a u32
+        #[allow(clippy::cast_possible_truncation)]
+        let buffer_size = size_of::<EventTraceProperties>() as u32;
+        etw_trace_properties.Wnode.BufferSize = buffer_size;
         etw_trace_properties.Wnode.Guid = T::trace_guid();
         etw_trace_properties.Wnode.Flags = Etw::WNODE_FLAG_TRACED_GUID;
         etw_trace_properties.Wnode.ClientContext = 1; // QPC clock resolution
@@ -237,15 +245,16 @@ impl EventTraceProperties {
             // Round to the closest second (FlushTimer is expressed in seconds),
             // and clamp to at least 1s as documented on TraceProperties
             let rounded_seconds = (trace_properties.flush_timer.as_millis() + 500) / 1_000;
-            rounded_seconds.clamp(1, u32::MAX as u128) as u32
+            let rounded_seconds = u32::try_from(rounded_seconds).unwrap_or(u32::MAX);
+            rounded_seconds.clamp(1, u32::MAX)
         };
 
-        if !trace_properties.log_file_mode.is_empty() {
-            etw_trace_properties.LogFileMode = trace_properties.log_file_mode.bits();
-        } else {
+        if trace_properties.log_file_mode.is_empty() {
             etw_trace_properties.LogFileMode = (LoggingMode::EVENT_TRACE_REAL_TIME_MODE
                 | LoggingMode::EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING)
-                .bits()
+                .bits();
+        } else {
+            etw_trace_properties.LogFileMode = trace_properties.log_file_mode.bits();
         }
 
         etw_trace_properties.LogFileMode |= T::augmented_file_mode();
@@ -258,13 +267,16 @@ impl EventTraceProperties {
         };
 
         // https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties#remarks
-        // > You do not copy the session name to the offset. The StartTrace function copies the name for you.
+        // > You do not copy the session name to the offset. The StartTrace function copies the name
+        // > for you.
         //
         // Let's do it anyway, even though that's not required
         let name_len = trace_name.len().min(TRACE_NAME_MAX_CHARS);
         s.wide_trace_name[..name_len].copy_from_slice(&trace_name.as_slice()[..name_len]);
-        s.etw_trace_properties.LoggerNameOffset =
-            offset_of!(EventTraceProperties, wide_trace_name) as u32;
+        // Offsets within this fixed-size struct: cannot overflow a u32
+        #[allow(clippy::cast_possible_truncation)]
+        let logger_name_offset = offset_of!(EventTraceProperties, wide_trace_name) as u32;
+        s.etw_trace_properties.LoggerNameOffset = logger_name_offset;
 
         // Also populate the file name, if any
         match etl_dump_file {
@@ -273,19 +285,22 @@ impl EventTraceProperties {
                 // > If you do not want to log events to a log file (for example, if you specify EVENT_TRACE_REAL_TIME_MODE only), set LogFileNameOffset to 0.
                 // (https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
                 s.etw_trace_properties.LogFileNameOffset = 0;
-            }
+            },
             Some((path, file_mode, max_size)) => {
                 // Set the file path, and set the dump-file-related flags
                 let path_len = path.len().min(TRACE_NAME_MAX_CHARS);
                 s.wide_etl_dump_file_path[..path_len].copy_from_slice(&path.as_slice()[..path_len]);
-                s.etw_trace_properties.LogFileNameOffset =
+                // Offsets within this fixed-size struct: cannot overflow a u32
+                #[allow(clippy::cast_possible_truncation)]
+                let log_file_name_offset =
                     offset_of!(EventTraceProperties, wide_etl_dump_file_path) as u32;
+                s.etw_trace_properties.LogFileNameOffset = log_file_name_offset;
 
                 s.etw_trace_properties.LogFileMode |= file_mode.bits();
                 if let Some(max_file_size) = max_size {
                     s.etw_trace_properties.MaximumFileSize = max_file_size;
                 }
-            }
+            },
         }
 
         s
@@ -296,20 +311,21 @@ impl EventTraceProperties {
     /// # Safety
     ///
     /// The API enforces this points to an allocated, valid `EVENT_TRACE_PROPERTIES` instance.
-    /// As evey other mutable raw pointer, you should not use it in case someone else is keeping a reference to this object.
+    /// As evey other mutable raw pointer, you should not use it in case someone else is keeping a
+    /// reference to this object.
     ///
     /// Note that `OpenTraceA` **will** modify its content on output.
     pub unsafe fn as_mut_ptr(&mut self) -> *mut Etw::EVENT_TRACE_PROPERTIES {
-        &mut self.etw_trace_properties as *mut Etw::EVENT_TRACE_PROPERTIES
+        &raw mut self.etw_trace_properties
     }
 
     pub fn trace_name_array(&self) -> &[u16] {
         &self.wide_trace_name
     }
+
     pub fn name(&self) -> OsString {
-        widestring::U16CStr::from_slice_truncate(&self.wide_trace_name)
-            .map(|ws| ws.to_os_string())
-            .unwrap_or_else(|_| OsString::from("<invalid name>"))
+        U16CStr::from_slice_truncate(&self.wide_trace_name)
+            .map_or_else(|_| OsString::from("<invalid name>"), U16CStr::to_os_string)
     }
 }
 
@@ -334,8 +350,11 @@ impl<'callbackdata> EventTraceLogfile<'callbackdata> {
         subscription_source: SubscriptionSource,
         callback: unsafe extern "system" fn(*mut Etw::EVENT_RECORD),
     ) -> Self {
-        let not_really_mut_ptr =
-            callback_data.as_ref() as *const Arc<CallbackData> as *const c_void as *mut c_void; // That's kind-of fine because the user context is _not supposed_ to be changed by Windows APIs
+        // That's kind-of fine because the user context is _not supposed_ to be changed by Windows
+        // APIs
+        let not_really_mut_ptr = std::ptr::from_ref(callback_data.as_ref())
+            .cast_mut()
+            .cast::<c_void>();
 
         let native = Etw::EVENT_TRACE_LOGFILEW {
             Anonymous2: Etw::EVENT_TRACE_LOGFILEW_1 {
@@ -358,16 +377,21 @@ impl<'callbackdata> EventTraceLogfile<'callbackdata> {
 
                 log_file.native.Anonymous1 = Etw::EVENT_TRACE_LOGFILEW_0 {
                     ProcessTraceMode: Etw::PROCESS_TRACE_MODE_REAL_TIME
-                        | Etw::PROCESS_TRACE_MODE_EVENT_RECORD, // In case you really want to use PROCESS_TRACE_MODE_RAW_TIMESTAMP, please review EventRecord::timestamp(), which could not be valid anymore
+                        | Etw::PROCESS_TRACE_MODE_EVENT_RECORD, /* In case you really want to use
+                                                                 * PROCESS_TRACE_MODE_RAW_TIMESTAMP,
+                                                                 * please review
+                                                                 * EventRecord::timestamp(),
+                                                                 * which could not be valid
+                                                                 * anymore */
                 };
-            }
+            },
             SubscriptionSource::FromFile(wide_file_name) => {
                 log_file.native.LogFileName = PWSTR(wide_file_name.as_mut_ptr());
 
                 log_file.native.Anonymous1 = Etw::EVENT_TRACE_LOGFILEW_0 {
-                    ProcessTraceMode: Etw::PROCESS_TRACE_MODE_EVENT_RECORD, // In case you really want to use PROCESS_TRACE_MODE_RAW_TIMESTAMP, please review EventRecord::timestamp(), which could not be valid anymore
+                    ProcessTraceMode: Etw::PROCESS_TRACE_MODE_EVENT_RECORD, /* In case you really want to use PROCESS_TRACE_MODE_RAW_TIMESTAMP, please review EventRecord::timestamp(), which could not be valid anymore */
                 };
-            }
+            },
         }
 
         log_file
@@ -378,13 +402,14 @@ impl<'callbackdata> EventTraceLogfile<'callbackdata> {
     /// # Safety
     ///
     /// This pointer is valid as long as [`Self`] is alive (and not modified elsewhere)<br/>
-    /// Note that `OpenTraceW` **will** modify its content on output, and thus you should make sure to be the only user of this instance.
+    /// Note that `OpenTraceW` **will** modify its content on output, and thus you should make sure
+    /// to be the only user of this instance.
     pub(crate) unsafe fn as_mut_ptr(&mut self) -> *mut Etw::EVENT_TRACE_LOGFILEW {
-        &mut self.native as *mut Etw::EVENT_TRACE_LOGFILEW
+        &raw mut self.native
     }
 
     /// The current Context pointer.
-    pub fn context_ptr(&self) -> *const std::ffi::c_void {
+    pub fn context_ptr(&self) -> *const c_void {
         self.native.Context
     }
 }
@@ -398,7 +423,8 @@ pub struct EnableTraceParameters<'filters> {
     native: Etw::ENABLE_TRACE_PARAMETERS,
     /// `native` has pointers to an array of EVENT_FILTER_DESCRIPTOR, let's store it here
     array_of_event_filter_descriptor: Vec<EVENT_FILTER_DESCRIPTOR>,
-    /// `array_of_event_filter_descriptor` points to data somewhere else. Let's bind it to their lifetime
+    /// `array_of_event_filter_descriptor` points to data somewhere else. Let's bind it to their
+    /// lifetime
     lifetime: PhantomData<&'filters EventFilterDescriptor>,
 }
 
@@ -414,14 +440,18 @@ impl<'filters> EnableTraceParameters<'filters> {
         params.native.SourceId = guid;
         params.native.EnableProperty = trace_flags.bits();
 
-        // Note: > Each type of filter (a specific Type member) may only appear once in a call to the EnableTraceEx2 function.
-        //       https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks
-        //       > The maximum number of filters that can be included in a call to EnableTraceEx2 is set by MAX_EVENT_FILTERS_COUNT
+        // Note: > Each type of filter (a specific Type member) may only appear once in a call to
+        // the EnableTraceEx2 function.       https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks
+        //       > The maximum number of filters that can be included in a call to EnableTraceEx2 is
+        //       > set by MAX_EVENT_FILTERS_COUNT
         params.array_of_event_filter_descriptor = filters
             .iter()
-            .map(|efd| efd.as_event_filter_descriptor())
+            .map(EventFilterDescriptor::as_event_filter_descriptor)
             .collect();
-        params.native.FilterDescCount = params.array_of_event_filter_descriptor.len() as u32; // (let's assume we won't try to fit more than 4 billion filters)
+        // (let's assume we won't try to fit more than 4 billion filters)
+        #[allow(clippy::cast_possible_truncation)]
+        let filter_desc_count = params.array_of_event_filter_descriptor.len() as u32;
+        params.native.FilterDescCount = filter_desc_count;
         if filters.is_empty() {
             params.native.EnableFilterDesc = std::ptr::null_mut();
         } else {
@@ -437,7 +467,7 @@ impl<'filters> EnableTraceParameters<'filters> {
     ///
     /// This pointer is valid as long `self` is valid (and not mutated)
     pub fn as_ptr(&self) -> *const Etw::ENABLE_TRACE_PARAMETERS {
-        &self.native as *const _
+        &raw const self.native
     }
 }
 
@@ -467,13 +497,15 @@ impl From<Etw::DECODING_SOURCE> for DecodingSource {
 
 // Safe cast (EVENT_HEADER_FLAG_32_BIT_HEADER = 32)
 #[doc(hidden)]
+#[allow(clippy::cast_possible_truncation)]
 pub const EVENT_HEADER_FLAG_32_BIT_HEADER: u16 = Etw::EVENT_HEADER_FLAG_32_BIT_HEADER as u16;
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use crate::trace::{TraceProperties, UserTrace};
-    use std::time::Duration;
 
     fn computed_flush_timer(flush_timer: Duration) -> u32 {
         let properties = TraceProperties {

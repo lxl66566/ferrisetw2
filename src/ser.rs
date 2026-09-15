@@ -2,13 +2,12 @@
 //!
 //! Requires the `serde` feature be enabled.
 //!
-//! If the `time_rs` feature is enabled, then time stamps are serialized per the serialization format
-//! of the time crate. Otherwise, if `time_rs` is not enabled, then timestamps are serialized as 64bit
-//! unix timestamps.
+//! If the `time_rs` feature is enabled, then time stamps are serialized per the serialization
+//! format of the time crate. Otherwise, if `time_rs` is not enabled, then timestamps are serialized
+//! as 64bit unix timestamps.
 //!
 //! ```
-//! use ferrisetw::schema_locator::SchemaLocator;
-//! use ferrisetw::{EventRecord, EventSerializer};
+//! use ferrisetw::{EventRecord, EventSerializer, schema_locator::SchemaLocator};
 //! extern crate serde_json;
 //!
 //! fn event_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
@@ -22,36 +21,46 @@
 //!                 Err(err) => println!("Error {:?}", err),
 //!                 Ok(json) => println!("{}", json),
 //!             }
-//!         }
+//!         },
 //!     }
 //! }
 //! ```
 #![cfg(feature = "serde")]
 
-use crate::GUID;
-use crate::native::etw_types::event_record::EventRecord;
-use crate::native::tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType};
-use crate::native::time::{FileTime, SystemTime};
-use crate::parser::Parser;
-use crate::schema::Schema;
-use serde::ser::{SerializeMap, SerializeStruct};
 use std::net::IpAddr;
+
+use serde::ser::{SerializeMap, SerializeStruct};
 use windows::Win32::System::Diagnostics::Etw::{EVENT_DESCRIPTOR, EVENT_HEADER};
 
+use crate::{
+    GUID,
+    native::{
+        etw_types::event_record::EventRecord,
+        tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType},
+        time::{FileTime, SystemTime},
+    },
+    parser::Parser,
+    schema::Schema,
+};
+
 /// Serialization options for EventSerializer
+// Named option fields: the bools are self-documenting
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Copy)]
 pub struct EventSerializerOptions {
-    /// Includes information from the schema in the serialized output such as the provider, opcode, and task names.
+    /// Includes information from the schema in the serialized output such as the provider, opcode,
+    /// and task names.
     pub include_schema: bool,
     /// Includes the [EVENT_HEADER](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/fa4f7836-06ee-4ab6-8688-386a5a85f8c5) in the serialized output.
     pub include_header: bool,
     /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output.
     pub include_extended_data: bool,
-    /// When `true` unimplemented serialization fails with an error, otherwise unimplemented serialization is skipped and will not be present in the serialized output.
+    /// When `true` unimplemented serialization fails with an error, otherwise unimplemented
+    /// serialization is skipped and will not be present in the serialized output.
     pub fail_unimplemented: bool,
 }
 
-impl core::default::Default for EventSerializerOptions {
+impl Default for EventSerializerOptions {
     fn default() -> Self {
         Self {
             include_schema: true,
@@ -112,9 +121,8 @@ impl serde::ser::Serialize for EventSerializer<'_> {
             return Err(serde::ser::Error::custom(
                 "not implemented for extended data",
             ));
-        } else {
-            state.skip_field("Extended")?;
         }
+        state.skip_field("Extended")?;
 
         let event = EventSer::new(self.record, self.schema, &self.parser, &self.options);
         state.serialize_field("Event", &event)?;
@@ -129,24 +137,12 @@ struct GUIDExt(GUID);
 /// into a stack buffer instead of a heap-allocated String
 fn guid_to_ascii_upper(guid: &GUID) -> [u8; 36] {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let bytes: [u8; 16] = [
-        (guid.data1 >> 24) as u8,
-        (guid.data1 >> 16) as u8,
-        (guid.data1 >> 8) as u8,
-        guid.data1 as u8,
-        (guid.data2 >> 8) as u8,
-        guid.data2 as u8,
-        (guid.data3 >> 8) as u8,
-        guid.data3 as u8,
-        guid.data4[0],
-        guid.data4[1],
-        guid.data4[2],
-        guid.data4[3],
-        guid.data4[4],
-        guid.data4[5],
-        guid.data4[6],
-        guid.data4[7],
-    ];
+    let mut bytes = [0u8; 16];
+    // Data1/2/3 are serialized big-endian (MSB first)
+    bytes[0..4].copy_from_slice(&guid.data1.to_be_bytes());
+    bytes[4..6].copy_from_slice(&guid.data2.to_be_bytes());
+    bytes[6..8].copy_from_slice(&guid.data3.to_be_bytes());
+    bytes[8..].copy_from_slice(&guid.data4);
     // hex groups of 4-2-2-2-6 bytes, separated by hyphens (8-4-4-4-12 digits)
     let mut out = [0u8; 36];
     let mut byte_index = 0;
@@ -316,7 +312,7 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
                             "not implemented {} in_type: {:?} out_type: {:?}",
                             prop.name, in_type, out_type,
                         )));
-                    }
+                    },
                     PropertyInfo::Array {
                         in_type,
                         out_type,
@@ -327,7 +323,7 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
                             "not implemented {} in_type: {:?} out_type: {:?} count: {:?}",
                             prop.name, in_type, out_type, count
                         )));
-                    }
+                    },
                 }
             }
         }
@@ -480,27 +476,27 @@ impl PropHandler {
             PropHandler::Null => {
                 let value: Option<usize> = None;
                 map.serialize_entry(&prop.name, &value)
-            }
+            },
             PropHandler::Pointer => {
                 if record.pointer_size() == 4 {
                     prop_ser_type!(u32, map, prop, parser)
                 } else {
                     prop_ser_type!(u64, map, prop, parser)
                 }
-            }
+            },
             PropHandler::ArrayPointer => {
                 if record.pointer_size() == 4 {
                     prop_ser_type!(&[u32], map, prop, parser)
                 } else {
                     prop_ser_type!(&[u64], map, prop, parser)
                 }
-            }
+            },
             PropHandler::Guid => {
                 let guid = parser
                     .try_parse::<GUID>(&prop.name)
                     .map_err(serde::ser::Error::custom)?;
                 map.serialize_entry(&prop.name, &GUIDExt(guid))
-            }
+            },
         }
     }
 }
@@ -513,19 +509,28 @@ impl PropSerable for PropertyInfo {
                 in_type, out_type, ..
             } => {
                 match out_type {
-                    TdhOutType::OutTypeIpv4 => Some(PropSer(PropHandler::IpAddr)),
-                    TdhOutType::OutTypeIpv6 => Some(PropSer(PropHandler::IpAddr)),
+                    TdhOutType::OutTypeIpv4 | TdhOutType::OutTypeIpv6 => {
+                        Some(PropSer(PropHandler::IpAddr))
+                    },
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
-                        TdhInType::InTypeUnicodeString => Some(PropSer(PropHandler::String)),
-                        TdhInType::InTypeAnsiString => Some(PropSer(PropHandler::String)),
+                        // `try_parse::<String>` is implemented for CountedAnsiString (see
+                        // parser.rs)
+                        TdhInType::InTypeUnicodeString
+                        | TdhInType::InTypeAnsiString
+                        | TdhInType::InTypeSid
+                        | TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
                         TdhInType::InTypeInt16 => Some(PropSer(PropHandler::Int16)),
                         TdhInType::InTypeUInt16 => Some(PropSer(PropHandler::UInt16)),
-                        TdhInType::InTypeInt32 => Some(PropSer(PropHandler::Int32)),
+                        TdhInType::InTypeInt32 | TdhInType::InTypeHexInt32 => {
+                            Some(PropSer(PropHandler::Int32))
+                        },
                         TdhInType::InTypeUInt32 => Some(PropSer(PropHandler::UInt32)),
-                        TdhInType::InTypeInt64 => Some(PropSer(PropHandler::Int64)),
+                        TdhInType::InTypeInt64 | TdhInType::InTypeHexInt64 => {
+                            Some(PropSer(PropHandler::Int64))
+                        },
                         TdhInType::InTypeUInt64 => Some(PropSer(PropHandler::UInt64)),
                         TdhInType::InTypeFloat => Some(PropSer(PropHandler::Float)),
                         TdhInType::InTypeDouble => Some(PropSer(PropHandler::Double)),
@@ -535,15 +540,10 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypePointer => Some(PropSer(PropHandler::Pointer)),
                         TdhInType::InTypeFileTime => Some(PropSer(PropHandler::FileTime)),
                         TdhInType::InTypeSystemTime => Some(PropSer(PropHandler::SystemTime)),
-                        TdhInType::InTypeSid => Some(PropSer(PropHandler::String)),
-                        TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::Int32)),
-                        TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::Int64)),
                         TdhInType::InTypeCountedString => None, // TODO
-                        // `try_parse::<String>` is implemented for CountedAnsiString (see parser.rs)
-                        TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
                     },
                 }
-            }
+            },
             PropertyInfo::Array { in_type, .. } => {
                 match in_type {
                     TdhInType::InTypeInt16 => Some(PropSer(PropHandler::ArrayInt16)),
@@ -555,7 +555,7 @@ impl PropSerable for PropertyInfo {
                     TdhInType::InTypePointer => Some(PropSer(PropHandler::ArrayPointer)),
                     _ => None, // TODO
                 }
-            }
+            },
         }
     }
 }

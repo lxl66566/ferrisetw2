@@ -4,16 +4,16 @@
 //! so this whole test is gated behind the `admin_tests` feature.
 #![cfg(feature = "admin_tests")]
 
-use std::process::Command;
-use std::time::Duration;
+use std::{process::Command, time::Duration};
 
-use ferrisetw::EventRecord;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::{EventFilter, Provider};
-use ferrisetw::schema::Schema;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::TraceTrait;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::{
+    EventRecord,
+    parser::Parser,
+    provider::{EventFilter, Provider},
+    schema::Schema,
+    schema_locator::SchemaLocator,
+    trace::{TraceTrait, UserTrace},
+};
 
 mod utils;
 use utils::{Status, TestKind};
@@ -40,7 +40,8 @@ fn simple_user_dns_trace() {
                 let schema = schema_locator.event_schema(record).unwrap();
                 let parser = Parser::create(record, &schema);
 
-                // While we're at it, let's check a few more-or-less unrelated things on an actual ETW event
+                // While we're at it, let's check a few more-or-less unrelated things on an actual
+                // ETW event
                 check_a_few_cases(record, &parser, &schema);
 
                 if has_seen_resolution_to_test_domain(record, &parser) {
@@ -113,9 +114,9 @@ fn test_event_id_filter() {
 
 fn generate_dns_events() {
     std::thread::sleep(Duration::from_secs(1));
-    // Unfortunately, `&str::to_socket_addrs()` does not use Microsoft APIs, and hence does not trigger a DNS ETW event
-    // Let's use ping.exe instead
-    println!("Resolving {}...", TEST_DOMAIN_NAME);
+    // Unfortunately, `&str::to_socket_addrs()` does not use Microsoft APIs, and hence does not
+    // trigger a DNS ETW event Let's use ping.exe instead
+    println!("Resolving {TEST_DOMAIN_NAME}...");
     let _output = Command::new("ping.exe")
         .arg("-n")
         .arg("1")

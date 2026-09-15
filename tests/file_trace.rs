@@ -4,15 +4,14 @@
 //! so this test is gated behind the `admin_tests` feature.
 #![cfg(feature = "admin_tests")]
 
-use std::path::PathBuf;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
 
-use ferrisetw::EventRecord;
-use ferrisetw::provider::Provider;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::DumpFileParams;
-use ferrisetw::trace::TraceTrait;
-use ferrisetw::{FileTrace, UserTrace};
+use ferrisetw::{
+    EventRecord, FileTrace, UserTrace,
+    provider::Provider,
+    schema_locator::SchemaLocator,
+    trace::{DumpFileParams, TraceTrait},
+};
 
 #[test]
 fn etl_file() {
@@ -46,7 +45,7 @@ fn save_a_trace(dump_file: DumpFileParams) -> usize {
     std::thread::sleep(Duration::from_secs(10));
 
     let n_events = trace.events_handled();
-    println!("Processed {} events", n_events);
+    println!("Processed {n_events} events");
     n_events
 }
 
@@ -56,6 +55,6 @@ fn process_from_file(input_file: PathBuf) -> usize {
     FileTrace::process_from_handle(handle).unwrap();
 
     let n_events = trace.events_handled();
-    println!("Read {} events from file", n_events);
+    println!("Read {n_events} events from file");
     n_events
 }

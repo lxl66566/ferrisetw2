@@ -1,60 +1,73 @@
 [package]
-name = "ferrisetw"
-version = "1.2.0"
-license = "MIT OR Apache-2.0"
+name        = "ferrisetw"
+version     = "1.2.0"
+edition     = "2024"
 description = "Basically a KrabsETW rip-off written in Rust"
-keywords = ["etw", "krabsetw", "event", "tracing", "windows"]
-categories = ["api-bindings", "parsing"]
-authors = ["n4r1b", "daladim"]
-edition = "2024"
-repository = "https://github.com/n4r1b/ferrisetw"
+repository  = "https://github.com/n4r1b/ferrisetw"
+license     = "MIT OR Apache-2.0"
+keywords    = ["etw", "event", "krabsetw", "tracing", "windows"]
+categories  = ["api-bindings", "parsing"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[dependencies]
+bitflags   = "2.13"
+# thiserror = "~1.0"
+# anyhow = "~1.0"
+log        = "0.4"
+memchr     = "2"
+memoffset  = "0.9"
+num-derive = "0.5"
+num-traits = "0.2"
+once_cell  = "1.21"
+rustc-hash = "2"
+serde      = { version = "1.0", optional = true }
+time       = { version = "0.3", features = ["large-dates"], optional = true }
+widestring = "1.2"
+windows    = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_Etw",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Ole",
+  "Win32_System_Performance",
+  "Win32_System_SystemInformation",
+  "Win32_System_SystemServices",
+  # No direct use anymore (SystemTimeToFileTime is gone), but
+  # EVENT_TRACE_LOGFILEW does not compile without this feature
+  "Win32_System_Time",
+  "Win32_System_Variant"
+] }
+zerocopy   = "0.8"
+
+[dev-dependencies]
+env_logger   = "0.11"  # used in examples
+flexbuffers  = "25"
+serde_json   = "1.0"
+tracelogging = "1.2"
+
 [features]
-# Enable the conversion of timestamps to time::OffsetDateTime
-time_rs = ["time"]
-serde = [ "dep:serde", "time?/serde", "time?/serde-human-readable" ]
 # Gate for integration tests that require administrator privileges
 # (creating an ETW trace session is admin-only).
 # Run them with: cargo test --features admin_tests
 admin_tests = []
+serde       = ["dep:serde", "time?/serde", "time?/serde-human-readable"]
+# Enable the conversion of timestamps to time::OffsetDateTime
+time_rs     = ["time"]
 
-[dependencies]
-windows = { version = "0.62", features = [
-    "Win32_Foundation",
-    "Win32_Security_Authorization",
-    "Win32_System_Com",
-    "Win32_System_Ole",
-    "Win32_Security",
-    "Win32_System_Diagnostics_Etw",
-    "Win32_System_LibraryLoader",
-    "Win32_System_Memory",
-    "Win32_System_Performance",
-    "Win32_System_SystemInformation",
-    "Win32_System_SystemServices",
-    # No direct use anymore (SystemTimeToFileTime is gone), but
-    # EVENT_TRACE_LOGFILEW does not compile without this feature
-    "Win32_System_Time",
-    "Win32_System_Variant"
-]}
-memoffset = "0.9"
-once_cell = "1.21"
-num-traits = "0.2"
-num-derive = "0.5"
-bitflags = "2.13"
-widestring = "1.2"
-zerocopy = "0.8"
-time = { version = "0.3", features = ["large-dates"], optional = true }
-serde = { version = "1.0", optional = true }
-# thiserror = "~1.0"
-# anyhow = "~1.0"
-log = "0.4"
-rustc-hash = "2"
-memchr = "2"
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
 
-[dev-dependencies]
-env_logger = "0.11" # used in examples
-serde_json = "1.0"
-flexbuffers = "25"
-tracelogging = "1.2"
+[lints.rust]
+unsafe_code           = "allow"
+unused_qualifications = "warn"

@@ -1,52 +1,48 @@
 //! ETW Tracing/Session abstraction
 //!
 //! Provides both a Kernel and User trace that allows to start an ETW session
-use std::ffi::OsString;
-use std::marker::PhantomData;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{ffi::OsString, marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
 
 use widestring::U16CString;
-use windows::Win32::Foundation::ERROR_WMI_INSTANCE_NOT_FOUND;
-use windows::Win32::System::Diagnostics::Etw;
-use windows::core::GUID;
+use windows::{
+    Win32::{Foundation::ERROR_WMI_INSTANCE_NOT_FOUND, System::Diagnostics::Etw},
+    core::GUID,
+};
 
 use self::private::{PrivateRealTimeTraceTrait, PrivateTraceTrait};
-
-use crate::EventRecord;
-use crate::SchemaLocator;
-use crate::native::etw_types::{EventTraceProperties, SubscriptionSource};
-use crate::native::evntrace::{
-    ControlHandle, TraceHandle, close_trace, control_trace, control_trace_by_name, enable_provider,
-    open_trace, process_trace, start_trace,
+pub use crate::native::etw_types::{DumpFileLoggingMode, LoggingMode};
+use crate::{
+    EventRecord, SchemaLocator,
+    native::{
+        EvntraceNativeError,
+        etw_types::{EventTraceProperties, SubscriptionSource},
+        evntrace::{
+            ControlHandle, TraceHandle, close_trace, control_trace, control_trace_by_name,
+            enable_provider, open_trace, process_trace, start_trace,
+        },
+        version_helper,
+    },
+    provider::Provider,
+    utils,
 };
-use crate::native::{EvntraceNativeError, version_helper};
-use crate::provider::Provider;
-use crate::utils;
-
-pub use crate::native::etw_types::DumpFileLoggingMode;
-pub use crate::native::etw_types::LoggingMode;
 
 pub(crate) mod callback_data;
-use callback_data::CallbackData;
-use callback_data::CallbackDataFromFile;
-use callback_data::RealTimeCallbackData;
+use callback_data::{CallbackData, CallbackDataFromFile, RealTimeCallbackData};
 
 const KERNEL_LOGGER_NAME: &str = "NT Kernel Logger";
 const SYSTEM_TRACE_CONTROL_GUID: GUID = GUID::from_u128(0x9e814aad_3204_11d2_9a82_006008a86939);
-const EVENT_TRACE_SYSTEM_LOGGER_MODE: u32 = 0x02000000;
+const EVENT_TRACE_SYSTEM_LOGGER_MODE: u32 = 0x0200_0000;
 
 /// Trace module errors
 #[derive(Debug)]
 pub enum TraceError {
     InvalidTraceName,
     /// Wrapper over an internal [`EvntraceNativeError`]
-    EtwNativeError(crate::native::EvntraceNativeError),
+    EtwNativeError(EvntraceNativeError),
 }
 
-impl From<crate::native::EvntraceNativeError> for TraceError {
-    fn from(err: crate::native::EvntraceNativeError) -> Self {
+impl From<EvntraceNativeError> for TraceError {
+    fn from(err: EvntraceNativeError) -> Self {
         TraceError::EtwNativeError(err)
     }
 }
@@ -89,8 +85,9 @@ impl Default for TraceProperties {
 }
 
 /// Trait for common methods to user, kernel and file traces
-pub trait TraceTrait: private::PrivateTraceTrait + Sized {
-    // This must be implemented for every trace, as this getter is needed by other methods from this trait
+pub trait TraceTrait: PrivateTraceTrait + Sized {
+    // This must be implemented for every trace, as this getter is needed by other methods from this
+    // trait
     fn trace_handle(&self) -> TraceHandle;
 
     // This utility function should be implemented for every trace
@@ -105,14 +102,14 @@ pub trait TraceTrait: private::PrivateTraceTrait + Sized {
     /// Because this call is blocking, you probably want to call this from a background thread.<br/>
     /// See [`TraceBuilder::start`] for alternative and more convenient ways to start a trace.
     fn process(&mut self) -> TraceResult<()> {
-        process_trace(self.trace_handle()).map_err(|e| e.into())
+        process_trace(self.trace_handle()).map_err(Into::into)
     }
 
     /// Process a trace given its handle.
     ///
     /// See [`TraceBuilder::start`] for alternative and more convenient ways to start a trace.
     fn process_from_handle(handle: TraceHandle) -> TraceResult<()> {
-        process_trace(handle).map_err(|e| e.into())
+        process_trace(handle).map_err(Into::into)
     }
 
     /// Stops the trace
@@ -125,7 +122,7 @@ pub trait TraceTrait: private::PrivateTraceTrait + Sized {
 }
 
 /// Trait for common methods to real-time traces
-pub trait RealTimeTraceTrait: TraceTrait + private::PrivateRealTimeTraceTrait {
+pub trait RealTimeTraceTrait: TraceTrait + PrivateRealTimeTraceTrait {
     // This differs between UserTrace and KernelTrace
     fn trace_guid() -> GUID;
 
@@ -157,7 +154,8 @@ impl RealTimeTraceTrait for UserTrace {
     }
 }
 
-// TODO: Implement enable_provider function for providers that require call to TraceSetInformation with extended PERFINFO_GROUPMASK
+// TODO: Implement enable_provider function for providers that require call to TraceSetInformation
+// with extended PERFINFO_GROUPMASK
 impl TraceTrait for KernelTrace {
     fn trace_handle(&self) -> TraceHandle {
         self.trace_handle
@@ -211,7 +209,8 @@ pub struct UserTrace {
     trace_handle: TraceHandle,
     // CallbackData is
     // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
+    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
+    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
     callback_data: Box<Arc<CallbackData>>,
 }
 
@@ -226,7 +225,8 @@ pub struct KernelTrace {
     trace_handle: TraceHandle,
     // CallbackData is
     // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
+    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
+    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
     callback_data: Box<Arc<CallbackData>>,
 }
 
@@ -239,7 +239,8 @@ pub struct FileTrace {
     trace_handle: TraceHandle,
     // CallbackData is
     // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
+    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
+    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
     callback_data: Box<Arc<CallbackData>>,
 }
 
@@ -247,9 +248,11 @@ pub struct FileTrace {
 #[derive(Clone, Default)]
 pub struct DumpFileParams {
     pub file_path: PathBuf,
-    /// Options that control how the file is written. If you're not sure, you can use [`DumpFileLoggingMode::default()`].
+    /// Options that control how the file is written. If you're not sure, you can use
+    /// [`DumpFileLoggingMode::default()`].
     pub file_logging_mode: DumpFileLoggingMode,
-    /// Maximum size of the dump file. This is expressed in MB, unless `file_logging_mode` requires it otherwise.
+    /// Maximum size of the dump file. This is expressed in MB, unless `file_logging_mode` requires
+    /// it otherwise.
     pub max_size: Option<u32>,
 }
 
@@ -272,6 +275,7 @@ pub struct FileTraceBuilder {
 
 impl UserTrace {
     /// Create a UserTrace builder
+    #[must_use]
     pub fn new() -> TraceBuilder<UserTrace> {
         let name = format!("n4r1b-trace-{}", utils::rand_string());
         TraceBuilder {
@@ -295,6 +299,7 @@ impl UserTrace {
 
 impl KernelTrace {
     /// Create a KernelTrace builder
+    #[must_use]
     pub fn new() -> TraceBuilder<KernelTrace> {
         let builder = TraceBuilder {
             name: String::new(),
@@ -318,7 +323,8 @@ impl KernelTrace {
 }
 
 mod private {
-    //! The only reason for this private module is to have a "private" trait in an otherwise publicly exported type (`TraceBuilder`)
+    //! The only reason for this private module is to have a "private" trait in an otherwise
+    //! publicly exported type (`TraceBuilder`)
     //!
     //! See <https://github.com/rust-lang/rust/issues/34537>
     use super::*;
@@ -331,6 +337,8 @@ mod private {
 
     pub trait PrivateRealTimeTraceTrait: PrivateTraceTrait {
         const TRACE_KIND: TraceKind;
+        // The properties are moved into the built trace: passing by value is the point
+        #[allow(clippy::large_types_passed_by_value)]
         #[allow(clippy::redundant_allocation)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer (see https://github.com/n4r1b/ferrisetw/issues/72)
         fn build(
             properties: EventTraceProperties,
@@ -344,12 +352,13 @@ mod private {
 
     pub trait PrivateTraceTrait {
         // This function aims at de-deduplicating code called by `impl Drop` and `Trace::stop`.
-        // It is basically [`Self::stop`], without consuming self (because the `impl Drop` only has a `&mut self`, not a `self`)
+        // It is basically [`Self::stop`], without consuming self (because the `impl Drop` only has
+        // a `&mut self`, not a `self`)
         fn non_consuming_stop(&mut self) -> TraceResult<()>;
     }
 }
 
-impl private::PrivateRealTimeTraceTrait for UserTrace {
+impl PrivateRealTimeTraceTrait for UserTrace {
     const TRACE_KIND: private::TraceKind = private::TraceKind::User;
 
     fn build(
@@ -369,12 +378,13 @@ impl private::PrivateRealTimeTraceTrait for UserTrace {
     fn augmented_file_mode() -> u32 {
         0
     }
+
     fn enable_flags(_providers: &[Provider]) -> u32 {
         0
     }
 }
 
-impl private::PrivateTraceTrait for UserTrace {
+impl PrivateTraceTrait for UserTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
         close_trace(self.trace_handle, &self.callback_data)?;
         control_trace(
@@ -386,7 +396,7 @@ impl private::PrivateTraceTrait for UserTrace {
     }
 }
 
-impl private::PrivateRealTimeTraceTrait for KernelTrace {
+impl PrivateRealTimeTraceTrait for KernelTrace {
     const TRACE_KIND: private::TraceKind = private::TraceKind::Kernel;
 
     fn build(
@@ -416,7 +426,7 @@ impl private::PrivateRealTimeTraceTrait for KernelTrace {
     }
 }
 
-impl private::PrivateTraceTrait for KernelTrace {
+impl PrivateTraceTrait for KernelTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
         close_trace(self.trace_handle, &self.callback_data)?;
         control_trace(
@@ -428,7 +438,7 @@ impl private::PrivateTraceTrait for KernelTrace {
     }
 }
 
-impl private::PrivateTraceTrait for FileTrace {
+impl PrivateTraceTrait for FileTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
         close_trace(self.trace_handle, &self.callback_data)?;
         Ok(())
@@ -438,15 +448,17 @@ impl private::PrivateTraceTrait for FileTrace {
 impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Define the trace name
     ///
-    /// For kernel traces on Windows Versions older than Win8, this method won't change the trace name. In those versions the trace name will be set to "NT Kernel Logger".
+    /// For kernel traces on Windows Versions older than Win8, this method won't change the trace
+    /// name. In those versions the trace name will be set to "NT Kernel Logger".
     ///
     /// Note: this trace name may be truncated to a few hundred characters if it is too long.
+    #[must_use]
     pub fn named(mut self, name: String) -> Self {
         if T::TRACE_KIND == private::TraceKind::Kernel && !version_helper::is_win8_or_greater() {
             self.name = String::from(KERNEL_LOGGER_NAME);
         } else {
             self.name = name;
-        };
+        }
 
         self
     }
@@ -454,6 +466,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Define several low-level properties of the trace at once.
     ///
     /// These are part of [`EVENT_TRACE_PROPERTIES`](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
+    #[must_use]
     pub fn set_trace_properties(mut self, props: TraceProperties) -> Self {
         self.properties = props;
         self
@@ -463,12 +476,15 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     ///
     /// If set, events will be dumped to a file on disk.<br/>
     /// Such files usually have a `.etl` extension.<br/>
-    /// Dumped events will also be processed by the callbacks you'll specify with [`crate::provider::ProviderBuilder::add_callback`].
+    /// Dumped events will also be processed by the callbacks you'll specify with
+    /// [`crate::provider::ProviderBuilder::add_callback`].
     ///
-    /// It is possible to control many aspects of the logging file (whether its size is limited, whether it should be a circular buffer file, etc.).
-    /// If you're not sure, `params` has a safe [`default` value](`DumpFileParams::default`).
+    /// It is possible to control many aspects of the logging file (whether its size is limited,
+    /// whether it should be a circular buffer file, etc.). If you're not sure, `params` has a
+    /// safe [`default` value](`DumpFileParams::default`).
     ///
     /// Note: the file name may be truncated to a few hundred characters if it is too long.
+    #[must_use]
     pub fn set_etl_dump_file(mut self, params: DumpFileParams) -> Self {
         self.etl_dump_file = Some(params);
         self
@@ -481,11 +497,13 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// # Note
     /// Windows API seems to support removing providers, or changing its properties when the session is processing events (see <https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks>)    /// Currently, this crate only supports defining Providers and their settings when building the trace, because it is easier to ensure memory-safety this way.
     /// It probably would be possible to support changing Providers when the trace is processing, but this is left as a TODO (see <https://github.com/n4r1b/ferrisetw/issues/54>)
+    #[must_use]
     pub fn enable(mut self, provider: Provider) -> Self {
         self.rt_callback_data.add_provider(provider);
         self
     }
 
+    #[must_use]
     pub fn stop_if_exist(mut self, b: bool) -> Self {
         self.stop_if_exist = b;
         self
@@ -496,14 +514,20 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Internally, this calls the `StartTraceW`, `EnableTraceEx2` and `OpenTraceW`.
     ///
     /// To start receiving events, you'll still have to call either:
-    /// * Worst option: `process()` on the returned `T`. This will block the current thread until the trace is stopped.<br/>
-    ///   This means you'll probably want to call this on a spawned thread, where the `T` must be moved to. This will prevent you from re-using it from the another thread.<br/>
-    ///   This means you will not be able to explicitly stop the trace, because you'll no longer have a `T` to drop or to call `stop` on. The trace will stop when the program exits, or when the ETW API hits an error.<br/>
+    /// * Worst option: `process()` on the returned `T`. This will block the current thread until
+    ///   the trace is stopped.<br/> This means you'll probably want to call this on a spawned
+    ///   thread, where the `T` must be moved to. This will prevent you from re-using it from the
+    ///   another thread.<br/> This means you will not be able to explicitly stop the trace, because
+    ///   you'll no longer have a `T` to drop or to call `stop` on. The trace will stop when the
+    ///   program exits, or when the ETW API hits an error.<br/>
     /// * Most powerful option: `T::process_from_handle()` with the returned [`TraceHandle`].<br/>
-    ///   This will block, so this also has to be run in a spawned thread. But, as this does not "consume" the `T`, you'll be able to call `stop` on it (or to drop it) to explicitly close the trace. Stopping a trace will make the `process` function return.
-    /// * Easiest option: [`TraceBuilder::start_and_process()`].<br/>
-    ///   This convenience function spawns a thread for you, call [`TraceBuilder::start`] on the trace, and returns immediately.<br/>
-    ///   This option returns a `T`, so you can explicitly stop the trace, but there is no way to get the status code of the ProcessTrace API.
+    ///   This will block, so this also has to be run in a spawned thread. But, as this does not
+    ///   "consume" the `T`, you'll be able to call `stop` on it (or to drop it) to explicitly close
+    ///   the trace. Stopping a trace will make the `process` function return.
+    /// * Easiest option: [`TraceBuilder::start_and_process()`].<br/> This convenience function
+    ///   spawns a thread for you, call [`TraceBuilder::start`] on the trace, and returns
+    ///   immediately.<br/> This option returns a `T`, so you can explicitly stop the trace, but
+    ///   there is no way to get the status code of the ProcessTrace API.
     pub fn start(self) -> TraceResult<(T, TraceHandle)> {
         if self.stop_if_exist {
             stop_trace_by_name(&self.name)?;
@@ -530,7 +554,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
                     file_logging_mode,
                     max_size,
                 ))
-            }
+            },
         };
 
         let flags = self.rt_callback_data.provider_flags::<T>();
@@ -543,7 +567,8 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             flags,
         )?;
 
-        // TODO: For kernel traces, implement enable_provider function for providers that require call to TraceSetInformation with extended PERFINFO_GROUPMASK
+        // TODO: For kernel traces, implement enable_provider function for providers that require
+        // call to TraceSetInformation with extended PERFINFO_GROUPMASK
 
         if T::TRACE_KIND == private::TraceKind::User {
             for prov in self.rt_callback_data.providers() {
@@ -568,11 +593,14 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Internally, this calls the `OpenTraceW`.
     ///
     /// This function is to be used when you want to receive events on a trace you don't own.
-    /// This can be useful when dealing with sources that only authorize one trace to be created, such as EventLog-Security.
+    /// This can be useful when dealing with sources that only authorize one trace to be created,
+    /// such as EventLog-Security.
     ///
-    /// Since the trace is not owed, it cannot be stopped using StopTraceW or controlled using ControlTraceW, but can be closed using CloseTraceW.
+    /// Since the trace is not owed, it cannot be stopped using StopTraceW or controlled using
+    /// ControlTraceW, but can be closed using CloseTraceW.
     ///
-    /// To start receiving events, see the [`TraceBuilder::start`] function to see the options, while keeping in mind that the trace cannot be stopped.
+    /// To start receiving events, see the [`TraceBuilder::start`] function to see the options,
+    /// while keeping in mind that the trace cannot be stopped.
     pub fn open_existing(self) -> TraceResult<(T, TraceHandle)> {
         // Prepare a wide version of the trace name
         let trace_wide_name = U16CString::from_str_truncate(self.name);
@@ -599,7 +627,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
                     file_logging_mode,
                     max_size,
                 ))
-            }
+            },
         };
 
         let trace_handle = open_trace(
@@ -632,7 +660,8 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     ///
     /// # Notes
     /// * See the documentation of [`TraceBuilder::start`] for more info
-    /// * `process` is called on a spawned thread, and thus this method does not give any way to retrieve the error of `process` (if any)
+    /// * `process` is called on a spawned thread, and thus this method does not give any way to
+    ///   retrieve the error of `process` (if any)
     pub fn start_and_process(self) -> TraceResult<T> {
         let (trace, trace_handle) = self.start()?;
 
@@ -689,7 +718,8 @@ impl FileTraceBuilder {
     ///
     /// # Notes
     /// * See the documentation of [`TraceBuilder::start`] for more info
-    /// * `process` is called on a spawned thread, and thus this method does not give any way to retrieve the error of `process` (if any)
+    /// * `process` is called on a spawned thread, and thus this method does not give any way to
+    ///   retrieve the error of `process` (if any)
     pub fn start_and_process(self) -> TraceResult<FileTrace> {
         let (trace, trace_handle) = self.start()?;
 
@@ -727,9 +757,12 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
     let wide_name = U16CString::from_str(trace_name).map_err(|_| TraceError::InvalidTraceName)?;
 
     let mut properties = EventTraceProperties::new::<UserTrace>(
-        // for EVENT_TRACE_CONTROL_STOP, we don't really care about most of the contents of the EventTraceProperties, so using new::<UserTrace>() is fine, even when stopping a kernel trace
+        // for EVENT_TRACE_CONTROL_STOP, we don't really care about most of the contents of the
+        // EventTraceProperties, so using new::<UserTrace>() is fine, even when stopping a kernel
+        // trace
         &wide_name,
-        None, // MSDN says the dump file name (if any) must be populated for a EVENT_TRACE_CONTROL_STOP, but experience shows this is not necessary.
+        None, /* MSDN says the dump file name (if any) must be populated for a
+               * EVENT_TRACE_CONTROL_STOP, but experience shows this is not necessary. */
         &trace_properties,
         flags,
     );

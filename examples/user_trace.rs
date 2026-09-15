@@ -1,9 +1,8 @@
-use ferrisetw::EventRecord;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::*;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::*;
 use std::time::Duration;
+
+use ferrisetw::{
+    EventRecord, parser::Parser, provider::*, schema_locator::SchemaLocator, trace::*,
+};
 
 fn main() {
     env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
@@ -16,18 +15,15 @@ fn main() {
                 let event_id = record.event_id();
                 if event_id == 2 {
                     let name = schema.provider_name();
-                    println!("Name: {}", name);
+                    println!("Name: {name}");
                     let parser = Parser::create(record, &schema);
                     let process_id: u32 = parser.try_parse("ProcessID").unwrap();
                     let exit_code: u32 = parser.try_parse("ExitCode").unwrap();
                     let image_name: String = parser.try_parse("ImageName").unwrap();
-                    println!(
-                        "PID: {}, ExitCode: {}, ImageName: {}",
-                        process_id, exit_code, image_name
-                    );
+                    println!("PID: {process_id}, ExitCode: {exit_code}, ImageName: {image_name}");
                 }
-            }
-            Err(err) => println!("Error {:?}", err),
+            },
+            Err(err) => println!("Error {err:?}"),
         };
 
     let process_provider = Provider::by_guid(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716) // Microsoft-Windows-Kernel-Process
@@ -40,13 +36,15 @@ fn main() {
         .start()
         .unwrap();
 
-    // This example uses `process_from_handle` rather than the more convient `start_and_process`, because why not.
+    // This example uses `process_from_handle` rather than the more convient `start_and_process`,
+    // because why not.
     std::thread::spawn(move || {
         let status = UserTrace::process_from_handle(handle);
         // This code will be executed when the trace stops. Examples:
         // * when it is dropped
-        // * when it is manually stopped (either by user_trace.stop, or by the `logman stop -ets MyTrace` command)
-        println!("Trace ended with status {:?}", status);
+        // * when it is manually stopped (either by user_trace.stop, or by the `logman stop -ets
+        //   MyTrace` command)
+        println!("Trace ended with status {status:?}");
     });
 
     std::thread::sleep(Duration::new(20, 0));

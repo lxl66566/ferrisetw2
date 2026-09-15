@@ -1,5 +1,4 @@
 use bitflags::bitflags;
-
 use windows::Win32::System::Diagnostics::Etw;
 
 bitflags! {

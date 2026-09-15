@@ -11,18 +11,15 @@ pub mod time;
 pub(crate) mod version_helper;
 
 // These are used in our custom error types, and must be part of the public API
-pub use evntrace::EvntraceNativeError;
+// These are returned by some of our public APIs
+pub use etw_types::{
+    DecodingSource,
+    extended_data::{EventHeaderExtendedDataItem, ExtendedDataItem, Sid},
+};
+pub use evntrace::{ControlHandle, EvntraceNativeError, TraceHandle};
 pub use pla::PlaError;
 pub use sddl::SddlNativeError;
 pub use tdh::TdhNativeError;
-
-// These are returned by some of our public APIs
-pub use etw_types::DecodingSource;
-pub use etw_types::extended_data::EventHeaderExtendedDataItem;
-pub use etw_types::extended_data::ExtendedDataItem;
-pub use etw_types::extended_data::Sid;
-pub use evntrace::ControlHandle;
-pub use evntrace::TraceHandle;
 pub use windows::Win32::System::Diagnostics::Etw::{
     EVENT_EXTENDED_ITEM_INSTANCE, EVENT_EXTENDED_ITEM_STACK_TRACE32,
     EVENT_EXTENDED_ITEM_STACK_TRACE64,

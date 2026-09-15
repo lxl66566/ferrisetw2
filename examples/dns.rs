@@ -1,14 +1,16 @@
-use std::sync::atomic::AtomicU32;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::{
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
-use ferrisetw::EventRecord;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::Provider;
-use ferrisetw::provider::TraceFlags;
-use ferrisetw::schema::Schema;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::UserTrace;
+use ferrisetw::{
+    EventRecord,
+    parser::Parser,
+    provider::{Provider, TraceFlags},
+    schema::Schema,
+    schema_locator::SchemaLocator,
+    trace::UserTrace,
+};
 
 static N_EVENTS: AtomicU32 = AtomicU32::new(0);
 
@@ -17,12 +19,12 @@ fn dns_etw_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
 
     match schema_locator.event_schema(record) {
         Err(err) => {
-            println!("Unable to get the ETW schema for a DNS event: {:?}", err);
-        }
+            println!("Unable to get the ETW schema for a DNS event: {err:?}");
+        },
 
         Ok(schema) => {
             parse_etw_event(&schema, record);
-        }
+        },
     }
 }
 
@@ -44,9 +46,9 @@ fn parse_etw_event(schema: &Schema, record: &EventRecord) {
         record.event_id(),
         query_status.map(|u| u.to_string()).unwrap_or_default(),
         query_options
-            .map(|u| format!("{:16x}", u))
+            .map(|u| format!("{u:16x}"))
             .unwrap_or_default(),
-        query_type.map(|u| format!("{:2}", u)).unwrap_or_default(),
+        query_type.map(|u| format!("{u:2}")).unwrap_or_default(),
         requested_fqdn
             .map(|s| truncate(&s, 10).to_owned())
             .unwrap_or_default(),
@@ -74,7 +76,7 @@ fn main() {
     std::thread::sleep(Duration::new(20, 0));
 
     trace.stop().unwrap(); // This is not required, as it will automatically be stopped on Drop
-    println!("Done: {:?} events", N_EVENTS);
+    println!("Done: {N_EVENTS:?} events");
 }
 
 fn truncate(s: &str, n: usize) -> &str {

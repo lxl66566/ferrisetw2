@@ -1,18 +1,18 @@
 //! Native API - Performance Logs and Alerts COM
 //!
 //! The `pla` module is an abstraction layer for the Windows evntrace library. This module act as a
-//! internal API that holds all `unsafe` calls to functions exported by the `evntrace` Windows library.
+//! internal API that holds all `unsafe` calls to functions exported by the `evntrace` Windows
+//! library.
 //!
-//! This module shouldn't be accessed directly. Modules from the the crate level provide a safe API to interact
-//! with the crate
-use windows::Win32::System::Variant::VARIANT;
-use windows::core::BSTR;
+//! This module shouldn't be accessed directly. Modules from the the crate level provide a safe API
+//! to interact with the crate
 use windows::{
     Win32::System::{
         Com::{CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize},
         Performance::{ITraceDataProviderCollection, TraceDataProviderCollection},
+        Variant::VARIANT,
     },
-    core::GUID,
+    core::{BSTR, GUID},
 };
 
 /// Pla native module errors
@@ -33,6 +33,11 @@ impl From<windows::core::Error> for PlaError {
 pub(crate) type ProvidersComResult<T> = Result<T, PlaError>;
 
 // https://github.com/microsoft/krabsetw/blob/31679cf84bc85360158672699f2f68a821e8a6d0/krabs/krabs/provider.hpp#L487
+/// # Safety
+///
+/// Initializes (and uninitializes) COM on the calling thread: must not be
+/// called on a thread whose COM apartment state is concurrently managed
+/// elsewhere
 pub(crate) unsafe fn get_provider_guid(name: &str) -> ProvidersComResult<GUID> {
     // CoUninitialize must be called once for every successful CoInitializeEx
     // (including when it returns S_FALSE, i.e. COM was already initialized on
@@ -59,12 +64,13 @@ unsafe fn find_provider_guid(name: &str) -> ProvidersComResult<GUID> {
     // COM initialization invariant documented under # Safety
     unsafe { all_providers.GetTraceDataProviders(&BSTR::default()) }?;
 
-    let count = unsafe { all_providers.Count() }? as u32;
+    // A negative count would only come from a broken COM implementation: treat it as empty
+    let count = u32::try_from(unsafe { all_providers.Count() }?).unwrap_or(0);
 
     let mut index = 0u32;
     let mut guid = None;
 
-    while index < count as u32 {
+    while index < count {
         let provider = unsafe { all_providers.get_Item(&VARIANT::from(index)) }?;
         let raw_name = unsafe { provider.DisplayName() }?;
 

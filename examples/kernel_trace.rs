@@ -1,9 +1,8 @@
-use ferrisetw::EventRecord;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::*;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::trace::*;
 use std::time::Duration;
+
+use ferrisetw::{
+    EventRecord, parser::Parser, provider::*, schema_locator::SchemaLocator, trace::*,
+};
 
 fn main() {
     env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
@@ -16,16 +15,16 @@ fn main() {
                 let opcode = record.opcode();
                 if opcode == 10 {
                     let name = schema.provider_name();
-                    println!("ProviderName: {}", name);
+                    println!("ProviderName: {name}");
                     let parser = Parser::create(record, &schema);
                     // Fully Qualified Syntax for Disambiguation
                     match parser.try_parse::<String>("FileName") {
-                        Ok(filename) => println!("FileName: {}", filename),
-                        Err(err) => println!("Error: {:?} getting Filename", err),
-                    };
+                        Ok(filename) => println!("FileName: {filename}"),
+                        Err(err) => println!("Error: {err:?} getting Filename"),
+                    }
                 }
-            }
-            Err(err) => println!("Error {:?}", err),
+            },
+            Err(err) => println!("Error {err:?}"),
         };
 
     let provider = Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)

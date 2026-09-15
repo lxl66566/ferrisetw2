@@ -5,12 +5,11 @@
 //! event
 //!
 //! This is a bit extra but is basically a redefinition of the In an Out TDH types following the
-//! rust naming convention, it can also come in handy when implementing the `TryParse` trait for a type
-//! to determine how to handle a [Property] based on this values
+//! rust naming convention, it can also come in handy when implementing the `TryParse` trait for a
+//! type to determine how to handle a [Property] based on this values
 //!
 //! [Property]: crate::native::tdh_types::Property
 use num_traits::FromPrimitive;
-
 use windows::Win32::System::Diagnostics::Etw;
 
 #[derive(Debug, Clone)]
@@ -23,7 +22,7 @@ pub enum PropertyError {
 impl std::fmt::Display for PropertyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnimplementedType(s) => write!(f, "unimplemented type: {}", s),
+            Self::UnimplementedType(s) => write!(f, "unimplemented type: {s}"),
         }
     }
 }
@@ -69,6 +68,8 @@ pub enum PropertyInfo {
         /// TDH In type of the property
         in_type: TdhInType,
         /// TDH Out type of the property
+        // Only read by the (feature-gated) serializer
+        #[cfg_attr(not(feature = "serde"), allow(dead_code))]
         out_type: TdhOutType,
         /// The length of the property
         length: PropertyLength,
@@ -80,9 +81,9 @@ pub enum PropertyInfo {
 impl Default for PropertyInfo {
     fn default() -> Self {
         PropertyInfo::Value {
-            in_type: Default::default(),
-            out_type: Default::default(),
-            length: Default::default(),
+            in_type: TdhInType::default(),
+            out_type: TdhOutType::default(),
+            length: PropertyLength::default(),
         }
     }
 }
@@ -106,15 +107,18 @@ impl Property {
         } else if flags.contains(PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA) {
             Err(PropertyError::UnimplementedType("has custom schema"))
         } else {
-            // The property is a non-struct type. It makes sense to access these fields of the unions
+            // The property is a non-struct type. It makes sense to access these fields of the
+            // unions
             let ot = unsafe { property.Anonymous1.nonStructType.OutType };
             let it = unsafe { property.Anonymous1.nonStructType.InType };
 
             let length = if flags.contains(PropertyFlags::PROPERTY_PARAM_LENGTH) {
-                // The property length is stored in another property, this is the index of that property
+                // The property length is stored in another property, this is the index of that
+                // property
                 PropertyLength::Index(unsafe { property.Anonymous3.lengthPropertyIndex })
             } else {
-                // The property has no param for its length, it makes sense to access this field of the union
+                // The property has no param for its length, it makes sense to access this field of
+                // the union
                 PropertyLength::Length(unsafe { property.Anonymous3.length })
             };
 
@@ -257,7 +261,8 @@ bitflags! {
 impl From<Etw::PROPERTY_FLAGS> for PropertyFlags {
     fn from(val: Etw::PROPERTY_FLAGS) -> Self {
         let flags: i32 = val.0;
-        // Should be a safe cast
+        // Safe cast: flags are a bit pattern, never a meaningful negative value
+        #[allow(clippy::cast_sign_loss)]
         PropertyFlags::from_bits_truncate(flags as u32)
     }
 }
@@ -270,6 +275,8 @@ mod tests {
     /// given value in the count/countPropertyIndex union member
     fn property_with_count_union(flags: u32, count_union: u16) -> Result<Property, PropertyError> {
         let mut info = Etw::EVENT_PROPERTY_INFO {
+            // Test flags are small bit patterns: they never wrap around
+            #[allow(clippy::cast_possible_wrap)]
             Flags: Etw::PROPERTY_FLAGS(flags as i32),
             ..Default::default()
         };
@@ -293,7 +300,7 @@ mod tests {
                     count: PropertyCount::Index(i),
                     ..
                 } => assert_eq!(i, index),
-                other => panic!("expected a dynamic array, got {:?}", other),
+                other => panic!("expected a dynamic array, got {other:?}"),
             }
         }
     }
@@ -310,12 +317,9 @@ mod tests {
         assert!(matches!(zero.info, PropertyInfo::Value { .. }));
 
         let array = property_with_count_union(0, 3).unwrap();
-        assert!(matches!(
-            array.info,
-            PropertyInfo::Array {
-                count: PropertyCount::Count(3),
-                ..
-            }
-        ));
+        assert!(matches!(array.info, PropertyInfo::Array {
+            count: PropertyCount::Count(3),
+            ..
+        }));
     }
 }

@@ -2,19 +2,24 @@
 //!
 //! This module act as a helper to parse the Buffer from an ETW Event
 
-use crate::native::etw_types::event_record::EventRecord;
-use crate::native::sddl;
-use crate::native::tdh;
-use crate::native::tdh_types::{
-    Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType,
+use std::{
+    convert::TryInto,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Mutex,
 };
-use crate::native::time::{FileTime, SystemTime};
-use crate::property::PropertySlice;
-use crate::schema::Schema;
-use std::convert::TryInto;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+
 use windows::core::GUID;
+
+use crate::{
+    native::{
+        etw_types::event_record::EventRecord,
+        sddl, tdh,
+        tdh_types::{Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType},
+        time::{FileTime, SystemTime},
+    },
+    property::PropertySlice,
+    schema::Schema,
+};
 
 /// Parser module errors
 #[derive(Debug)]
@@ -69,11 +74,11 @@ impl std::fmt::Display for ParserError {
             Self::InvalidType => write!(f, "invalid type"),
             Self::ParseError => write!(f, "parse error"),
             Self::LengthMismatch => write!(f, "length mismatch"),
-            Self::PropertyError(s) => write!(f, "property error {}", s),
-            Self::Utf8Error(e) => write!(f, "utf-8 error {}", e),
-            Self::SliceError(e) => write!(f, "slice error {}", e),
-            Self::SddlNativeError(e) => write!(f, "sddl native error {}", e),
-            Self::TdhNativeError(e) => write!(f, "tdh native error {}", e),
+            Self::PropertyError(s) => write!(f, "property error {s}"),
+            Self::Utf8Error(e) => write!(f, "utf-8 error {e}"),
+            Self::SliceError(e) => write!(f, "slice error {e}"),
+            Self::SddlNativeError(e) => write!(f, "sddl native error {e}"),
+            Self::TdhNativeError(e) => write!(f, "tdh native error {e}"),
         }
     }
 }
@@ -101,7 +106,8 @@ struct CachedSlices<'schema, 'record> {
 /// Represents a Parser
 ///
 /// This structure provides a way to parse an ETW event (= extract its properties).
-/// Because properties may have variable length (e.g. strings), a `Parser` is only suited to a single [`EventRecord`]
+/// Because properties may have variable length (e.g. strings), a `Parser` is only suited to a
+/// single [`EventRecord`]
 ///
 /// # Example
 /// ```
@@ -166,11 +172,14 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             } => {
                 // There are several cases
                 //  * regular case, where property.len() directly makes sense
-                //  * but EVENT_PROPERTY_INFO.length is an union, and (in its lengthPropertyIndex form) can refeer to another field
-                //    e.g.: the WinInet provider manifest has fields such as `<data name="Verb" inType="win:AnsiString" length="_VerbLength"/>`
-                //    In this case, we defer to TDH to know the right length.
+                //  * but EVENT_PROPERTY_INFO.length is an union, and (in its lengthPropertyIndex
+                //    form) can refeer to another field e.g.: the WinInet provider manifest has
+                //    fields such as `<data name="Verb" inType="win:AnsiString"
+                //    length="_VerbLength"/>` In this case, we defer to TDH to know the right
+                //    length.
 
-                // For pointer input type we can immediately infer the size based on the header flags.
+                // For pointer input type we can immediately infer the size based on the header
+                // flags.
                 if in_type == TdhInType::InTypePointer {
                     return Ok(self.record.pointer_size());
                 }
@@ -178,11 +187,12 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 let prop_len = match length {
                     PropertyLength::Length(l) => l,
                     PropertyLength::Index(_) => {
-                        // TODO optimize to cache the lookup, the problem is here this is called under an
-                        // exclusive mutex, so attempting to extract and cache a related property will
+                        // TODO optimize to cache the lookup, the problem is here this is called
+                        // under an exclusive mutex, so attempting to
+                        // extract and cache a related property will
                         // deadlock.
                         return Ok(tdh::property_size(self.record, &property.name)? as usize);
-                    }
+                    },
                 };
 
                 if prop_len > 0 {
@@ -190,9 +200,10 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 }
 
                 // Length is not set. We'll have to ask TDH for the right length.
-                // However, before doing so, there are some cases where we could determine ourselves.
-                // The following _very_ common property types can be short-circuited to prevent the expensive call.
-                // (that's taken from krabsetw)
+                // However, before doing so, there are some cases where we could determine
+                // ourselves. The following _very_ common property types can be
+                // short-circuited to prevent the expensive call. (that's taken from
+                // krabsetw)
 
                 match in_type {
                     TdhInType::InTypeAnsiString => {
@@ -203,55 +214,56 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                             ));
                         };
                         return Ok(nul_index + 1);
-                    }
+                    },
                     TdhInType::InTypeUnicodeString => {
                         // The property spans up to and including the NUL terminator
                         let Some(nul_index) = remaining_user_buffer
-                            .as_chunks::<2>()
-                            .0
-                            .iter()
-                            .position(|bytes| u16::from_ne_bytes(*bytes) == 0)
+                            .chunks_exact(2)
+                            .position(|bytes| u16::from_ne_bytes(bytes.try_into().unwrap()) == 0)
                         else {
                             return Err(ParserError::PropertyError(
                                 "UnicodeString property is not null-terminated".into(),
                             ));
                         };
                         return Ok((nul_index + 1) * 2);
-                    }
+                    },
                     _ => (),
                 }
 
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
-            }
+            },
             PropertyInfo::Array {
                 in_type,
                 length,
                 count,
                 ..
             } => {
-                // For pointer input type we can immediately infer the size based on the header flags.
+                // For pointer input type we can immediately infer the size based on the header
+                // flags.
                 let prop_len = if in_type == TdhInType::InTypePointer {
                     self.record.pointer_size()
                 } else {
                     match length {
                         PropertyLength::Length(l) => l as usize,
                         PropertyLength::Index(_) => {
-                            // TODO optimize to cache the lookup, the problem is here this is called under an
-                            // exclusive mutex, so attempting to extract and cache a related property will
+                            // TODO optimize to cache the lookup, the problem is here this is called
+                            // under an exclusive mutex, so attempting
+                            // to extract and cache a related property will
                             // deadlock.
                             return Ok(tdh::property_size(self.record, &property.name)? as usize);
-                        }
+                        },
                     }
                 };
 
                 let prop_count = match count {
                     PropertyCount::Count(c) => c as usize,
                     PropertyCount::Index(_) => {
-                        // TODO optimize to cache the lookup, the problem is here this is called under an
-                        // exclusive mutex, so attempting to extract and cache a related property will
+                        // TODO optimize to cache the lookup, the problem is here this is called
+                        // under an exclusive mutex, so attempting to
+                        // extract and cache a related property will
                         // deadlock.
                         return Ok(tdh::property_size(self.record, &property.name)? as usize);
-                    }
+                    },
                 };
 
                 if prop_len > 0 {
@@ -259,7 +271,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 }
 
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
-            }
+            },
         }
     }
 
@@ -276,31 +288,25 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             }
         }
 
-        let properties_not_parsed_yet = match self.properties.get(cache.slices.len()..) {
-            Some(s) => s,
-            // If we've parsed every property already, that means no property matches this name
-            None => return Err(ParserError::NotFound),
+        // If we've parsed every property already, that means no property matches this name
+        let Some(properties_not_parsed_yet) = self.properties.get(cache.slices.len()..) else {
+            return Err(ParserError::NotFound);
         };
 
         for property in properties_not_parsed_yet {
-            let remaining_user_buffer =
-                match self.record.user_buffer().get(cache.last_cached_offset..) {
-                    None => {
-                        return Err(ParserError::PropertyError(
-                            "Invalid buffer bounds".to_owned(),
-                        ));
-                    }
-                    Some(s) => s,
-                };
+            let Some(remaining_user_buffer) =
+                self.record.user_buffer().get(cache.last_cached_offset..)
+            else {
+                return Err(ParserError::PropertyError(
+                    "Invalid buffer bounds".to_owned(),
+                ));
+            };
 
             let prop_size = self.find_property_size(property, remaining_user_buffer)?;
-            let property_buffer = match remaining_user_buffer.get(..prop_size) {
-                None => {
-                    return Err(ParserError::PropertyError(
-                        "Property length out of buffer bounds".to_owned(),
-                    ));
-                }
-                Some(s) => s,
+            let Some(property_buffer) = remaining_user_buffer.get(..prop_size) else {
+                return Err(ParserError::PropertyError(
+                    "Property length out of buffer bounds".to_owned(),
+                ));
             };
 
             let prop_slice = PropertySlice {
@@ -321,7 +327,8 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     /// Return a property from the event, or an error in case the parsing failed.
     ///
     /// You must explicitly define `T`, the type you want to parse the property into.<br/>
-    /// In case this type is not compatible with the ETW type, [`ParserError::InvalidType`] is returned.
+    /// In case this type is not compatible with the ETW type, [`ParserError::InvalidType`] is
+    /// returned.
     pub fn try_parse<T>(&self, name: &str) -> ParserResult<T>
     where
         Parser<'schema, 'record>: private::TryParse<T>,
@@ -336,11 +343,11 @@ mod private {
 
     /// Trait to try and parse a type
     ///
-    /// This trait has to be implemented in order to be able to parse a type we want to retrieve from
-    /// within an Event.
+    /// This trait has to be implemented in order to be able to parse a type we want to retrieve
+    /// from within an Event.
     ///
-    /// An implementation for most of the Primitive Types is created by using a Macro, any other needed type
-    /// requires this trait to be implemented
+    /// An implementation for most of the Primitive Types is created by using a Macro, any other
+    /// needed type requires this trait to be implemented
     pub trait TryParse<T> {
         /// Implement the `try_parse` function to provide a way to Parse `T` from an ETW event or
         /// return an Error in case the type `T` can't be parsed
@@ -364,7 +371,7 @@ macro_rules! impl_try_parse_primitive {
                             return Err(ParserError::LengthMismatch);
                         }
                         Ok($T::from_ne_bytes(prop_slice.buffer.try_into()?))
-                    }
+                    },
                     _ => Err(ParserError::InvalidType),
                 }
             }
@@ -406,14 +413,16 @@ macro_rules! impl_try_parse_primitive_array {
                         }
 
                         let slice = unsafe {
+                            // The alignment of the buffer was checked above
+                            #[allow(clippy::cast_ptr_alignment)]
                             std::slice::from_raw_parts(
-                                prop_slice.buffer.as_ptr() as *const $T,
+                                prop_slice.buffer.as_ptr().cast::<$T>(),
                                 count,
                             )
                         };
 
                         Ok(slice)
-                    }
+                    },
                     _ => Err(ParserError::InvalidType),
                 }
             }
@@ -483,9 +492,8 @@ impl private::TryParse<String> for Parser<'_, '_> {
                     // the buffer into a new Vec<u16> and use that as the source for the slice
                     // until we can find a better solution.
                     let mut aligned_buffer = Vec::with_capacity(prop_slice.buffer.len() / 2);
-                    for chunk in prop_slice.buffer.as_chunks::<2>().0 {
-                        let part = u16::from_ne_bytes(*chunk);
-                        aligned_buffer.push(part);
+                    for chunk in prop_slice.buffer.chunks_exact(2) {
+                        aligned_buffer.push(u16::from_ne_bytes(chunk.try_into().unwrap()));
                     }
 
                     let mut wide = aligned_buffer.as_slice();
@@ -498,16 +506,15 @@ impl private::TryParse<String> for Parser<'_, '_> {
 
                     // Decode UTF-16 to String
                     Ok(widestring::decode_utf16_lossy(wide.iter().copied()).collect::<String>())
-                }
+                },
                 TdhInType::InTypeAnsiString => {
                     let string = std::str::from_utf8(prop_slice.buffer)?;
                     Ok(string.trim_matches(char::default()).to_string())
-                }
+                },
                 TdhInType::InTypeSid => {
-                    let string =
-                        sddl::convert_sid_to_string(prop_slice.buffer.as_ptr() as *const _)?;
+                    let string = sddl::convert_sid_to_string(prop_slice.buffer.as_ptr().cast())?;
                     Ok(string)
-                }
+                },
                 TdhInType::InTypeCountedString => unimplemented!(),
                 TdhInType::InTypeCountedAnsiString => {
                     if prop_slice.buffer.len() < 2 {
@@ -516,24 +523,21 @@ impl private::TryParse<String> for Parser<'_, '_> {
                         ));
                     }
                     let str_length = u16::from_le_bytes(
-                        prop_slice.buffer[..std::mem::size_of::<u16>()]
-                            .try_into()
-                            .unwrap(),
+                        prop_slice.buffer[..size_of::<u16>()].try_into().unwrap(),
                     ) as usize;
-                    if prop_slice.buffer[std::mem::size_of::<u16>()..].len() < str_length {
+                    if prop_slice.buffer[size_of::<u16>()..].len() < str_length {
                         return Err(ParserError::PropertyError(
                             "invalid counted string length".into(),
                         ));
                     }
                     let string = std::str::from_utf8(
-                        &prop_slice.buffer
-                            [std::mem::size_of::<u16>()..std::mem::size_of::<u16>() + str_length],
+                        &prop_slice.buffer[size_of::<u16>()..size_of::<u16>() + str_length],
                     )?;
                     Ok(string.to_string())
-                }
+                },
                 _ => Err(ParserError::InvalidType),
             },
-            _ => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -560,8 +564,8 @@ impl private::TryParse<GUID> for Parser<'_, '_> {
                     data3: u16::from_ne_bytes(prop_slice.buffer[6..8].try_into()?),
                     data4: prop_slice.buffer[8..].try_into()?,
                 })
-            }
-            _ => Err(ParserError::InvalidType),
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -581,17 +585,17 @@ impl private::TryParse<IpAddr> for Parser<'_, '_> {
                     16 => {
                         let tmp: [u8; 16] = prop_slice.buffer.try_into()?;
                         IpAddr::V6(Ipv6Addr::from(tmp))
-                    }
+                    },
                     4 => {
                         let tmp: [u8; 4] = prop_slice.buffer.try_into()?;
                         IpAddr::V4(Ipv4Addr::from(tmp))
-                    }
+                    },
                     _ => return Err(ParserError::LengthMismatch),
                 };
 
                 Ok(res)
-            }
-            _ => Err(ParserError::InvalidType),
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -612,8 +616,8 @@ impl private::TryParse<bool> for Parser<'_, '_> {
                     8 => Ok(u64::from_ne_bytes(prop_slice.buffer.try_into()?) != 0),
                     _ => Err(ParserError::LengthMismatch),
                 }
-            }
-            _ => Err(ParserError::InvalidType),
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -629,8 +633,8 @@ impl private::TryParse<FileTime> for Parser<'_, '_> {
                 }
 
                 Ok(FileTime::from_slice(prop_slice.buffer.try_into()?))
-            }
-            _ => Err(ParserError::InvalidType),
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -646,8 +650,8 @@ impl private::TryParse<SystemTime> for Parser<'_, '_> {
                 }
 
                 Ok(SystemTime::from_slice(prop_slice.buffer.try_into()?))
-            }
-            _ => Err(ParserError::InvalidType),
+            },
+            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -698,7 +702,9 @@ impl private::TryParse<Pointer> for Parser<'_, '_> {
         let prop_slice = self.find_property(name)?;
 
         let mut res = Pointer::default();
-        if prop_slice.buffer.len() == std::mem::size_of::<u32>() {
+        // Pointers wider than usize (i.e. on 16-bit targets) are truncated
+        #[allow(clippy::cast_possible_truncation)]
+        if prop_slice.buffer.len() == size_of::<u32>() {
             res.0 = private::TryParse::<u32>::try_parse_impl(self, name)? as usize;
         } else {
             res.0 = private::TryParse::<u64>::try_parse_impl(self, name)? as usize;
@@ -724,11 +730,12 @@ mod tests {
     //! so that the parsing logic can be exercised without a real ETW session
     //! (which would require administrator rights).
 
-    use super::*;
-    use crate::native::tdh::TraceEventInfo;
-    use crate::schema::Schema;
     use std::alloc::Layout;
+
     use windows::Win32::System::Diagnostics::Etw;
+
+    use super::*;
+    use crate::{native::tdh::TraceEventInfo, schema::Schema};
 
     /// Description of one synthetic property of a schema
     struct PropSpec {
@@ -756,14 +763,14 @@ mod tests {
 
     /// Builds a `Schema` wrapping a synthetic `TRACE_EVENT_INFO` describing `props`
     fn synthetic_schema(props: &[PropSpec]) -> Schema {
-        let size_of_info = std::mem::size_of::<Etw::TRACE_EVENT_INFO>();
-        let size_of_prop = std::mem::size_of::<Etw::EVENT_PROPERTY_INFO>();
+        let size_of_info = size_of::<Etw::TRACE_EVENT_INFO>();
+        let size_of_prop = size_of::<Etw::EVENT_PROPERTY_INFO>();
         let mut names_size = 0;
         for prop in props {
             names_size += (prop.name.len() + 1) * 2; // utf-16 code units, NUL included
         }
         let size = size_of_info + props.len().saturating_sub(1) * size_of_prop + names_size;
-        let layout = Layout::from_size_align(size, std::mem::align_of::<Etw::TRACE_EVENT_INFO>())
+        let layout = Layout::from_size_align(size, align_of::<Etw::TRACE_EVENT_INFO>())
             .expect("valid layout");
 
         let buffer = unsafe {
@@ -773,20 +780,27 @@ mod tests {
             buffer
         };
 
-        let names_offset = (size - names_size) as u32;
+        let names_offset = u32::try_from(size - names_size).unwrap();
         unsafe {
+            // The buffer is allocated with the alignment of TRACE_EVENT_INFO
+            #[allow(clippy::cast_ptr_alignment)]
             let info = buffer.cast::<Etw::TRACE_EVENT_INFO>();
-            (*info).PropertyCount = props.len() as u32;
+            (*info).PropertyCount = u32::try_from(props.len()).unwrap();
 
             let mut name_offset = names_offset;
             for (index, spec) in props.iter().enumerate() {
+                // Test flags are small bit patterns: they never wrap around
+                #[allow(clippy::cast_possible_wrap)]
+                let flags = Etw::PROPERTY_FLAGS(spec.flags as i32);
                 let prop = (*info).EventPropertyInfoArray.as_mut_ptr().add(index);
-                (*prop).Flags = Etw::PROPERTY_FLAGS(spec.flags as i32);
+                (*prop).Flags = flags;
                 (*prop).NameOffset = name_offset;
                 (*prop).Anonymous1.nonStructType.InType = spec.in_type as u16;
                 (*prop).Anonymous2.count = spec.count;
                 (*prop).Anonymous3.length = spec.length;
 
+                // Names are written unaligned, which the read side mirrors
+                #[allow(clippy::cast_ptr_alignment)]
                 let name = buffer.cast::<u16>().add(name_offset as usize / 2);
                 for (i, unit) in spec
                     .name
@@ -796,7 +810,7 @@ mod tests {
                 {
                     name.add(i).write_unaligned(unit);
                 }
-                name_offset += ((spec.name.len() + 1) * 2) as u32;
+                name_offset += u32::try_from((spec.name.len() + 1) * 2).unwrap();
             }
         }
 
@@ -807,7 +821,7 @@ mod tests {
     fn synthetic_record(user_data: &[u8]) -> EventRecord {
         EventRecord(Etw::EVENT_RECORD {
             UserData: user_data.as_ptr() as *mut _,
-            UserDataLength: user_data.len() as u16,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
             ..Default::default()
         })
     }
@@ -919,7 +933,7 @@ mod tests {
     fn terminated_strings_parse_and_advance_the_offset() {
         let user_data: Vec<u8> = Vec::from("ab\0")
             .into_iter()
-            .chain(0x11223344u32.to_ne_bytes())
+            .chain(0x1122_3344u32.to_ne_bytes())
             .collect();
         let record = synthetic_record(&user_data);
         let schema = synthetic_schema(&[
@@ -931,6 +945,6 @@ mod tests {
         assert_eq!(parser.try_parse::<String>("s").unwrap(), "ab");
         // The u32 sits right after the 3-byte string: this verifies the string
         // size computation (NUL included)
-        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x11223344);
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
     }
 }

@@ -29,8 +29,8 @@ impl SessionlessInfo {
             // SAFETY: TRACE_PROFILE_INTERVAL is `#[repr(C)]` and uses only POD
             unsafe {
                 std::slice::from_raw_parts_mut(
-                    &mut info as *mut _ as *mut u8,
-                    std::mem::size_of::<TRACE_PROFILE_INTERVAL>(),
+                    (&raw mut info).cast::<u8>(),
+                    size_of::<TRACE_PROFILE_INTERVAL>(),
                 )
             },
         )?;
