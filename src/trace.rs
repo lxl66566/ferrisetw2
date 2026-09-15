@@ -17,8 +17,8 @@ use crate::{
         EvntraceNativeError,
         etw_types::{EventTraceProperties, SubscriptionSource},
         evntrace::{
-            ControlHandle, TraceHandle, close_trace, control_trace, control_trace_by_name,
-            enable_provider, open_trace, process_trace, start_trace,
+            ControlHandle, TraceHandle, capture_provider_state, close_trace, control_trace,
+            control_trace_by_name, enable_provider, open_trace, process_trace, start_trace,
         },
         version_helper,
     },
@@ -299,6 +299,38 @@ impl UserTrace {
     /// The same result is achieved by dropping `Self`
     pub fn stop(mut self) -> TraceResult<()> {
         self.non_consuming_stop()
+    }
+
+    /// Ask every provider created with
+    /// [`ProviderBuilder::request_capture_state`](crate::provider::ProviderBuilder::request_capture_state)
+    /// to log its current state (rundown)
+    ///
+    /// This is automatically done when the trace is started. Calling this
+    /// again requests a fresh rundown, e.g. to observe state changes during a
+    /// long-running trace. The events will be delivered to the processing
+    /// callbacks, as usual.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw::trace::UserTrace;
+    /// # let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
+    /// #     .request_capture_state()
+    /// #     .build();
+    /// # let trace = UserTrace::new().enable(provider).start().unwrap().0;
+    /// // ... process events for a while ...
+    /// trace.request_capture_state().unwrap();
+    /// ```
+    pub fn request_capture_state(&self) -> TraceResult<()> {
+        // A UserTrace always holds real-time callback data
+        if let CallbackData::RealTime(rt) = &**self.callback_data {
+            for provider in rt.providers() {
+                if provider.requests_capture_state() {
+                    capture_provider_state(self.control_handle, provider)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -596,6 +628,20 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             SubscriptionSource::RealTimeSession(trace_wide_name),
             &callback_data,
         )?;
+
+        // Request provider states (rundown) now that the consumer is attached:
+        // real-time sessions drop events nobody listens to, so this must happen
+        // after `open_trace` (same ordering as krabsetw, which fires it right
+        // before ProcessTrace)
+        if T::TRACE_KIND == private::TraceKind::User {
+            if let CallbackData::RealTime(rt) = &**callback_data {
+                for prov in rt.providers() {
+                    if prov.requests_capture_state() {
+                        capture_provider_state(control_handle, prov)?;
+                    }
+                }
+            }
+        }
 
         Ok((
             T::build(full_properties, control_handle, trace_handle, callback_data),

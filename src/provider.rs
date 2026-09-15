@@ -49,6 +49,9 @@ pub struct Provider {
     trace_flags: TraceFlags,
     /// Provider kernel flags, only apply to KernelProvider
     kernel_flags: u32,
+    /// Whether the provider should be asked for its state (rundown) when the
+    /// trace starts
+    capture_state: bool,
     /// Provider filters
     filters: Vec<EventFilter>,
     /// Callbacks that will receive events from this Provider
@@ -68,6 +71,7 @@ pub struct ProviderBuilder {
     level: u8,
     trace_flags: TraceFlags,
     kernel_flags: u32,
+    capture_state: bool,
     filters: Vec<EventFilter>,
     callbacks: Arc<Mutex<Vec<crate::EtwCallback>>>,
 }
@@ -81,6 +85,7 @@ impl std::fmt::Debug for ProviderBuilder {
             .field("level", &self.level)
             .field("trace_flags", &self.trace_flags)
             .field("kernel_flags", &self.kernel_flags)
+            .field("capture_state", &self.capture_state)
             .field("filters", &self.filters)
             .field("n_callbacks", &self.callbacks.lock().unwrap().len())
             .finish()
@@ -130,6 +135,7 @@ impl Provider {
             level: 5,
             trace_flags: TraceFlags::empty(),
             kernel_flags: 0,
+            capture_state: false,
             filters: Vec::new(),
             callbacks: Arc::new(Mutex::new(Vec::new())),
         }
@@ -199,6 +205,15 @@ impl Provider {
         self.kernel_flags
     }
 
+    /// Whether the provider is asked for its state (rundown) when the trace
+    /// starts
+    ///
+    /// Set through [`ProviderBuilder::request_capture_state`]
+    #[must_use]
+    pub fn requests_capture_state(&self) -> bool {
+        self.capture_state
+    }
+
     #[must_use]
     pub fn filters(&self) -> &[EventFilter] {
         &self.filters
@@ -220,6 +235,7 @@ impl std::fmt::Debug for Provider {
             .field("level", &self.level)
             .field("trace_flags", &self.trace_flags)
             .field("kernel_flags", &self.kernel_flags)
+            .field("capture_state", &self.capture_state)
             .field("filters", &self.filters)
             .field("callbacks", &self.callbacks.lock().unwrap().len())
             .finish()
@@ -293,6 +309,34 @@ impl ProviderBuilder {
     #[must_use]
     pub fn trace_flags(mut self, trace_flags: TraceFlags) -> Self {
         self.trace_flags = trace_flags;
+        self
+    }
+
+    /// Ask this provider to log its state information (a.k.a. rundown) when
+    /// the trace starts
+    ///
+    /// This sends an `EVENT_CONTROL_CODE_CAPTURE_STATE` request to the
+    /// provider. State-based providers (e.g. those that can enumerate loaded
+    /// images, open files or handles) only emit their current state upon this
+    /// request, so they need it to appear in the trace at all.
+    ///
+    /// For a [`UserTrace`](crate::trace::UserTrace), the request is sent right
+    /// after the consumer is attached (rundown events would be dropped with no
+    /// consumer listening), and can be re-sent at any time with
+    /// [`UserTrace::request_capture_state`](crate::trace::UserTrace::request_capture_state).
+    /// This is a no-op for kernel trace providers: their rundown goes through
+    /// another (undocumented) mechanism.
+    ///
+    /// # Example
+    /// ```
+    /// # use ferrisetw::provider::Provider;
+    /// let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716") // Microsoft-Windows-Kernel-Process
+    ///     .request_capture_state()
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn request_capture_state(mut self) -> Self {
+        self.capture_state = true;
         self
     }
 
@@ -375,6 +419,7 @@ impl ProviderBuilder {
             level: self.level,
             trace_flags: self.trace_flags,
             kernel_flags: self.kernel_flags,
+            capture_state: self.capture_state,
             filters: self.filters,
             callbacks: self.callbacks,
         }

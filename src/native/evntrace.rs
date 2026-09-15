@@ -17,7 +17,10 @@ use windows::{
         Foundation::{ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_SUCCESS, FILETIME},
         System::Diagnostics::{
             Etw,
-            Etw::{EVENT_CONTROL_CODE_ENABLE_PROVIDER, TRACE_QUERY_INFO_CLASS},
+            Etw::{
+                EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                TRACE_QUERY_INFO_CLASS,
+            },
         },
     },
     core::{GUID, PCWSTR},
@@ -311,6 +314,45 @@ pub(crate) fn enable_provider(
                     provider.all(),
                     0,
                     Some(parameters.as_ptr()),
+                )
+            }
+            .ok();
+
+            res.map_err(|err| {
+                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
+            })
+        },
+    }
+}
+
+/// Ask a provider to log its current state (a.k.a. rundown)
+///
+/// Sends `EVENT_CONTROL_CODE_CAPTURE_STATE` to the provider. State-based
+/// providers (e.g. those that can enumerate loaded images, open files or
+/// handles) only emit their state upon this request.
+///
+/// The request carries no level, keyword or filter: it is a bare notification,
+/// which is what such providers expect (same call shape as krabsetw).
+pub(crate) fn capture_provider_state(
+    control_handle: ControlHandle,
+    provider: &Provider,
+) -> EvntraceNativeResult<()> {
+    match filter_invalid_control_handle(control_handle) {
+        None => Err(EvntraceNativeError::InvalidHandle),
+        Some(handle) => {
+            let res = unsafe {
+                // Safety:
+                //  * the control handle is valid (by construction)
+                //  * the provider GUID is a valid, readable GUID
+                Etw::EnableTraceEx2(
+                    handle,
+                    std::ptr::from_ref::<GUID>(&provider.guid()),
+                    EVENT_CONTROL_CODE_CAPTURE_STATE.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
                 )
             }
             .ok();
