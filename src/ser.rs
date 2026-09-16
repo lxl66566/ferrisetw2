@@ -453,27 +453,10 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
             if prop.get_parser().is_some() {
                 len += 1;
             } else if self.options.fail_unimplemented {
-                match prop.info {
-                    PropertyInfo::Value {
-                        in_type, out_type, ..
-                    } => {
-                        return Err(serde::ser::Error::custom(format!(
-                            "not implemented {} in_type: {:?} out_type: {:?}",
-                            prop.name, in_type, out_type,
-                        )));
-                    },
-                    PropertyInfo::Array {
-                        in_type,
-                        out_type,
-                        count,
-                        ..
-                    } => {
-                        return Err(serde::ser::Error::custom(format!(
-                            "not implemented {} in_type: {:?} out_type: {:?} count: {:?}",
-                            prop.name, in_type, out_type, count
-                        )));
-                    },
-                }
+                return Err(serde::ser::Error::custom(format!(
+                    "not implemented {} info: {:?}",
+                    prop.name, prop.info
+                )));
             }
         }
 
@@ -865,6 +848,8 @@ impl PropSerable for PropertyInfo {
                     _ => None, // TODO
                 }
             },
+            // Structures are not serialized (yet)
+            PropertyInfo::Struct { .. } | PropertyInfo::StructArray { .. } => None,
         }
     }
 }

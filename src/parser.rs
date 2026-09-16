@@ -297,6 +297,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
 
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
+            // Structures span all of their members; defer to TDH for the total
+            // size (their members are laid out by the struct breakdown logic)
+            PropertyInfo::Struct { .. } | PropertyInfo::StructArray { .. } => {
+                Ok(tdh::property_size(self.record, &property.name)? as usize)
+            },
         }
     }
 
@@ -577,7 +582,9 @@ impl private::TryParse<String> for Parser<'_, '_> {
                 },
                 _ => Err(ParserError::InvalidType),
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -605,7 +612,9 @@ impl private::TryParse<GUID> for Parser<'_, '_> {
                     data4: prop_slice.buffer[8..].try_into()?,
                 })
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -635,7 +644,9 @@ impl private::TryParse<IpAddr> for Parser<'_, '_> {
 
                 Ok(res)
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -657,7 +668,9 @@ impl private::TryParse<bool> for Parser<'_, '_> {
                     _ => Err(ParserError::LengthMismatch),
                 }
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -688,7 +701,9 @@ impl private::TryParse<TdhSocketAddress> for Parser<'_, '_> {
 
                 TdhSocketAddress::from_property_buffer(prop_slice.buffer)
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -705,7 +720,9 @@ impl private::TryParse<FileTime> for Parser<'_, '_> {
 
                 Ok(FileTime::from_slice(prop_slice.buffer.try_into()?))
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -722,7 +739,9 @@ impl private::TryParse<SystemTime> for Parser<'_, '_> {
 
                 Ok(SystemTime::from_slice(prop_slice.buffer.try_into()?))
             },
-            PropertyInfo::Array { .. } => Err(ParserError::InvalidType),
+            PropertyInfo::Array { .. }
+            | PropertyInfo::Struct { .. }
+            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -805,7 +824,10 @@ mod tests {
     use windows::Win32::System::Diagnostics::Etw;
 
     use super::*;
-    use crate::{native::tdh::TraceEventInfo, schema::Schema};
+    use crate::{
+        native::{tdh::TraceEventInfo, tdh_types::PropertyFlags},
+        schema::Schema,
+    };
 
     /// Description of one synthetic property of a schema
     struct PropSpec {
@@ -818,6 +840,8 @@ mod tests {
         count: u16,
         /// Value written to the length/lengthPropertyIndex union member
         length: u16,
+        /// Members, when the property describes a structure
+        structure: Option<&'static [PropSpec]>,
     }
 
     impl PropSpec {
@@ -829,6 +853,7 @@ mod tests {
                 flags: 0,
                 count: 0,
                 length,
+                structure: None,
             }
         }
 
@@ -836,17 +861,97 @@ mod tests {
             self.out_type = out_type;
             self
         }
+
+        /// A structure property with the given members
+        const fn structure(name: &'static str, members: &'static [PropSpec]) -> Self {
+            Self {
+                flags: PropertyFlags::PROPERTY_STRUCT.bits(),
+                structure: Some(members),
+                ..Self::new(name, TdhInType::InTypeNull, 0)
+            }
+        }
+
+        /// An array of structures whose element count is held by the property
+        /// at `count_property_index` (PropertyParamCount, as in the .NET
+        /// GCBulk events)
+        const fn structure_array(
+            name: &'static str,
+            members: &'static [PropSpec],
+            count_property_index: u16,
+        ) -> Self {
+            Self {
+                flags: PropertyFlags::PROPERTY_STRUCT.bits()
+                    | PropertyFlags::PROPERTY_PARAM_COUNT.bits(),
+                count: count_property_index,
+                ..Self::structure(name, members)
+            }
+        }
+    }
+
+    /// A flattened synthetic `EVENT_PROPERTY_INFO` entry
+    struct RawProp {
+        name: &'static str,
+        flags: u32,
+        in_type: TdhInType,
+        out_type: TdhOutType,
+        count: u16,
+        length: u16,
+        /// First member entry index, for structures
+        member_start: u16,
+        /// Number of member entries, for structures
+        member_count: u16,
+    }
+
+    impl RawProp {
+        fn scalar(spec: &PropSpec) -> Self {
+            Self {
+                name: spec.name,
+                flags: spec.flags,
+                in_type: spec.in_type,
+                out_type: spec.out_type,
+                count: spec.count,
+                length: spec.length,
+                member_start: 0,
+                member_count: 0,
+            }
+        }
+    }
+
+    /// Flattens the spec tree the way TDH does: every level's direct entries
+    /// first, then their members (each structure's member block stays
+    /// contiguous, at the recorded start index)
+    fn flatten_props(specs: &[PropSpec], entries: &mut Vec<RawProp>) {
+        // Direct entries of this level, remembering where the structures are
+        let mut structures = Vec::new();
+        for spec in specs {
+            let entry_index = entries.len();
+            entries.push(RawProp::scalar(spec));
+            if let Some(members) = spec.structure {
+                structures.push((entry_index, members));
+            }
+        }
+        for (entry_index, members) in structures {
+            // Test property counts are tiny: they always fit a u16
+            let start = u16::try_from(entries.len()).expect("property count fits u16");
+            let entry = &mut entries[entry_index];
+            entry.member_start = start;
+            entry.member_count = u16::try_from(members.len()).expect("member count fits u16");
+            flatten_props(members, entries);
+        }
     }
 
     /// Builds a `Schema` wrapping a synthetic `TRACE_EVENT_INFO` describing `props`
     fn synthetic_schema(props: &[PropSpec]) -> Schema {
+        let mut entries = Vec::new();
+        flatten_props(props, &mut entries);
+
         let size_of_info = size_of::<Etw::TRACE_EVENT_INFO>();
         let size_of_prop = size_of::<Etw::EVENT_PROPERTY_INFO>();
         let mut names_size = 0;
-        for prop in props {
+        for prop in &entries {
             names_size += (prop.name.len() + 1) * 2; // utf-16 code units, NUL included
         }
-        let size = size_of_info + props.len().saturating_sub(1) * size_of_prop + names_size;
+        let size = size_of_info + entries.len().saturating_sub(1) * size_of_prop + names_size;
         let layout = Layout::from_size_align(size, align_of::<Etw::TRACE_EVENT_INFO>())
             .expect("valid layout");
 
@@ -862,25 +967,33 @@ mod tests {
             // The buffer is allocated with the alignment of TRACE_EVENT_INFO
             #[allow(clippy::cast_ptr_alignment)]
             let info = buffer.cast::<Etw::TRACE_EVENT_INFO>();
-            (*info).PropertyCount = u32::try_from(props.len()).unwrap();
+            (*info).PropertyCount = u32::try_from(entries.len()).unwrap();
+            (*info).TopLevelPropertyCount = u32::try_from(props.len()).unwrap();
 
             let mut name_offset = names_offset;
-            for (index, spec) in props.iter().enumerate() {
+            for (index, prop) in entries.iter().enumerate() {
                 // Test flags are small bit patterns: they never wrap around
                 #[allow(clippy::cast_possible_wrap)]
-                let flags = Etw::PROPERTY_FLAGS(spec.flags as i32);
-                let prop = (*info).EventPropertyInfoArray.as_mut_ptr().add(index);
-                (*prop).Flags = flags;
-                (*prop).NameOffset = name_offset;
-                (*prop).Anonymous1.nonStructType.InType = spec.in_type as u16;
-                (*prop).Anonymous1.nonStructType.OutType = spec.out_type as u16;
-                (*prop).Anonymous2.count = spec.count;
-                (*prop).Anonymous3.length = spec.length;
+                let flags = Etw::PROPERTY_FLAGS(prop.flags as i32);
+                let entry = (*info).EventPropertyInfoArray.as_mut_ptr().add(index);
+                (*entry).Flags = flags;
+                (*entry).NameOffset = name_offset;
+                if prop.flags & PropertyFlags::PROPERTY_STRUCT.bits() != 0 {
+                    (*entry).Anonymous1.structType.StructStartIndex = prop.member_start;
+                    (*entry).Anonymous1.structType.NumOfStructMembers = prop.member_count;
+                    // Aliases countPropertyIndex in the union
+                    (*entry).Anonymous2.count = prop.count;
+                } else {
+                    (*entry).Anonymous1.nonStructType.InType = prop.in_type as u16;
+                    (*entry).Anonymous1.nonStructType.OutType = prop.out_type as u16;
+                    (*entry).Anonymous2.count = prop.count;
+                    (*entry).Anonymous3.length = prop.length;
+                }
 
                 // Names are written unaligned, which the read side mirrors
                 #[allow(clippy::cast_ptr_alignment)]
                 let name = buffer.cast::<u16>().add(name_offset as usize / 2);
-                for (i, unit) in spec
+                for (i, unit) in prop
                     .name
                     .encode_utf16()
                     .chain(std::iter::once(0))
@@ -888,7 +1001,7 @@ mod tests {
                 {
                     name.add(i).write_unaligned(unit);
                 }
-                name_offset += u32::try_from((spec.name.len() + 1) * 2).unwrap();
+                name_offset += u32::try_from((prop.name.len() + 1) * 2).unwrap();
             }
         }
 
@@ -924,6 +1037,74 @@ mod tests {
             guid,
             GUID::from_u128(0x56781234_abcd_4609_0102_030405060708)
         );
+    }
+
+    #[test]
+    fn struct_properties_parse_as_nested_trees() {
+        static NESTED_MEMBERS: [PropSpec; 1] =
+            [PropSpec::new("inner_x", TdhInType::InTypeUInt32, 4)];
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure("inner", &NESTED_MEMBERS),
+            PropSpec::new("y", TdhInType::InTypeUInt16, 2),
+        ];
+        static PROPS: [PropSpec; 3] = [
+            PropSpec::new("before", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure("s", &MEMBERS),
+            PropSpec::new("after", TdhInType::InTypeUInt32, 4),
+        ];
+        let schema = synthetic_schema(&PROPS);
+
+        let top = schema.properties();
+        // Structures are yielded as single top-level properties: their members
+        // must not leak into the top-level list
+        assert_eq!(
+            top.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["before", "s", "after"]
+        );
+
+        let PropertyInfo::Struct { members } = &top[1].info else {
+            panic!("'s' should parse as a structure");
+        };
+        assert_eq!(
+            members.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["x", "inner", "y"]
+        );
+        // Nested structures are trees, not flat lists
+        let PropertyInfo::Struct {
+            members: nested_members,
+        } = &members[1].info
+        else {
+            panic!("'inner' should parse as a nested structure");
+        };
+        assert_eq!(nested_members.len(), 1);
+        assert_eq!(nested_members[0].name, "inner_x");
+        assert!(matches!(nested_members[0].info, PropertyInfo::Value { .. }));
+    }
+
+    #[test]
+    fn struct_arrays_carry_their_element_count() {
+        // Layout of the .NET GCBulk events: a count property followed by an
+        // array of structures referencing it
+        static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt32, 4)];
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("Count", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure_array("Values", &MEMBERS, 0),
+        ];
+        let schema = synthetic_schema(&PROPS);
+
+        let top = schema.properties();
+        assert_eq!(top.len(), 2);
+        let PropertyInfo::StructArray {
+            members,
+            count: PropertyCount::Index(index),
+        } = &top[1].info
+        else {
+            panic!("'Values' should parse as a structure array");
+        };
+        assert_eq!(*index, 0);
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "v");
     }
 
     #[test]

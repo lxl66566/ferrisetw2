@@ -18,7 +18,10 @@ use windows::{
 
 use super::etw_types::*;
 use crate::{
-    native::{etw_types::event_record::EventRecord, tdh_types::Property},
+    native::{
+        etw_types::event_record::EventRecord,
+        tdh_types::{Property, PropertyCount, PropertyError, PropertyFlags, PropertyInfo},
+    },
     traits::*,
 };
 
@@ -212,63 +215,57 @@ impl Drop for TraceEventInfo {
 
 pub struct PropertyIterator<'info> {
     next_index: u32,
-    count: u32,
+    /// Number of top-level properties to yield: "top-level properties come
+    /// before all member properties in the array" (TRACE_EVENT_INFO docs),
+    /// members of structures are only reachable through PropertyInfo
+    top_level_count: u32,
+    /// Total number of entries in EventPropertyInfoArray
+    property_count: u32,
     te_info: &'info TraceEventInfo,
 }
 
 impl<'info> PropertyIterator<'info> {
     fn new(te_info: &'info TraceEventInfo) -> Self {
-        let count = te_info.as_raw().PropertyCount;
+        let raw = te_info.as_raw();
+        let property_count = raw.PropertyCount;
+        let top_level_count = if raw.TopLevelPropertyCount == 0 {
+            // Defensive: keep the legacy behavior of treating every property
+            // as top-level if TDH did not fill the top-level count
+            property_count
+        } else {
+            raw.TopLevelPropertyCount.min(property_count)
+        };
         Self {
             next_index: 0,
-            count,
+            top_level_count,
+            property_count,
             te_info,
         }
     }
-}
 
-impl Iterator for PropertyIterator<'_> {
-    type Item = Result<Property, crate::native::tdh_types::PropertyError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.next_index == self.count {
-            return None;
-        }
-
+    /// The EVENT_PROPERTY_INFO at the given index, if within bounds
+    fn property_at(&self, index: u32) -> Option<&Etw::EVENT_PROPERTY_INFO> {
         let properties_array = self.te_info.as_raw().EventPropertyInfoArray.as_ptr();
-        let cur_property_ptr = unsafe {
+        let property_ptr = unsafe {
             // Safety:
             //  * index being in the right bounds, this guarantees the resulting pointer lies in the
             //    same allocated object
             // (we assume there will not be more than 4 billion properties for an event)
-            properties_array.add(self.next_index as usize)
+            properties_array.add(index as usize)
         };
-        let curr_prop = unsafe {
-            // Safety:
-            //  * this pointer has been allocated by a Microsoft API
-            match cur_property_ptr.as_ref() {
-                None => {
-                    // This should not happen, as there is no reason the Microsoft API has put a
-                    // null pointer at an index below self.count Ideally, I
-                    // probably should return an `Err` here. But I prefer keeping a simple return
-                    // type, and stop the iteration here in case this (normally impossible error)
-                    // happens
-                    return None;
-                },
-                Some(r) => r,
-            }
-        };
+        // Safety: this pointer has been allocated by a Microsoft API
+        unsafe { property_ptr.as_ref() }
+    }
 
+    /// Name of a property entry, extracted from the TRACE_EVENT_INFO buffer
+    fn property_name(&self, property: &Etw::EVENT_PROPERTY_INFO) -> Option<String> {
         let te_info_data = std::ptr::from_ref(self.te_info.as_raw()).cast::<u8>();
-        let property_name_offset = curr_prop.NameOffset;
         let property_name_ptr = unsafe {
             // Safety: offset comes from a Microsoft API
-            te_info_data.add(property_name_offset as usize)
+            te_info_data.add(property.NameOffset as usize)
         };
         if property_name_ptr.is_null() {
             // This is really a safety net, there is no reason the offset nullifies the base pointer
-            // This is not supposed to happen, so a simple `None` (instead of a proper `Err`) will
-            // do
             return None;
         }
 
@@ -280,10 +277,88 @@ impl Iterator for PropertyIterator<'_> {
             //  * we will copy into a String before the buffer gets invalid
             U16CStr::from_ptr_str(property_name_ptr.cast::<u16>())
         };
-        let property_name = property_name.to_string_lossy();
+        Some(property_name.to_string_lossy())
+    }
 
+    /// Parses the property at `index`; a structure also pulls in its members,
+    /// recursively, from their own entries in EventPropertyInfoArray
+    fn parse_property(&self, index: u32) -> Option<Result<Property, PropertyError>> {
+        let curr_prop = self.property_at(index)?;
+        // This should not happen, as there is no reason the Microsoft API has put a
+        // null pointer at an index below the property count. Ideally, I
+        // probably should return an `Err` here. But I prefer keeping a simple return
+        // type, and stop the iteration here in case this (normally impossible error)
+        // happens
+        let property_name = self.property_name(curr_prop)?;
+
+        let flags = PropertyFlags::from(curr_prop.Flags);
+
+        if flags.contains(PropertyFlags::PROPERTY_STRUCT) {
+            // Safety: PropertyStruct is set, the union holds a structType
+            let struct_type = unsafe { curr_prop.Anonymous1.structType };
+            let members = match self
+                .parse_members(struct_type.StructStartIndex, struct_type.NumOfStructMembers)
+            {
+                None => return None,
+                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(members)) => members,
+            };
+            // The structure is an array of structures when its element count
+            // comes from another property, or is a literal greater than 1
+            let count = if flags.contains(PropertyFlags::PROPERTY_PARAM_COUNT) {
+                // Safety: PropertyParamCount is set, the union holds countPropertyIndex
+                Some(PropertyCount::Index(unsafe {
+                    curr_prop.Anonymous2.countPropertyIndex
+                }))
+            } else {
+                // Safety: PropertyParamCount is not set, the union holds the literal count
+                let count = unsafe { curr_prop.Anonymous2.count };
+                (count > 1).then_some(PropertyCount::Count(count))
+            };
+
+            Some(Ok(Property {
+                name: property_name,
+                info: match count {
+                    Some(count) => PropertyInfo::StructArray { members, count },
+                    None => PropertyInfo::Struct { members },
+                },
+            }))
+        } else {
+            Some(Property::new(property_name, curr_prop))
+        }
+    }
+
+    /// Parses the `num` member entries starting at `start` (the member region
+    /// of a structure). Trust but verify: the region is clamped to the
+    /// property array so bogus struct info cannot read out of bounds.
+    fn parse_members(&self, start: u16, num: u16) -> Option<Result<Vec<Property>, PropertyError>> {
+        let start = u32::from(start).min(self.property_count);
+        let end = start
+            .saturating_add(u32::from(num))
+            .min(self.property_count);
+        let mut members = Vec::with_capacity((end - start) as usize);
+        for index in start..end {
+            match self.parse_property(index) {
+                None => return None,
+                Some(Err(e)) => return Some(Err(e)),
+                Some(Ok(member)) => members.push(member),
+            }
+        }
+        Some(Ok(members))
+    }
+}
+
+impl Iterator for PropertyIterator<'_> {
+    type Item = Result<Property, PropertyError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_index >= self.top_level_count {
+            return None;
+        }
+
+        let result = self.parse_property(self.next_index);
         self.next_index += 1;
-        Some(Property::new(property_name, curr_prop))
+        result
     }
 }
 

@@ -54,6 +54,15 @@ impl Default for PropertyLength {
     }
 }
 
+/// A note on structures: TDH expresses a structure property through the
+/// `PropertyStruct` flag. Its members are identified by
+/// `structType.StructStartIndex` (index in `TRACE_EVENT_INFO.EventPropertyInfoArray`
+/// of the first member) and `structType.NumOfStructMembers` (contiguous entry
+/// count, possibly structures themselves). Top-level properties come before
+/// all member properties in the array, so the schema iterator yields
+/// top-level properties only: members are reachable only through
+/// [`PropertyInfo::Struct`] / [`PropertyInfo::StructArray`], never mistaken
+/// for top-level ones.
 #[derive(Debug, Clone)]
 pub enum PropertyInfo {
     Value {
@@ -68,12 +77,40 @@ pub enum PropertyInfo {
         /// TDH In type of the property
         in_type: TdhInType,
         /// TDH Out type of the property
-        // Only read by the (feature-gated) serializer
-        #[cfg_attr(not(feature = "serde"), allow(dead_code))]
+        // Not read yet: modeled for completeness, the array handlers select on
+        // the in type
+        #[allow(dead_code)]
         out_type: TdhOutType,
         /// The length of the property
         length: PropertyLength,
         /// Number of elements.
+        count: PropertyCount,
+    },
+    /// A structure: its members, in layout order.
+    ///
+    /// A structure occupies the concatenation of its members' bytes. Its
+    /// scalar members can be read through [`crate::parser::Parser::try_parse`]
+    /// (member names must be unambiguous at event level); the generic
+    /// `try_parse` of a whole structure is not supported.
+    Struct {
+        /// Members of the structure, possibly structures themselves
+        // Read by the parser's struct breakdown
+        #[allow(dead_code)]
+        members: Vec<Property>,
+    },
+    /// An array of structures: `count` elements, each laid out as `members`.
+    ///
+    /// `count` may reference the property holding the element count
+    /// ([`PropertyCount::Index`]), as manifest struct arrays commonly do
+    /// (e.g. the .NET `GCBulk*` events).
+    StructArray {
+        /// Members of one element, possibly structures themselves
+        // Read by the parser's struct breakdown
+        #[allow(dead_code)]
+        members: Vec<Property>,
+        /// Number of elements
+        // Read by the parser's element count resolution
+        #[allow(dead_code)]
         count: PropertyCount,
     },
 }
@@ -103,7 +140,12 @@ impl Property {
         let flags = PropertyFlags::from(property.Flags);
 
         if flags.contains(PropertyFlags::PROPERTY_STRUCT) {
-            Err(PropertyError::UnimplementedType("structure"))
+            // Structures are assembled by the schema iterator (see
+            // native::tdh::PropertyIterator), which has access to the member
+            // entries that follow: a single EVENT_PROPERTY_INFO is not enough
+            Err(PropertyError::UnimplementedType(
+                "structure (needs the whole EventPropertyInfoArray)",
+            ))
         } else if flags.contains(PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA) {
             Err(PropertyError::UnimplementedType("has custom schema"))
         } else {
