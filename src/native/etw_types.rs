@@ -81,6 +81,60 @@ pub(crate) enum ControlValues {
     Update = 2,
 }
 
+/// The kernel logger's group mask, payload of the `TraceSystemTraceEnableFlagsInfo` info class
+///
+/// `evntrace.h` documents that info class as taking a `PERFINFO_GROUPMASK`, but that struct is
+/// not part of the public SDK (it lives in the kernel's `ntwmi.h`). Layout mirrored from
+/// [krabsetw](https://github.com/microsoft/krabsetw/blob/master/krabs/krabs/perfinfo_groupmask.hpp):
+/// an array of eight `ULONG` masks.
+///
+/// A group id (see [`crate::trace::ExtendedKernelGroup`]) encodes the index of its target mask
+/// in its top 3 bits, and the groups to enable within that mask in the remaining 29 bits.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PerfinfoGroupmask {
+    masks: [u32; Self::MASK_COUNT],
+}
+
+impl PerfinfoGroupmask {
+    const MASK_COUNT: usize = 8;
+    /// Top 3 bits of a group id: the index of the mask it applies to
+    const MASK_INDEX: u32 = 0xe000_0000;
+
+    /// Merges a raw group id into the mask
+    pub(crate) fn set_group(&mut self, group: u32) {
+        let index = ((group & Self::MASK_INDEX) >> 29) as usize;
+        self.masks[index] |= group & !Self::MASK_INDEX;
+    }
+
+    /// Merges the given extended kernel groups into the mask
+    pub(crate) fn set_groups(&mut self, groups: &[crate::trace::ExtendedKernelGroup]) {
+        for group in groups {
+            self.set_group(group.group_id());
+        }
+    }
+
+    /// The eight masks, for tests asserting on the encoding
+    #[cfg(test)]
+    pub(crate) fn masks(&self) -> &[u32; Self::MASK_COUNT] {
+        &self.masks
+    }
+
+    /// Byte view of the struct, as expected by the ETW APIs
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the struct is #[repr(C)] and only holds integers, so there is no padding,
+        // and any bit pattern is a valid value
+        unsafe { std::slice::from_raw_parts(std::ptr::from_ref(self).cast(), size_of::<Self>()) }
+    }
+
+    /// Rebuilds the struct from the byte view filled by a query
+    pub(crate) fn from_bytes(buf: &[u8; size_of::<PerfinfoGroupmask>()]) -> Self {
+        // SAFETY: `buf` holds exactly size_of::<Self>() initialized bytes, and the struct is
+        // #[repr(C)] with only integer fields (no padding to read, any bit pattern is valid)
+        unsafe { std::ptr::read_unaligned(buf.as_ptr().cast()) }
+    }
+}
+
 bitflags! {
     /// Logging Mode constants that applies to a general trace
     ///

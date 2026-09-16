@@ -18,7 +18,8 @@ use crate::{
         etw_types::{EventTraceProperties, SubscriptionSource},
         evntrace::{
             ControlHandle, TraceHandle, capture_provider_state, close_trace, control_trace,
-            control_trace_by_name, enable_provider, open_trace, process_trace, start_trace,
+            control_trace_by_name, enable_provider, enable_stack_tracing, open_trace,
+            process_trace, set_extended_kernel_groups, start_trace,
         },
         version_helper,
     },
@@ -86,6 +87,268 @@ impl Default for TraceProperties {
                 | LoggingMode::EVENT_TRACE_NO_PER_PROCESSOR_BUFFERING,
             clock_type: ClockType::default(),
         }
+    }
+}
+
+// Kernel events of the PerfInfo provider (syscalls, sampled profile, ...) have well-known
+// numeric types ("hook ids"). They are not part of the public SDK: the values below are the
+// ones behind xperf's `-stackwalk` names, as also used by krabsetw.
+// Mirrors kernel_providers' (private) PERF_INFO_GUID
+const PERF_INFO_GUID: GUID = GUID::from_values(0xce1d_bfb4, 0x137e, 0x4da6, [
+    0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc,
+]);
+
+/// A kernel event to collect call stacks for
+///
+/// Kernel loggers cannot use the per-provider stack trace flag of user traces
+/// (`EVENT_ENABLE_PROPERTY_STACK_TRACE`): stacks are enabled per event, through the
+/// `TraceStackTracingInfo` info class, whose payload is an array of Windows'
+/// `CLASSIC_EVENT_ID` (an event GUID + type pair).
+///
+/// Valid GUIDs and types are the classic kernel event identifiers, the same values xperf's
+/// [`-stackwalk`](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/stackwalk)
+/// option names. For the most common use case, syscall stack collection, ready-made
+/// constants exist: [`StackTracingEvent::SYSCALL_ENTER`] and [`StackTracingEvent::SYSCALL_EXIT`].
+///
+/// # Example
+/// ```
+/// # use ferrisetw::trace::{KernelTrace, StackTracingEvent};
+/// let builder = KernelTrace::new().set_stack_tracing(vec![StackTracingEvent::SYSCALL_ENTER]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct StackTracingEvent {
+    /// GUID of the kernel provider the event belongs to
+    pub event_guid: GUID,
+    /// Type (a.k.a. hook id) of the event within its provider
+    pub event_type: u8,
+}
+
+impl StackTracingEvent {
+    /// Syscall entry (`xperf -stackwalk SyscallEnter`)
+    ///
+    /// Syscall events come from the
+    /// [`SYSTEM_CALL_PROVIDER`](crate::provider::kernel_providers::SYSTEM_CALL_PROVIDER), which
+    /// must also be enabled for the trace to see them.
+    pub const SYSCALL_ENTER: Self = Self::new(PERF_INFO_GUID, 46);
+    /// Syscall exit (`xperf -stackwalk SyscallExit`)
+    ///
+    /// See [`StackTracingEvent::SYSCALL_ENTER`] about enabling the syscall events themselves.
+    pub const SYSCALL_EXIT: Self = Self::new(PERF_INFO_GUID, 47);
+
+    /// Create a stack tracing event from its provider GUID and event type
+    #[must_use]
+    pub const fn new(event_guid: GUID, event_type: u8) -> Self {
+        Self {
+            event_guid,
+            event_type,
+        }
+    }
+}
+
+/// A fine-grained kernel event group, enabled through the extended kernel group mask
+///
+/// [The `EnableFlags` of `EVENT_TRACE_PROPERTIES`](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_properties)
+/// can only express the 32 classic kernel groups (those of
+/// [`crate::provider::kernel_providers`]). Finer-grained groups are enabled on a running
+/// session through the `TraceSystemTraceEnableFlagsInfo` info class, which
+/// [`KernelTrace::set_extended_groups`](TraceBuilder::set_extended_groups) does when
+/// starting the trace. Requires Windows 8 or later.
+///
+/// Each variant is a `PERF_*` group id as named in
+/// [krabsetw](https://github.com/microsoft/krabsetw/blob/master/krabs/krabs/perfinfo_groupmask.hpp)
+/// (the `PERF_*` names come from the kernel's `ntwmi.h`): the top 3 bits select one of the
+/// eight masks of the group mask, the low 29 bits the groups within it. Groups that are mere
+/// aliases of a classic `EnableFlags` bit are not duplicated here.
+///
+/// # Example
+/// ```
+/// # use ferrisetw::trace::{ExtendedKernelGroup, KernelTrace};
+/// let builder = KernelTrace::new()
+///     .set_extended_groups(vec![ExtendedKernelGroup::Memory, ExtendedKernelGroup::Pool]);
+/// ```
+#[non_exhaustive]
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtendedKernelGroup {
+    // Masks[1]
+    /// `PERF_MEMORY`
+    Memory = 0x2000_0001,
+    /// `PERF_FOOTPRINT`
+    Footprint = 0x2000_0008,
+    /// `PERF_REFSET`
+    RefSet = 0x2000_0020,
+    /// `PERF_POOL`
+    Pool = 0x2000_0040,
+    /// `PERF_POOLTRACE`
+    PoolTrace = 0x2000_0041,
+    /// `PERF_COMPACT_CSWITCH`
+    CompactContextSwitch = 0x2000_0100,
+    /// `PERF_PMC_PROFILE`
+    PmcProfile = 0x2000_0400,
+    /// `PERF_PROCESS_INSWAP`
+    ProcessInswap = 0x2000_0800,
+    /// `PERF_AFFINITY`
+    Affinity = 0x2000_1000,
+    /// `PERF_PRIORITY`
+    Priority = 0x2000_2000,
+    /// `PERF_SPINLOCK`
+    Spinlock = 0x2001_0000,
+    /// `PERF_SYNC_OBJECTS`
+    SyncObjects = 0x2002_0000,
+    /// `PERF_DPC_QUEUE`
+    DpcQueue = 0x2004_0000,
+    /// `PERF_MEMINFO`
+    MemInfo = 0x2008_0000,
+    /// `PERF_CONTMEM_GEN`
+    ContiguousMemoryGeneration = 0x2010_0000,
+    /// `PERF_SPINLOCK_CNTRS`
+    SpinlockCounters = 0x2020_0000,
+    /// `PERF_SPININSTR`
+    SpinlockInstructions = 0x2021_0000,
+    /// `PERF_SESSION` (also known as `PERF_PFSECTION`, same value)
+    Session = 0x2040_0000,
+    /// `PERF_MEMINFO_WS`
+    MemInfoWorkingSet = 0x2080_0000,
+    /// `PERF_KERNEL_QUEUE`
+    KernelQueue = 0x2100_0000,
+    /// `PERF_INTERRUPT_STEER`
+    InterruptSteering = 0x2200_0000,
+    /// `PERF_SHOULD_YIELD`
+    ShouldYield = 0x2400_0000,
+    /// `PERF_WS`
+    WorkingSet = 0x2800_0000,
+    // Masks[2]
+    /// `PERF_ANTI_STARVATION`
+    AntiStarvation = 0x4000_0001,
+    /// `PERF_PROCESS_FREEZE`
+    ProcessFreeze = 0x4000_0002,
+    /// `PERF_PFN_LIST`
+    PfnList = 0x4000_0004,
+    /// `PERF_WS_DETAIL`
+    WorkingSetDetail = 0x4000_0008,
+    /// `PERF_WS_ENTRY`
+    WorkingSetEntry = 0x4000_0010,
+    /// `PERF_HEAP`
+    Heap = 0x4000_0020,
+    /// `PERF_UMS`
+    Ums = 0x4000_0080,
+    /// `PERF_BACKTRACE`
+    Backtrace = 0x4000_0100,
+    /// `PERF_VULCAN`
+    Vulcan = 0x4000_0200,
+    /// `PERF_OBJECTS`
+    Objects = 0x4000_0400,
+    /// `PERF_EVENTS`
+    Events = 0x4000_0800,
+    /// `PERF_FULLTRACE`
+    FullTrace = 0x4000_1000,
+    /// `PERF_DFSS`
+    Dfss = 0x4000_2000,
+    /// `PERF_PREFETCH`
+    Prefetch = 0x4000_4000,
+    /// `PERF_PROCESSOR_IDLE`
+    ProcessorIdle = 0x4000_8000,
+    /// `PERF_CPU_CONFIG`
+    CpuConfig = 0x4001_0000,
+    /// `PERF_TIMER`
+    Timer = 0x4002_0000,
+    /// `PERF_CLOCK_INTERRUPT`
+    ClockInterrupt = 0x4004_0000,
+    /// `PERF_LOAD_BALANCER`
+    LoadBalancer = 0x4008_0000,
+    /// `PERF_CLOCK_TIMER`
+    ClockTimer = 0x4010_0000,
+    /// `PERF_IDLE_SELECTION`
+    IdleSelection = 0x4020_0000,
+    /// `PERF_IPI`
+    Ipi = 0x4040_0000,
+    /// `PERF_IO_TIMER`
+    IoTimer = 0x4080_0000,
+    /// `PERF_REG_HIVE`
+    RegistryHive = 0x4100_0000,
+    /// `PERF_REG_NOTIF`
+    RegistryNotification = 0x4200_0000,
+    /// `PERF_PPM_EXIT_LATENCY`
+    PpmExitLatency = 0x4400_0000,
+    /// `PERF_WORKER_THREAD`
+    WorkerThread = 0x4800_0000,
+    // Masks[4]
+    /// `PERF_OPTICAL_IO`
+    OpticalIo = 0x8000_0001,
+    /// `PERF_OPTICAL_IO_INIT`
+    OpticalIoInit = 0x8000_0002,
+    /// `PERF_DLL_INFO`
+    DllInfo = 0x8000_0008,
+    /// `PERF_DLL_FLUSH_WS`
+    DllFlushWorkingSet = 0x8000_0010,
+    /// `PERF_OB_HANDLE` (object manager handles)
+    ObHandle = 0x8000_0040,
+    /// `PERF_OB_OBJECT` (object manager objects)
+    ObObject = 0x8000_0080,
+    /// `PERF_WAKE_DROP`
+    WakeDrop = 0x8000_0200,
+    /// `PERF_WAKE_EVENT`
+    WakeEvent = 0x8000_0400,
+    /// `PERF_DEBUGGER`
+    Debugger = 0x8000_0800,
+    /// `PERF_PROC_ATTACH`
+    ProcessAttach = 0x8000_1000,
+    /// `PERF_WAKE_COUNTER`
+    WakeCounter = 0x8000_2000,
+    /// `PERF_POWER`
+    Power = 0x8000_8000,
+    /// `PERF_SOFT_TRIM`
+    SoftTrim = 0x8001_0000,
+    /// `PERF_CC` (cache manager)
+    Cc = 0x8002_0000,
+    /// `PERF_FLT_IO_INIT` (filter manager)
+    FilteredIoInit = 0x8008_0000,
+    /// `PERF_FLT_IO`
+    FilteredIo = 0x8010_0000,
+    /// `PERF_FLT_FASTIO`
+    FilteredFastIo = 0x8020_0000,
+    /// `PERF_FLT_IO_FAILURE`
+    FilteredIoFailure = 0x8040_0000,
+    /// `PERF_HV_PROFILE` (hypervisor)
+    HvProfile = 0x8080_0000,
+    /// `PERF_WDF_DPC` (driver framework)
+    WdfDpc = 0x8100_0000,
+    /// `PERF_WDF_INTERRUPT`
+    WdfInterrupt = 0x8200_0000,
+    /// `PERF_CACHE_FLUSH`
+    CacheFlush = 0x8400_0000,
+    // Masks[5]
+    /// `PERF_HIBER_RUNDOWN`
+    HibernateRundown = 0xa000_0001,
+    // Masks[6]
+    /// `PERF_SYSCFG_SYSTEM` (system configuration rundown)
+    SysCfgSystem = 0xc000_0001,
+    /// `PERF_SYSCFG_GRAPHICS`
+    SysCfgGraphics = 0xc000_0002,
+    /// `PERF_SYSCFG_STORAGE`
+    SysCfgStorage = 0xc000_0004,
+    /// `PERF_SYSCFG_NETWORK`
+    SysCfgNetwork = 0xc000_0008,
+    /// `PERF_SYSCFG_SERVICES`
+    SysCfgServices = 0xc000_0010,
+    /// `PERF_SYSCFG_PNP`
+    SysCfgPnp = 0xc000_0020,
+    /// `PERF_SYSCFG_OPTICAL`
+    SysCfgOptical = 0xc000_0040,
+    /// `PERF_SYSCFG_ALL`: all system configuration groups
+    SysCfgAll = 0xdfff_ffff,
+    // Masks[7] - control flags, they change system behavior
+    /// `PERF_CLUSTER_OFF`
+    ClusterOff = 0xe000_0001,
+    /// `PERF_MEMORY_CONTROL`
+    MemoryControl = 0xe000_0002,
+}
+
+impl ExtendedKernelGroup {
+    /// The raw `PERF_*` group id, as consumed by the extended group mask
+    #[must_use]
+    pub const fn group_id(self) -> u32 {
+        self as u32
     }
 }
 
@@ -159,8 +422,9 @@ impl RealTimeTraceTrait for UserTrace {
     }
 }
 
-// TODO: Implement enable_provider function for providers that require call to TraceSetInformation
-// with extended PERFINFO_GROUPMASK
+// Kernel providers that need the extended PERFINFO_GROUPMASK (see
+// `ExtendedKernelGroup`) are enabled through `TraceBuilder::set_extended_groups` when the
+// trace is started
 impl TraceTrait for KernelTrace {
     fn trace_handle(&self) -> TraceHandle {
         self.trace_handle
@@ -270,6 +534,11 @@ pub struct TraceBuilder<T: RealTimeTraceTrait> {
     properties: TraceProperties,
     rt_callback_data: RealTimeCallbackData,
     stop_if_exist: bool,
+    // Kernel-only settings (see the `TraceBuilder<KernelTrace>` impl block). They live on the
+    // generic builder because both `new()` build one directly, but stay unreachable for user
+    // traces at compile time
+    stack_tracing_events: Vec<StackTracingEvent>,
+    extended_kernel_groups: Vec<ExtendedKernelGroup>,
     trace_kind: PhantomData<T>,
 }
 
@@ -289,6 +558,8 @@ impl UserTrace {
             rt_callback_data: RealTimeCallbackData::new(),
             properties: TraceProperties::default(),
             stop_if_exist: true,
+            stack_tracing_events: Vec::new(),
+            extended_kernel_groups: Vec::new(),
             trace_kind: PhantomData,
         }
     }
@@ -344,6 +615,8 @@ impl KernelTrace {
             rt_callback_data: RealTimeCallbackData::new(),
             properties: TraceProperties::default(),
             stop_if_exist: true,
+            stack_tracing_events: Vec::new(),
+            extended_kernel_groups: Vec::new(),
             trace_kind: PhantomData,
         };
         // Not all names are valid. Let's use the setter to check them for us
@@ -614,8 +887,13 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             flags,
         )?;
 
-        // TODO: For kernel traces, implement enable_provider function for providers that require
-        // call to TraceSetInformation with extended PERFINFO_GROUPMASK
+        // Kernel-only TraceSetInformation configuration, applied between StartTraceW and
+        // OpenTraceW (the control handle is valid as soon as the session is started, and the
+        // settings must be in place before events start flowing)
+        if T::TRACE_KIND == private::TraceKind::Kernel {
+            enable_stack_tracing(control_handle, &self.stack_tracing_events)?;
+            set_extended_kernel_groups(control_handle, &self.extended_kernel_groups)?;
+        }
 
         if T::TRACE_KIND == private::TraceKind::User {
             for prov in self.rt_callback_data.providers() {
@@ -732,6 +1010,54 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     }
 }
 
+// Settings that only make sense for kernel traces. A dedicated impl block (rather than methods
+// on the generic builder) makes them impossible to set on a `UserTrace` builder at compile time.
+impl TraceBuilder<KernelTrace> {
+    /// Collect call stacks for these kernel events
+    ///
+    /// This is the kernel-trace counterpart of user traces'
+    /// [`EVENT_ENABLE_PROPERTY_STACK_TRACE`](crate::provider::TraceFlags::EVENT_ENABLE_PROPERTY_STACK_TRACE):
+    /// kernel loggers ignore that flag, and stacks are instead enabled per event through the
+    /// `TraceStackTracingInfo` info class. Per the Windows SDK, the given list replaces any
+    /// previous one: events absent from it will not carry stacks.
+    ///
+    /// The events must also be enabled themselves (e.g. syscall stacks need the
+    /// [`SYSTEM_CALL_PROVIDER`](crate::provider::kernel_providers::SYSTEM_CALL_PROVIDER)),
+    /// and stack collection requires the `SeSystemProfilePrivilege` privilege on the process.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ferrisetw::provider::{Provider, kernel_providers};
+    /// # use ferrisetw::trace::{KernelTrace, StackTracingEvent};
+    /// let syscall_provider = Provider::kernel(&kernel_providers::SYSTEM_CALL_PROVIDER).build();
+    /// let trace = KernelTrace::new()
+    ///     .enable(syscall_provider)
+    ///     .set_stack_tracing(vec![
+    ///         StackTracingEvent::SYSCALL_ENTER,
+    ///         StackTracingEvent::SYSCALL_EXIT,
+    ///     ])
+    ///     .start(); // starting a kernel trace requires administrator privileges
+    /// ```
+    #[must_use]
+    pub fn set_stack_tracing(mut self, events: Vec<StackTracingEvent>) -> Self {
+        self.stack_tracing_events = events;
+        self
+    }
+
+    /// Enable these fine-grained kernel event groups (see [`ExtendedKernelGroup`])
+    ///
+    /// Unlike the classic kernel groups of
+    /// [`kernel_providers`](crate::provider::kernel_providers), these cannot be set through
+    /// `EVENT_TRACE_PROPERTIES::EnableFlags`: they are applied to the session's extended group
+    /// mask when the trace is started, on top of the groups already enabled. Requires
+    /// Windows 8 or later.
+    #[must_use]
+    pub fn set_extended_groups(mut self, groups: Vec<ExtendedKernelGroup>) -> Self {
+        self.extended_kernel_groups = groups;
+        self
+    }
+}
+
 impl FileTrace {
     /// Create a trace that will read events from a file
     #[allow(clippy::new_ret_no_self)]
@@ -845,6 +1171,9 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{
+        native::etw_types::PerfinfoGroupmask, provider::kernel_providers::SYSTEM_CALL_PROVIDER,
+    };
 
     #[test]
     fn test_enable_multiple_providers() {
@@ -854,5 +1183,67 @@ mod test {
         let trace_builder = UserTrace::new().enable(prov).enable(prov1);
 
         assert_eq!(trace_builder.rt_callback_data.providers().len(), 2);
+    }
+
+    #[test]
+    fn syscall_stack_tracing_events_match_the_perfinfo_provider() {
+        // PERF_INFO_GUID must not drift from kernel_providers' definition
+        assert_eq!(
+            StackTracingEvent::SYSCALL_ENTER.event_guid,
+            SYSTEM_CALL_PROVIDER.guid
+        );
+        assert_eq!(
+            StackTracingEvent::SYSCALL_EXIT.event_guid,
+            SYSTEM_CALL_PROVIDER.guid
+        );
+        assert_eq!(StackTracingEvent::SYSCALL_ENTER.event_type, 46);
+        assert_eq!(StackTracingEvent::SYSCALL_EXIT.event_type, 47);
+    }
+
+    #[test]
+    fn extended_kernel_groups_encode_into_the_groupmask() {
+        let mut groupmask = PerfinfoGroupmask::default();
+        groupmask.set_groups(&[
+            ExtendedKernelGroup::Memory,
+            ExtendedKernelGroup::PoolTrace,
+            ExtendedKernelGroup::Heap,
+            ExtendedKernelGroup::ObHandle,
+            ExtendedKernelGroup::SysCfgAll,
+            ExtendedKernelGroup::MemoryControl,
+        ]);
+
+        assert_eq!(groupmask.masks(), &[
+            0,
+            0x41,
+            0x20,
+            0,
+            0x40,
+            0,
+            0x1fff_ffff,
+            2
+        ]);
+    }
+
+    #[test]
+    fn overlapping_and_empty_extended_groups_merge_correctly() {
+        // PoolTrace is Pool plus another group: applying both must not double anything
+        let mut groupmask = PerfinfoGroupmask::default();
+        groupmask.set_groups(&[ExtendedKernelGroup::PoolTrace, ExtendedKernelGroup::Pool]);
+        assert_eq!(groupmask.masks()[1], 0x41);
+
+        groupmask.set_groups(&[]);
+        assert_eq!(groupmask.masks()[1], 0x41);
+    }
+
+    #[test]
+    fn kernel_trace_builder_stores_kernel_only_settings() {
+        let builder = KernelTrace::new()
+            .set_stack_tracing(vec![StackTracingEvent::SYSCALL_ENTER])
+            .set_extended_groups(vec![ExtendedKernelGroup::Pool]);
+
+        assert_eq!(builder.stack_tracing_events, [
+            StackTracingEvent::SYSCALL_ENTER
+        ]);
+        assert_eq!(builder.extended_kernel_groups, [ExtendedKernelGroup::Pool]);
     }
 }

@@ -33,7 +33,10 @@ use super::etw_types::*;
 use crate::{
     native::etw_types::event_record::EventRecord,
     provider::{Provider, TraceFlags, event_filter::EventFilterDescriptor},
-    trace::{RealTimeTraceTrait, TraceProperties, callback_data::CallbackData},
+    trace::{
+        ExtendedKernelGroup, RealTimeTraceTrait, StackTracingEvent, TraceProperties,
+        callback_data::CallbackData,
+    },
 };
 
 pub type TraceHandle = Etw::PROCESSTRACE_HANDLE;
@@ -574,6 +577,99 @@ pub(crate) fn query_array_info(
         std::io::ErrorKind::InvalidData,
         "the ETW API kept asking for a larger query buffer",
     )))
+}
+
+/// Calls `TraceSetInformation` on an active session
+pub(crate) fn set_info(
+    session: ControlHandle,
+    class: TraceInformation,
+    buf: &[u8],
+) -> EvntraceNativeResult<()> {
+    match filter_invalid_control_handle(session) {
+        None => Err(EvntraceNativeError::InvalidHandle),
+        Some(handle) => {
+            // Set buffers hold small fixed-size structs: cannot overflow a u32
+            #[allow(clippy::cast_possible_truncation)]
+            let buf_len = buf.len() as u32;
+            unsafe {
+                // Safety:
+                //  * the control handle is valid (checked above)
+                //  * the buffer is valid for reads over `buf_len` bytes
+                Etw::TraceSetInformation(
+                    handle,
+                    TRACE_QUERY_INFO_CLASS(class as i32),
+                    buf.as_ptr().cast(),
+                    buf_len,
+                )
+            }
+            .ok()
+            .map_err(|err| win32_error(&err))
+        },
+    }
+}
+
+/// Enables stack trace collection for the given kernel events
+///
+/// Kernel loggers ignore the `EVENT_ENABLE_PROPERTY_STACK_TRACE` flag of `EnableTraceEx2`:
+/// `TraceSetInformation` with the `TraceStackTracingInfo` info class is the only way to get
+/// call stacks out of them. Per the Windows SDK, the given list replaces any previous one,
+/// so events absent from it lose their stacks.
+pub(crate) fn enable_stack_tracing(
+    control_handle: ControlHandle,
+    events: &[StackTracingEvent],
+) -> EvntraceNativeResult<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let event_ids: Vec<Etw::CLASSIC_EVENT_ID> = events
+        .iter()
+        .map(|event| Etw::CLASSIC_EVENT_ID {
+            EventGuid: event.event_guid,
+            Type: event.event_type,
+            Reserved: [0; 7],
+        })
+        .collect();
+    // SAFETY: CLASSIC_EVENT_ID is #[repr(C)] and all-integer (no padding), so this is a
+    // valid byte view of the array, valid for reads as long as `event_ids` is alive
+    let buf = unsafe {
+        std::slice::from_raw_parts(event_ids.as_ptr().cast::<u8>(), size_of_val(&event_ids))
+    };
+
+    set_info(control_handle, TraceInformation::TraceStackTracingInfo, buf)
+}
+
+/// Enables the given extended kernel event groups, on top of the session's current ones
+///
+/// These groups cannot be expressed in `EVENT_TRACE_PROPERTIES::EnableFlags` (they do not fit
+/// the classic 32-bit flag space). The call replaces the session's whole group mask, so the
+/// current mask is first queried and merged into: this preserves the classic groups already
+/// enabled through `EnableFlags` (same read-modify-write as krabsetw).
+pub(crate) fn set_extended_kernel_groups(
+    control_handle: ControlHandle,
+    groups: &[ExtendedKernelGroup],
+) -> EvntraceNativeResult<()> {
+    if groups.is_empty() {
+        return Ok(());
+    }
+
+    let mut buf = [0u8; size_of::<PerfinfoGroupmask>()];
+    let (current, _) = trace_query_raw(
+        control_handle,
+        TraceInformation::TraceSystemTraceEnableFlagsInfo,
+        &mut buf,
+    );
+    // An error here means the session (or OS, these need Windows 8+) does not support the
+    // extended group mask: surface it rather than silently skipping the groups
+    current.map_err(|err| win32_error(&err))?;
+    let mut groupmask = PerfinfoGroupmask::from_bytes(&buf);
+    groupmask.set_groups(groups);
+
+    set_info(
+        control_handle,
+        TraceInformation::TraceSystemTraceEnableFlagsInfo,
+        groupmask.as_bytes(),
+    )
 }
 
 #[cfg(test)]
