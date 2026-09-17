@@ -285,12 +285,28 @@ impl<'info> PropertyIterator<'info> {
     ///
     /// Returns `None` when the iteration must stop (unreadable entry): this
     /// truncates the property list rather than failing it, as there is no way
-    /// to know where the remaining properties would sit in the buffer anyway
+    /// to know where the remaining properties would sit in the buffer anyway.
+    /// The truncation is logged (warn level): a malformed schema silently
+    /// dropping properties would be near-impossible to diagnose otherwise
     fn parse_property(&self, index: u32) -> Option<Property> {
-        let curr_prop = self.property_at(index)?;
+        let Some(curr_prop) = self.property_at(index) else {
+            log::warn!(
+                "ETW schema: property index {index}/{} lies outside the property array, dropping \
+                 it and every remaining property",
+                self.property_count
+            );
+            return None;
+        };
         // This should not happen, as there is no reason the Microsoft API has put a
         // null pointer at an index below the property count.
-        let property_name = self.property_name(curr_prop)?;
+        let Some(property_name) = self.property_name(curr_prop) else {
+            log::warn!(
+                "ETW schema: property {index}/{} has an unreadable name, dropping it and every \
+                 remaining property",
+                self.property_count
+            );
+            return None;
+        };
 
         let flags = PropertyFlags::from(curr_prop.Flags);
 
