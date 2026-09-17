@@ -491,6 +491,14 @@ pub trait RealTimeTraceTrait: TraceTrait + PrivateRealTimeTraceTrait {
     /// This calls `ControlTraceW` with `EVENT_TRACE_CONTROL_QUERY`, and can be issued at any
     /// time while the session is running, as often as needed.
     ///
+    /// This takes `&mut self` because the query is an in/out call over the session's own
+    /// properties buffer (Windows writes the statistics fields into it): the exclusive
+    /// borrow is what rules out concurrent queries racing on that buffer. A `&self`
+    /// signature would not enable polling from another thread anyway — `UserTrace` and
+    /// `KernelTrace` are deliberately `!Send + !Sync` (their properties embed raw handles),
+    /// so sharing a running trace across threads requires the caller's own synchronization
+    /// around the whole trace, whatever the signature.
+    ///
     /// Traces obtained through [`TraceBuilder::open_existing`] do not own their session and
     /// hold no control handle: querying them returns an error.
     ///
