@@ -3,11 +3,7 @@
 //! This module contains the means needed to interact with the Schema of an ETW event
 use once_cell::sync::OnceCell;
 
-use crate::native::{
-    etw_types::DecodingSource,
-    tdh::TraceEventInfo,
-    tdh_types::{Property, PropertyError},
-};
+use crate::native::{etw_types::DecodingSource, tdh::TraceEventInfo, tdh_types::Property};
 
 /// A schema suitable for parsing a given kind of event.
 ///
@@ -17,7 +13,7 @@ use crate::native::{
 /// with a few info parsed (and cached) out of it
 pub struct Schema {
     te_info: TraceEventInfo,
-    cached_properties: OnceCell<Result<Vec<Property>, PropertyError>>,
+    cached_properties: OnceCell<Vec<Property>>,
     /// Extracting a name requires a UTF-16 -> String conversion of the raw
     /// `TRACE_EVENT_INFO` buffer; these values are constant per schema, and
     /// the serde path requests them for every serialized event
@@ -123,30 +119,15 @@ impl Schema {
 
     /// Parses the list of properties of the wrapped `TRACE_EVENT_INFO`
     ///
-    /// This is parsed on first call, and cached for later use
+    /// Parsed on first call, then cached. Properties the crate cannot decode
+    /// (e.g. `PROPERTY_HAS_CUSTOM_SCHEMA`) stay in the list, marked as
+    /// [`crate::native::tdh_types::PropertyInfo::Unsupported`]: they occupy
+    /// their bytes in the event buffer, so leaving them out would shift the
+    /// offsets of every later property
     pub(crate) fn properties(&self) -> &[Property] {
-        match self.try_properties() {
-            Err(PropertyError::UnimplementedType(_)) => {
-                log::error!("Unable to list properties: a type is not implemented");
-                &[]
-            },
-            Ok(p) => p,
-        }
-    }
-
-    pub(crate) fn try_properties(&self) -> Result<&[Property], PropertyError> {
-        let cache = self.cached_properties.get_or_init(|| {
-            let mut cache = Vec::new();
-            for property in self.te_info.properties() {
-                cache.push(property?);
-            }
-            Ok(cache)
-        });
-
-        match cache {
-            Err(e) => Err(e.clone()),
-            Ok(cache) => Ok(cache.as_slice()),
-        }
+        self.cached_properties
+            .get_or_init(|| self.te_info.properties().collect())
+            .as_slice()
     }
 }
 

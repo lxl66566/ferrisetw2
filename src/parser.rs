@@ -306,6 +306,14 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 }
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
+            // A property this crate cannot decode still occupies its bytes: a
+            // schema-declared length keeps the walk local, otherwise defer to
+            // TDH (its size computation does not depend on our decoding
+            // support)
+            PropertyInfo::Unsupported { length } => match length {
+                PropertyLength::Length(l) if l > 0 => Ok(usize::from(l)),
+                _ => Ok(tdh::property_size(self.record, &property.name)? as usize),
+            },
         }
     }
 
@@ -656,7 +664,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'s
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -687,7 +696,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, GUID> for Parser<'sch
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -717,7 +727,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, IpAddr> for Parser<'s
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -739,7 +750,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, bool> for Parser<'sch
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -775,7 +787,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, TdhSocketAddress>
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -795,7 +808,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, FileTime> for Parser<
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -817,7 +831,8 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, SystemTime>
             },
             PropertyInfo::Array { .. }
             | PropertyInfo::Struct { .. }
-            | PropertyInfo::StructArray { .. } => Err(ParserError::InvalidType),
+            | PropertyInfo::StructArray { .. }
+            | PropertyInfo::Unsupported { .. } => Err(ParserError::InvalidType),
         }
     }
 }
@@ -940,6 +955,15 @@ pub(crate) mod test_support {
         pub(crate) const fn with_out_type(mut self, out_type: TdhOutType) -> Self {
             self.out_type = out_type;
             self
+        }
+
+        /// A property the crate cannot decode (`PROPERTY_HAS_CUSTOM_SCHEMA`),
+        /// of the given fixed length
+        pub(crate) const fn custom_schema(name: &'static str, length: u16) -> Self {
+            Self {
+                flags: PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA.bits(),
+                ..Self::new(name, TdhInType::InTypeNull, length)
+            }
         }
 
         /// A structure property with the given members
@@ -1261,6 +1285,42 @@ mod tests {
         assert!(matches!(
             parser.property_bytes_at(3),
             Err(ParserError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn custom_schema_property_keeps_the_rest_locatable() {
+        // A property the crate cannot decode used to discard the whole
+        // property list: it must stay in place (it occupies its bytes) so
+        // the surrounding properties keep their buffer offsets
+        let props = [
+            PropSpec::new("before", TdhInType::InTypeUInt32, 4),
+            PropSpec::custom_schema("custom", 8),
+            PropSpec::new("after", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut user_data = 1u32.to_ne_bytes().to_vec();
+        user_data.resize(12, 0xaa); // the opaque custom-schema payload
+        user_data.extend_from_slice(&2u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&props);
+
+        let top = schema.properties();
+        assert_eq!(
+            top.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["before", "custom", "after"]
+        );
+        assert!(matches!(&top[1].info, PropertyInfo::Unsupported {
+            length: PropertyLength::Length(8),
+        }));
+
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<u32>("before").unwrap(), 1);
+        // The walk crosses the 8 custom-schema bytes to reach "after"
+        assert_eq!(parser.try_parse::<u32>("after").unwrap(), 2);
+        // The unsupported property itself does not decode
+        assert!(matches!(
+            parser.try_parse::<u32>("custom"),
+            Err(ParserError::InvalidType)
         ));
     }
 

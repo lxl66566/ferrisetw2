@@ -12,21 +12,6 @@
 use num_traits::FromPrimitive;
 use windows::Win32::System::Diagnostics::Etw;
 
-#[derive(Debug, Clone)]
-pub enum PropertyError {
-    /// Parsing complex types in properties is not supported in this crate
-    /// (yet? See <https://github.com/n4r1b/ferrisetw/issues/76>)
-    UnimplementedType(&'static str),
-}
-
-impl std::fmt::Display for PropertyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::UnimplementedType(s) => write!(f, "unimplemented type: {s}"),
-        }
-    }
-}
-
 /// Notes if the property count is a concrete length or an index into another property.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PropertyCount {
@@ -106,13 +91,25 @@ pub enum PropertyInfo {
     /// (e.g. the .NET `GCBulk*` events).
     StructArray {
         /// Members of one element, possibly structures themselves
-        // Read by the parser's struct breakdown
+        // Read by the parser's element count resolution
         #[allow(dead_code)]
         members: Vec<Property>,
         /// Number of elements
         // Read by the parser's element count resolution
         #[allow(dead_code)]
         count: PropertyCount,
+    },
+    /// A property this crate cannot decode (e.g. `PROPERTY_HAS_CUSTOM_SCHEMA`,
+    /// whose layout is described by an out-of-band schema).
+    ///
+    /// It still occupies its bytes in the event buffer, so it stays in the
+    /// property list in its original position: dropping it would shift the
+    /// offsets of every later property. The serializer degrades it per its
+    /// `fail_unimplemented` option.
+    Unsupported {
+        /// Schema-declared size, when fixed: a known size keeps the parser's
+        /// buffer walk local (no TDH round-trip)
+        length: PropertyLength,
     },
 }
 
@@ -193,83 +190,101 @@ impl Property {
                 };
                 Some(elem * count)
             },
+            PropertyInfo::Unsupported { length } => match length {
+                PropertyLength::Length(l) if *l > 0 => Some(*l as usize),
+                _ => None,
+            },
         }
     }
 }
 
 #[doc(hidden)]
 impl Property {
-    pub fn new(name: String, property: &Etw::EVENT_PROPERTY_INFO) -> Result<Self, PropertyError> {
+    /// Parses a non-structure property entry.
+    ///
+    /// Structure entries need their member entries, which only the schema
+    /// iterator has access to (see `native::tdh::PropertyIterator`): they
+    /// never reach this function.
+    pub fn new(name: String, property: &Etw::EVENT_PROPERTY_INFO) -> Self {
         let flags = PropertyFlags::from(property.Flags);
 
-        if flags.contains(PropertyFlags::PROPERTY_STRUCT) {
-            // Structures are assembled by the schema iterator (see
-            // native::tdh::PropertyIterator), which has access to the member
-            // entries that follow: a single EVENT_PROPERTY_INFO is not enough
-            Err(PropertyError::UnimplementedType(
-                "structure (needs the whole EventPropertyInfoArray)",
-            ))
-        } else if flags.contains(PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA) {
-            Err(PropertyError::UnimplementedType("has custom schema"))
-        } else {
-            // The property is a non-struct type. It makes sense to access these fields of the
-            // unions
-            let ot = unsafe { property.Anonymous1.nonStructType.OutType };
-            let it = unsafe { property.Anonymous1.nonStructType.InType };
-
+        if flags.contains(PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA) {
+            // The layout lives in an out-of-band custom schema this crate
+            // does not decode: keep the property marked instead of dropping
+            // it (it occupies its bytes in the buffer)
             let length = if flags.contains(PropertyFlags::PROPERTY_PARAM_LENGTH) {
-                // The property length is stored in another property, this is the index of that
-                // property
+                // The property length is stored in another property, this is
+                // the index of that property
+                // Safety: PropertyParamLength is set, the union holds
+                // lengthPropertyIndex
                 PropertyLength::Index(unsafe { property.Anonymous3.lengthPropertyIndex })
             } else {
-                // The property has no param for its length, it makes sense to access this field of
-                // the union
+                // Safety: no PropertyParamLength, the union holds the length
                 PropertyLength::Length(unsafe { property.Anonymous3.length })
             };
-
-            let count = if flags.contains(PropertyFlags::PROPERTY_PARAM_COUNT) {
-                // The union holds countPropertyIndex: the 0-based index of the
-                // property that contains the number of elements. It can
-                // legitimately be 0 or 1, so always treat it as an index.
-                Some(PropertyCount::Index(unsafe {
-                    property.Anonymous2.countPropertyIndex
-                }))
-            } else {
-                // The union holds the literal number of elements. Note that TDH
-                // reports 1 for properties that are not defined as an array
-                // (see EVENT_PROPERTY_INFO's documentation), so only count > 1
-                // unambiguously means "array"
-                let count = unsafe { property.Anonymous2.count };
-                if count > 1 {
-                    Some(PropertyCount::Count(count))
-                } else {
-                    None
-                }
+            return Self {
+                name,
+                info: PropertyInfo::Unsupported { length },
             };
+        }
 
-            let out_type = FromPrimitive::from_u16(ot).unwrap_or(TdhOutType::OutTypeNull);
+        // The property is a non-struct type. It makes sense to access these fields of
+        // the unions
+        let ot = unsafe { property.Anonymous1.nonStructType.OutType };
+        let it = unsafe { property.Anonymous1.nonStructType.InType };
 
-            let in_type = FromPrimitive::from_u16(it).unwrap_or(TdhInType::InTypeNull);
+        let length = if flags.contains(PropertyFlags::PROPERTY_PARAM_LENGTH) {
+            // The property length is stored in another property, this is the index of that
+            // property
+            PropertyLength::Index(unsafe { property.Anonymous3.lengthPropertyIndex })
+        } else {
+            // The property has no param for its length, it makes sense to access this field of
+            // the union
+            PropertyLength::Length(unsafe { property.Anonymous3.length })
+        };
 
-            match count {
-                Some(c) => Ok(Property {
-                    name,
-                    info: PropertyInfo::Array {
-                        in_type,
-                        out_type,
-                        length,
-                        count: c,
-                    },
-                }),
-                None => Ok(Property {
-                    name,
-                    info: PropertyInfo::Value {
-                        in_type,
-                        out_type,
-                        length,
-                    },
-                }),
+        let count = if flags.contains(PropertyFlags::PROPERTY_PARAM_COUNT) {
+            // The union holds countPropertyIndex: the 0-based index of the
+            // property that contains the number of elements. It can
+            // legitimately be 0 or 1, so always treat it as an index.
+            Some(PropertyCount::Index(unsafe {
+                property.Anonymous2.countPropertyIndex
+            }))
+        } else {
+            // The union holds the literal number of elements. Note that TDH
+            // reports 1 for properties that are not defined as an array
+            // (see EVENT_PROPERTY_INFO's documentation), so only count > 1
+            // unambiguously means "array"
+            let count = unsafe { property.Anonymous2.count };
+            if count > 1 {
+                Some(PropertyCount::Count(count))
+            } else {
+                None
             }
+        };
+
+        let out_type = FromPrimitive::from_u16(ot).unwrap_or(TdhOutType::OutTypeNull);
+
+        let in_type = FromPrimitive::from_u16(it).unwrap_or(TdhInType::InTypeNull);
+
+        match count {
+            Some(c) => Self {
+                name,
+                info: PropertyInfo::Array {
+                    in_type,
+                    out_type,
+                    length,
+                    count: c,
+                },
+            },
+            None => Self {
+                name,
+                info: PropertyInfo::Value {
+                    in_type,
+                    out_type,
+                    length,
+                },
+            },
         }
     }
 }
@@ -388,7 +403,7 @@ mod tests {
 
     /// Builds an EVENT_PROPERTY_INFO describing a UInt32 of 4 bytes, with the
     /// given value in the count/countPropertyIndex union member
-    fn property_with_count_union(flags: u32, count_union: u16) -> Result<Property, PropertyError> {
+    fn property_with_count_union(flags: u32, count_union: u16) -> Property {
         let mut info = Etw::EVENT_PROPERTY_INFO {
             // Test flags are small bit patterns: they never wrap around
             #[allow(clippy::cast_possible_wrap)]
@@ -408,8 +423,7 @@ mod tests {
         // used to be mistaken for scalars, breaking dynamic arrays
         for index in [0u16, 1, 2] {
             let property =
-                property_with_count_union(PropertyFlags::PROPERTY_PARAM_COUNT.bits(), index)
-                    .unwrap();
+                property_with_count_union(PropertyFlags::PROPERTY_PARAM_COUNT.bits(), index);
             match property.info {
                 PropertyInfo::Array {
                     count: PropertyCount::Index(i),
@@ -425,16 +439,36 @@ mod tests {
         // TDH reports 1 for properties that are NOT arrays
         // (EVENT_PROPERTY_INFO.count documentation), so count == 1 cannot be
         // distinguished from an actual 1-element array
-        let scalar = property_with_count_union(0, 1).unwrap();
+        let scalar = property_with_count_union(0, 1);
         assert!(matches!(scalar.info, PropertyInfo::Value { .. }));
 
-        let zero = property_with_count_union(0, 0).unwrap();
+        let zero = property_with_count_union(0, 0);
         assert!(matches!(zero.info, PropertyInfo::Value { .. }));
 
-        let array = property_with_count_union(0, 3).unwrap();
+        let array = property_with_count_union(0, 3);
         assert!(matches!(array.info, PropertyInfo::Array {
             count: PropertyCount::Count(3),
             ..
         }));
+    }
+
+    #[test]
+    fn custom_schema_property_is_kept_as_unsupported() {
+        // A PROPERTY_HAS_CUSTOM_SCHEMA property used to fail the whole schema
+        // property list: it must come back as a marked, in-place property
+        // (dropping it would shift the offsets of every later property)
+        let mut info = Etw::EVENT_PROPERTY_INFO {
+            #[allow(clippy::cast_possible_wrap)]
+            Flags: Etw::PROPERTY_FLAGS(PropertyFlags::PROPERTY_HAS_CUSTOM_SCHEMA.bits() as i32),
+            ..Default::default()
+        };
+        info.Anonymous3.length = 8;
+        let property = Property::new("custom".into(), &info);
+        match property.info {
+            PropertyInfo::Unsupported {
+                length: PropertyLength::Length(8),
+            } => {},
+            other => panic!("expected an unsupported property of length 8, got {other:?}"),
+        }
     }
 }

@@ -131,12 +131,12 @@ impl serde::ser::Serialize for EventSerializer<'_> {
         // so structure members can only be decoded when both agree. Accessing
         // the schema through `self.schema` (a copied `&'x Schema`) keeps that
         // lifetime; going through a shorter reborrow would not.
-        let props = match self.schema.try_properties() {
-            Ok(p) => p,
-            Err(e) if self.options.fail_unimplemented => return Err(serde::ser::Error::custom(e)),
-            Err(_) => &[],
-        };
-        let event = EventSer::new(self.record, props, &self.parser, &self.options);
+        let event = EventSer::new(
+            self.record,
+            self.schema.properties(),
+            &self.parser,
+            &self.options,
+        );
         state.serialize_field("Event", &event)?;
 
         state.end()
@@ -1342,6 +1342,8 @@ impl PropSerable for PropertyInfo {
             // Structures serialize as nested maps/arrays (see `ser_property`)
             PropertyInfo::Struct { .. } => Some(PropSer(PropHandler::Struct)),
             PropertyInfo::StructArray { .. } => Some(PropSer(PropHandler::StructArray)),
+            // Cannot be decoded: degraded per the serializer's options
+            PropertyInfo::Unsupported { .. } => None,
         }
     }
 }

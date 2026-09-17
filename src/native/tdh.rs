@@ -20,7 +20,7 @@ use super::etw_types::*;
 use crate::{
     native::{
         etw_types::event_record::EventRecord,
-        tdh_types::{Property, PropertyCount, PropertyError, PropertyFlags, PropertyInfo},
+        tdh_types::{Property, PropertyCount, PropertyFlags, PropertyInfo},
     },
     traits::*,
 };
@@ -281,14 +281,15 @@ impl<'info> PropertyIterator<'info> {
     }
 
     /// Parses the property at `index`; a structure also pulls in its members,
-    /// recursively, from their own entries in EventPropertyInfoArray
-    fn parse_property(&self, index: u32) -> Option<Result<Property, PropertyError>> {
+    /// recursively, from their own entries in EventPropertyInfoArray.
+    ///
+    /// Returns `None` when the iteration must stop (unreadable entry): this
+    /// truncates the property list rather than failing it, as there is no way
+    /// to know where the remaining properties would sit in the buffer anyway
+    fn parse_property(&self, index: u32) -> Option<Property> {
         let curr_prop = self.property_at(index)?;
         // This should not happen, as there is no reason the Microsoft API has put a
-        // null pointer at an index below the property count. Ideally, I
-        // probably should return an `Err` here. But I prefer keeping a simple return
-        // type, and stop the iteration here in case this (normally impossible error)
-        // happens
+        // null pointer at an index below the property count.
         let property_name = self.property_name(curr_prop)?;
 
         let flags = PropertyFlags::from(curr_prop.Flags);
@@ -296,13 +297,8 @@ impl<'info> PropertyIterator<'info> {
         if flags.contains(PropertyFlags::PROPERTY_STRUCT) {
             // Safety: PropertyStruct is set, the union holds a structType
             let struct_type = unsafe { curr_prop.Anonymous1.structType };
-            let members = match self
-                .parse_members(struct_type.StructStartIndex, struct_type.NumOfStructMembers)
-            {
-                None => return None,
-                Some(Err(e)) => return Some(Err(e)),
-                Some(Ok(members)) => members,
-            };
+            let members =
+                self.parse_members(struct_type.StructStartIndex, struct_type.NumOfStructMembers)?;
             // The structure is an array of structures when its element count
             // comes from another property, or is a literal greater than 1
             let count = if flags.contains(PropertyFlags::PROPERTY_PARAM_COUNT) {
@@ -316,13 +312,13 @@ impl<'info> PropertyIterator<'info> {
                 (count > 1).then_some(PropertyCount::Count(count))
             };
 
-            Some(Ok(Property {
+            Some(Property {
                 name: property_name,
                 info: match count {
                     Some(count) => PropertyInfo::StructArray { members, count },
                     None => PropertyInfo::Struct { members },
                 },
-            }))
+            })
         } else {
             Some(Property::new(property_name, curr_prop))
         }
@@ -331,25 +327,21 @@ impl<'info> PropertyIterator<'info> {
     /// Parses the `num` member entries starting at `start` (the member region
     /// of a structure). Trust but verify: the region is clamped to the
     /// property array so bogus struct info cannot read out of bounds.
-    fn parse_members(&self, start: u16, num: u16) -> Option<Result<Vec<Property>, PropertyError>> {
+    fn parse_members(&self, start: u16, num: u16) -> Option<Vec<Property>> {
         let start = u32::from(start).min(self.property_count);
         let end = start
             .saturating_add(u32::from(num))
             .min(self.property_count);
         let mut members = Vec::with_capacity((end - start) as usize);
         for index in start..end {
-            match self.parse_property(index) {
-                None => return None,
-                Some(Err(e)) => return Some(Err(e)),
-                Some(Ok(member)) => members.push(member),
-            }
+            members.push(self.parse_property(index)?);
         }
-        Some(Ok(members))
+        Some(members)
     }
 }
 
 impl Iterator for PropertyIterator<'_> {
-    type Item = Result<Property, PropertyError>;
+    type Item = Property;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.next_index >= self.top_level_count {
