@@ -90,8 +90,9 @@ pub enum PropertyInfo {
     ///
     /// A structure occupies the concatenation of its members' bytes. The
     /// generic `try_parse` of a whole structure is not supported; with the
-    /// `serde` feature, structures serialize as nested objects (fixed-size
-    /// members only, variable-length members are skipped).
+    /// `serde` feature, structures serialize as nested objects
+    /// (variable-length members are sized from their leading bytes when
+    /// possible, and members that cannot be sized serialize as null).
     Struct {
         /// Members of the structure, possibly structures themselves
         // Read by the parser's struct breakdown

@@ -37,7 +37,7 @@ use crate::{
     native::{
         EVENT_EXTENDED_ITEM_INSTANCE, EventHeaderExtendedDataItem, ExtendedDataItem,
         etw_types::event_record::EventRecord,
-        tdh_types::{Property, PropertyCount, PropertyInfo, TdhInType, TdhOutType},
+        tdh_types::{Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType},
         time::{FileTime, SystemTime},
     },
     parser::{Parser, TdhSocketAddress},
@@ -642,6 +642,148 @@ mod test {
         assert_eq!(json, br#"{"Event":{"a":1,"b":2,"a":3}}"#);
     }
 
+    /// Members of the first (structure) property of a synthetic schema
+    fn struct_members(schema: &Schema) -> &[Property] {
+        match &schema.properties()[0].info {
+            PropertyInfo::Struct { members } => members,
+            other => panic!("expected a structure property, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn members_after_variable_length_are_located() {
+        // Members are packed: the reviewer's repro is a struct
+        // {x: u32, str: AnsiString, y: u32}, where skipping the string
+        // without advancing the offset made y read the string's bytes
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("str", TdhInType::InTypeAnsiString, 0),
+            PropSpec::new("y", TdhInType::InTypeUInt32, 4),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("s", &MEMBERS)];
+        let schema = synthetic_schema(&PROPS);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xaa_bb_cc_ddu32.to_le_bytes());
+        data.extend_from_slice(b"hi\0");
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+
+        let parser = Parser::create(&record, &schema);
+        let ser = StructSer {
+            members: struct_members(&schema),
+            bytes: &data,
+            parser: &parser,
+            record: &record,
+        };
+        assert_eq!(
+            serde_json::to_value(&ser).unwrap(),
+            serde_json::json!({"x": 0xaa_bb_cc_ddu32, "str": "hi", "y": 7})
+        );
+    }
+
+    #[test]
+    fn counted_string_member_is_sized_from_its_prefix() {
+        // CountedAnsiString members carry a little-endian u16 byte count
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("c", TdhInType::InTypeCountedAnsiString, 0),
+            PropSpec::new("y", TdhInType::InTypeUInt32, 4),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("s", &MEMBERS)];
+        let schema = synthetic_schema(&PROPS);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes()); // byte count
+        data.extend_from_slice(b"hi");
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+
+        let parser = Parser::create(&record, &schema);
+        let ser = StructSer {
+            members: struct_members(&schema),
+            bytes: &data,
+            parser: &parser,
+            record: &record,
+        };
+        assert_eq!(
+            serde_json::to_value(&ser).unwrap(),
+            serde_json::json!({"x": 1, "c": "hi", "y": 7})
+        );
+    }
+
+    #[test]
+    fn struct_array_with_variable_members_walks_elements() {
+        // Element sizes differ (3-byte vs 5-byte string): the old
+        // total/count stride sliced both elements at wrong offsets
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 2] = [
+            PropSpec::new("a", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("s", TdhInType::InTypeAnsiString, 0),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("elems", &MEMBERS)];
+        let schema = synthetic_schema(&PROPS);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(b"ab\0");
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(b"cdef\0");
+        let record = synthetic_record(&data);
+
+        let parser = Parser::create(&record, &schema);
+        let ser = StructArraySer {
+            members: struct_members(&schema),
+            count: 2,
+            bytes: &data,
+            parser: &parser,
+            record: &record,
+        };
+        assert_eq!(
+            serde_json::to_value(&ser).unwrap(),
+            serde_json::json!([{"a": 1, "s": "ab"}, {"a": 2, "s": "cdef"}])
+        );
+    }
+
+    #[test]
+    fn unsizeable_members_serialize_as_null() {
+        // A binary member of unknown length cannot be located, so neither
+        // can the members after it: emit null instead of mislocated values
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("b", TdhInType::InTypeBinary, 0),
+            PropSpec::new("y", TdhInType::InTypeUInt32, 4),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("s", &MEMBERS)];
+        let schema = synthetic_schema(&PROPS);
+
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.push(0xff);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let record = synthetic_record(&data);
+
+        let parser = Parser::create(&record, &schema);
+        let ser = StructSer {
+            members: struct_members(&schema),
+            bytes: &data,
+            parser: &parser,
+            record: &record,
+        };
+        assert_eq!(
+            serde_json::to_value(&ser).unwrap(),
+            serde_json::json!({"x": 1, "b": null, "y": null})
+        );
+    }
+
     #[test]
     fn extended_data_serializes_supported_items() {
         let guid = GUID::from_u128(0x56781234_abcd_4609_0102_030405060708);
@@ -838,9 +980,71 @@ macro_rules! prop_ser_type {
     }};
 }
 
-/// Serializes one structure element as a nested map: fixed-size members are
-/// sliced out of `bytes` and decoded through the parser, variable-length
-/// members are skipped
+/// Size of a variable-length structure member, read from its leading bytes.
+///
+/// Mirrors the local (TDH-free) sizing of the parser's buffer walk: members
+/// are packed, so NUL-terminated strings end at their terminator, counted
+/// strings carry a little-endian `u16` byte count and a SID's size follows
+/// from its sub-authority count.
+/// Returns `None` for sizes that cannot be determined locally (e.g. a length
+/// held by another property): TDH cannot fill the gap either, its name-based
+/// descriptor does not reliably locate structure members.
+fn variable_member_size(member: &Property, remaining: &[u8]) -> Option<usize> {
+    let PropertyInfo::Value {
+        in_type,
+        length: PropertyLength::Length(0),
+        ..
+    } = &member.info
+    else {
+        return None;
+    };
+    match in_type {
+        TdhInType::InTypeAnsiString => Some(memchr::memchr(0, remaining)? + 1),
+        TdhInType::InTypeUnicodeString => {
+            let units = remaining
+                .chunks_exact(2)
+                .position(|c| u16::from_ne_bytes(c.try_into().unwrap()) == 0)?;
+            Some((units + 1) * 2)
+        },
+        TdhInType::InTypeManifestCountedString
+        | TdhInType::InTypeCountedString
+        | TdhInType::InTypeManifestCountedAnsiString
+        | TdhInType::InTypeCountedAnsiString => {
+            let count = remaining.get(..size_of::<u16>())?;
+            Some(size_of::<u16>() + u16::from_le_bytes(count.try_into().ok()?) as usize)
+        },
+        // Revision (1) + sub-authority count (1) + authority (6) + RIDs (4 each)
+        TdhInType::InTypeSid => Some(8 + 4 * usize::from(*remaining.get(1)?)),
+        _ => None,
+    }
+}
+
+/// Slices the member starting at `*offset` out of the packed member bytes and
+/// advances `*offset` past it.
+///
+/// Fixed sizes come from the schema; variable-length members are sized from
+/// their leading bytes ([`variable_member_size`]). Returns `None` when the
+/// size cannot be determined or the bytes do not fit: the offsets of every
+/// member after this one are then unknown too.
+fn member_buffer<'b>(
+    member: &Property,
+    bytes: &'b [u8],
+    offset: &mut usize,
+    pointer_size: usize,
+) -> Option<&'b [u8]> {
+    let size = member
+        .fixed_size(pointer_size)
+        .or_else(|| variable_member_size(member, bytes.get(*offset..)?))?;
+    let buffer = bytes.get(*offset..)?.get(..size)?;
+    *offset += size;
+    Some(buffer)
+}
+
+/// Serializes one structure element as a nested map: members are sliced out
+/// of the packed `bytes` at their walked offsets, variable-length members are
+/// sized from their leading bytes. Members whose size cannot be determined
+/// (nor the ones after them, whose offsets are then unknown) are emitted as
+/// null instead of being read at a wrong offset
 struct StructSer<'a, 'b, 'p, 'r> {
     members: &'a [Property],
     bytes: &'b [u8],
@@ -855,30 +1059,45 @@ impl serde::ser::Serialize for StructSer<'_, '_, '_, '_> {
     {
         let mut map = serializer.serialize_map(Some(self.members.len()))?;
         let mut offset = 0;
-        for member in self.members {
-            let Some(size) = member.fixed_size(self.record.pointer_size()) else {
-                // Variable-length member: cannot be located without TDH help
-                continue;
-            };
-            let Some(buffer) = self.bytes.get(offset..offset + size) else {
+        for (pos, member) in self.members.iter().enumerate() {
+            let Some(buffer) =
+                member_buffer(member, self.bytes, &mut offset, self.record.pointer_size())
+            else {
+                let none: Option<()> = None;
+                for member in &self.members[pos..] {
+                    map.serialize_entry(&member.name, &none)?;
+                }
                 break;
             };
-            offset += size;
             ser_property::<S>(&mut map, member, buffer, self.parser, self.record)?;
         }
         map.end()
     }
 }
 
-/// Serializes an array of structures as a nested array of maps. Elements are
-/// `stride` bytes apart, starting at `bytes`
+/// Serializes an array of structures as a nested array of maps.
+///
+/// Elements are packed back to back and walked with a single cursor: elements
+/// holding variable-length members have different sizes, so a fixed stride
+/// would mislocate them
 struct StructArraySer<'a, 'b, 'p, 'r> {
     members: &'a [Property],
     count: usize,
-    stride: usize,
     bytes: &'b [u8],
     parser: &'p Parser<'a, 'b>,
     record: &'r EventRecord,
+}
+
+impl StructArraySer<'_, '_, '_, '_> {
+    /// End offset of the element starting at `start`, or `None` when one of
+    /// its members cannot be sized or the bytes run out
+    fn element_end(&self, start: usize) -> Option<usize> {
+        let mut offset = start;
+        for member in self.members {
+            member_buffer(member, self.bytes, &mut offset, self.record.pointer_size())?;
+        }
+        Some(offset)
+    }
 }
 
 impl serde::ser::Serialize for StructArraySer<'_, '_, '_, '_> {
@@ -887,16 +1106,27 @@ impl serde::ser::Serialize for StructArraySer<'_, '_, '_, '_> {
         S: serde::ser::Serializer,
     {
         let mut seq = serializer.serialize_seq(Some(self.count))?;
+        let mut offset = 0;
         for i in 0..self.count {
-            let Some(element) = self.bytes.get(i * self.stride..(i + 1) * self.stride) else {
+            let Some(end) = self.element_end(offset) else {
+                // Unresolvable member size or truncated buffer: the element
+                // boundaries are unknown from here on, emit null rather than
+                // mislocated maps
+                let none: Option<()> = None;
+                for _ in i..self.count {
+                    seq.serialize_element(&none)?;
+                }
                 break;
             };
+            // element_end only succeeds when the element fits in the buffer
+            let element = self.bytes.get(offset..end).expect("element within buffer");
             seq.serialize_element(&StructSer {
                 members: self.members,
                 bytes: element,
                 parser: self.parser,
                 record: self.record,
             })?;
+            offset = end;
         }
         seq.end()
     }
@@ -925,12 +1155,9 @@ where
     }
     if let PropertyInfo::StructArray { members, count } = &prop.info {
         let resolved = resolve_struct_count(*count, parser);
-        // TDH sizes the whole array; the stride follows from the element count
-        let stride = resolved.filter(|&c| c > 0).map_or(0, |c| buffer.len() / c);
         return map.serialize_entry(&prop.name, &StructArraySer {
             members,
             count: resolved.unwrap_or(0),
-            stride,
             bytes: buffer,
             parser,
             record,
