@@ -708,6 +708,20 @@ pub(crate) fn enable_stack_tracing(
         return Ok(());
     }
 
+    let buf = stack_tracing_buffer(events);
+    set_info(
+        control_handle,
+        TraceInformation::TraceStackTracingInfo,
+        &buf,
+    )
+}
+
+/// Builds the CLASSIC_EVENT_ID array expected by `TraceStackTracingInfo`, as a byte buffer
+// The byte view in `stack_tracing_buffer` is only sound while CLASSIC_EVENT_ID stays a
+// padding-free struct (a GUID + a type byte + 7 reserved bytes)
+const _: () = assert!(size_of::<Etw::CLASSIC_EVENT_ID>() == 24);
+
+fn stack_tracing_buffer(events: &[StackTracingEvent]) -> Vec<u8> {
     let event_ids: Vec<Etw::CLASSIC_EVENT_ID> = events
         .iter()
         .map(|event| Etw::CLASSIC_EVENT_ID {
@@ -717,12 +731,17 @@ pub(crate) fn enable_stack_tracing(
         })
         .collect();
     // SAFETY: CLASSIC_EVENT_ID is #[repr(C)] and all-integer (no padding), so this is a
-    // valid byte view of the array, valid for reads as long as `event_ids` is alive
-    let buf = unsafe {
-        std::slice::from_raw_parts(event_ids.as_ptr().cast::<u8>(), size_of_val(&event_ids))
-    };
-
-    set_info(control_handle, TraceInformation::TraceStackTracingInfo, buf)
+    // valid byte view of the array, valid for reads as long as `event_ids` is alive.
+    // The size must come from the *slice*, not the Vec: `size_of_val(&event_ids)` would
+    // measure the Vec header (3 pointers = 24 bytes on x64, i.e. exactly one
+    // CLASSIC_EVENT_ID), silently truncating the list to its first event
+    unsafe {
+        std::slice::from_raw_parts(
+            event_ids.as_ptr().cast::<u8>(),
+            size_of_val(event_ids.as_slice()),
+        )
+    }
+    .to_vec()
 }
 
 /// Enables the given extended kernel event groups, on top of the session's current ones
@@ -800,5 +819,33 @@ mod tests {
             build_event_filter_descriptors(&provider),
             Err(EvntraceNativeError::InvalidFilter(_))
         ));
+    }
+
+    #[test]
+    fn stack_tracing_buffer_is_sized_per_event_not_per_vec() {
+        // Regression: the buffer used to be sized with `size_of_val(&Vec)`, i.e. the
+        // Vec header (24 bytes on x64 = exactly one CLASSIC_EVENT_ID), so only the
+        // first event was ever stack-traced, and the call still succeeded
+        let events: Vec<StackTracingEvent> = [46u8, 47, 12]
+            .map(|ty| StackTracingEvent::new(GUID::new().unwrap(), ty))
+            .into();
+
+        let buf = stack_tracing_buffer(&events);
+        assert_eq!(buf.len(), events.len() * size_of::<Etw::CLASSIC_EVENT_ID>());
+
+        // Decode every element back per the SDK layout: GUID (16 bytes), type byte,
+        // 7 reserved bytes
+        for (i, event) in events.iter().enumerate() {
+            let id = &buf[i * 24..][..24];
+            let guid = GUID::from_values(
+                u32::from_ne_bytes(id[0..4].try_into().unwrap()),
+                u16::from_ne_bytes(id[4..6].try_into().unwrap()),
+                u16::from_ne_bytes(id[6..8].try_into().unwrap()),
+                id[8..16].try_into().unwrap(),
+            );
+            assert_eq!(guid, event.event_guid);
+            assert_eq!(id[16], event.event_type);
+            assert!(id[17..].iter().all(|&b| b == 0));
+        }
     }
 }
