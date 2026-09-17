@@ -16,7 +16,7 @@ use windows::{
     Win32::{
         Foundation::{
             ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_INSUFFICIENT_BUFFER,
-            ERROR_SUCCESS, FILETIME,
+            ERROR_SUCCESS, FILETIME, WIN32_ERROR,
         },
         System::Diagnostics::{
             Etw,
@@ -257,19 +257,12 @@ where
             PCWSTR::from_raw(properties.trace_name_array().as_ptr()),
             properties.as_mut_ptr(),
         )
-    }
-    .ok();
+    };
 
-    if let Err(status) = status {
-        let code = status.code();
-
-        if code == ERROR_ALREADY_EXISTS.to_hresult() {
-            return Err(EvntraceNativeError::AlreadyExist);
-        } else if code != ERROR_SUCCESS.to_hresult() {
-            return Err(EvntraceNativeError::IoError(
-                std::io::Error::from_raw_os_error(code.0),
-            ));
-        }
+    match status {
+        ERROR_SUCCESS => {},
+        ERROR_ALREADY_EXISTS => return Err(EvntraceNativeError::AlreadyExist),
+        other => return Err(win32_error(other)),
     }
 
     match filter_invalid_control_handle(control_handle) {
@@ -391,12 +384,9 @@ pub(crate) fn enable_provider(
                     0,
                     Some(parameters.as_ptr()),
                 )
-            }
-            .ok();
+            };
 
-            res.map_err(|err| {
-                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-            })
+            win32_result(res)
         },
     }
 }
@@ -427,12 +417,9 @@ pub(crate) fn disable_provider(
                     0,
                     None,
                 )
-            }
-            .ok();
+            };
 
-            res.map_err(|err| {
-                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-            })
+            win32_result(res)
         },
     }
 }
@@ -466,12 +453,9 @@ pub(crate) fn capture_provider_state(
                     0,
                     None,
                 )
-            }
-            .ok();
+            };
 
-            res.map_err(|err| {
-                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-            })
+            win32_result(res)
         },
     }
 }
@@ -483,19 +467,16 @@ pub(crate) fn process_trace(trace_handle: TraceHandle) -> EvntraceNativeResult<(
     if filter_invalid_trace_handles(trace_handle).is_none() {
         Err(EvntraceNativeError::InvalidHandle)
     } else {
-        let result = unsafe {
+        let status = unsafe {
             // We want to start processing events as soon as January 1601.
             // * for ETL file traces, this is fine, this means "process everything from the file"
             // * for real-time traces, this means we might process a few events already waiting in
             //   the buffers when the processing is starting. This is fine, I suppose.
             let mut start = FILETIME::default();
             Etw::ProcessTrace(&[trace_handle], Some(&raw mut start), None)
-        }
-        .ok();
+        };
 
-        result.map_err(|err| {
-            EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-        })
+        win32_result(status)
     }
 }
 
@@ -515,7 +496,7 @@ pub(crate) fn control_trace(
     match filter_invalid_control_handle(control_handle) {
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
-            let result = unsafe {
+            let status = unsafe {
                 // Safety:
                 //  * the trace handle is valid (by construction)
                 //  * depending on the control code, the `Properties` can be mutated. This is fine
@@ -528,23 +509,24 @@ pub(crate) fn control_trace(
                     properties.as_mut_ptr(),
                     control_code,
                 )
-            }
-            .ok();
+            };
 
-            result.map_err(|err| {
-                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
-            })
+            win32_result(status)
         },
     }
 }
 
 /// Similar to [`control_trace`], but using a trace name instead of a handle
+///
+/// Returns the raw `WIN32_ERROR` on failure: some callers special-case
+/// particular codes (e.g. `ERROR_WMI_INSTANCE_NOT_FOUND` means "nothing to
+/// stop" for `stop_trace_by_name`)
 pub(crate) fn control_trace_by_name(
     properties: &mut EventTraceProperties,
     trace_name: &U16CStr,
     control_code: Etw::EVENT_TRACE_CONTROL,
-) -> windows::core::Result<()> {
-    unsafe {
+) -> Result<(), WIN32_ERROR> {
+    let status = unsafe {
         // Safety:
         //  * depending on the control code, the `Properties` can be mutated. This is fine because
         //    properties is declared as `&mut` in this function, which means no other Rust function
@@ -556,8 +538,12 @@ pub(crate) fn control_trace_by_name(
             properties.as_mut_ptr(),
             control_code,
         )
+    };
+    if status.is_ok() {
+        Ok(())
+    } else {
+        Err(status)
     }
-    .ok()
 }
 
 /// Close the trace
@@ -582,21 +568,38 @@ pub(crate) fn close_trace(
             UNIQUE_VALID_CONTEXTS
                 .remove(std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>());
 
-            let status = unsafe { Etw::CloseTrace(handle) }.ok();
+            let status = unsafe { Etw::CloseTrace(handle) };
 
             match status {
-                Ok(()) => Ok(false),
-                Err(err) if err.code() == ERROR_CTX_CLOSE_PENDING.to_hresult() => Ok(true),
-                Err(err) => Err(EvntraceNativeError::IoError(
-                    std::io::Error::from_raw_os_error(err.code().0),
-                )),
+                ERROR_SUCCESS => Ok(false),
+                // Events are still queued: they will still trigger the callbacks
+                ERROR_CTX_CLOSE_PENDING => Ok(true),
+                other => Err(win32_error(other)),
             }
         },
     }
 }
 
-fn win32_error(err: &windows::core::Error) -> EvntraceNativeError {
-    EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
+/// Convert a bare `WIN32_ERROR` — the return type of every ETW control API —
+/// into the crate error
+///
+/// Do not route this through `WIN32_ERROR::ok()` and its `windows::core::Error`:
+/// that wraps the code into an `HRESULT_FROM_WIN32` (0x8007xxxx), which
+/// `io::Error::from_raw_os_error` would take at face value (e.g. os error
+/// -2147024713 instead of 183 for `ERROR_ALREADY_EXISTS`), losing every
+/// `ErrorKind` mapping.
+#[allow(clippy::cast_possible_wrap)] // Win32 error codes always fit in an i32
+pub(crate) fn win32_error(status: WIN32_ERROR) -> EvntraceNativeError {
+    EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(status.0 as i32))
+}
+
+/// [`win32_error`], unless `status` is `ERROR_SUCCESS`
+pub(crate) fn win32_result(status: WIN32_ERROR) -> EvntraceNativeResult<()> {
+    if status.is_ok() {
+        Ok(())
+    } else {
+        Err(win32_error(status))
+    }
 }
 
 /// Calls `TraceQueryInformation`, returning its status along with the number of bytes
@@ -605,12 +608,12 @@ fn trace_query_raw(
     session: ControlHandle,
     class: TraceInformation,
     buf: &mut [u8],
-) -> (windows::core::Result<()>, u32) {
+) -> (WIN32_ERROR, u32) {
     // Query buffers hold small fixed-size structs: cannot overflow a u32
     #[allow(clippy::cast_possible_truncation)]
     let buf_len = buf.len() as u32;
     let mut needed = 0u32;
-    let result = unsafe {
+    let status = unsafe {
         // Safety:
         //  * the buffer is valid for reads and writes over `buf_len` bytes
         //  * `needed` is a valid out-parameter
@@ -621,17 +624,15 @@ fn trace_query_raw(
             buf_len,
             Some(&raw mut needed),
         )
-    }
-    .ok();
+    };
 
-    (result, needed)
+    (status, needed)
 }
 
 /// Queries the system for system-wide ETW information (that does not require an active session).
 pub(crate) fn query_info(class: TraceInformation, buf: &mut [u8]) -> EvntraceNativeResult<()> {
-    trace_query_raw(ControlHandle::default(), class, buf)
-        .0
-        .map_err(|err| win32_error(&err))
+    let (status, _) = trace_query_raw(ControlHandle::default(), class, buf);
+    win32_result(status)
 }
 
 /// Queries a system-wide, variable-sized info class (an array of structures).
@@ -645,21 +646,17 @@ pub(crate) fn query_array_info(
     let mut capacity = initial_capacity;
     for _ in 0..4 {
         let mut buf = vec![0u8; capacity];
-        let (result, needed) = trace_query_raw(ControlHandle::default(), class, &mut buf);
-        match result {
-            Ok(()) => {
+        let (status, needed) = trace_query_raw(ControlHandle::default(), class, &mut buf);
+        match status {
+            ERROR_SUCCESS => {
                 let written = (needed as usize).min(buf.len());
                 buf.truncate(written);
                 return Ok(buf);
             },
-            Err(err) => {
-                let required = needed as usize;
-                if err.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() && required > capacity {
-                    capacity = required;
-                } else {
-                    return Err(win32_error(&err));
-                }
+            ERROR_INSUFFICIENT_BUFFER if needed as usize > capacity => {
+                capacity = needed as usize;
             },
+            other => return Err(win32_error(other)),
         }
     }
 
@@ -681,7 +678,7 @@ pub(crate) fn set_info(
             // Set buffers hold small fixed-size structs: cannot overflow a u32
             #[allow(clippy::cast_possible_truncation)]
             let buf_len = buf.len() as u32;
-            unsafe {
+            let status = unsafe {
                 // Safety:
                 //  * the control handle is valid (checked above)
                 //  * the buffer is valid for reads over `buf_len` bytes
@@ -691,9 +688,8 @@ pub(crate) fn set_info(
                     buf.as_ptr().cast(),
                     buf_len,
                 )
-            }
-            .ok()
-            .map_err(|err| win32_error(&err))
+            };
+            win32_result(status)
         },
     }
 }
@@ -763,14 +759,14 @@ pub(crate) fn set_extended_kernel_groups(
     }
 
     let mut buf = [0u8; size_of::<PerfinfoGroupmask>()];
-    let (current, _) = trace_query_raw(
+    let (status, _) = trace_query_raw(
         control_handle,
         TraceInformation::TraceSystemTraceEnableFlagsInfo,
         &mut buf,
     );
     // An error here means the session (or OS, these need Windows 8+) does not support the
     // extended group mask: surface it rather than silently skipping the groups
-    current.map_err(|err| win32_error(&err))?;
+    win32_result(status)?;
     let mut groupmask = PerfinfoGroupmask::from_bytes(&buf);
     groupmask.set_groups(groups);
 
@@ -784,9 +780,36 @@ pub(crate) fn set_extended_kernel_groups(
 #[cfg(test)]
 mod tests {
     use widestring::U16CString;
+    use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 
     use super::*;
     use crate::{provider::EventFilter, trace::callback_data::RealTimeCallbackData};
+
+    #[test]
+    fn win32_errors_map_to_their_raw_code_not_the_hresult() {
+        // Regression: routing WIN32_ERROR through `ok()` produced an
+        // HRESULT_FROM_WIN32 (0x800700B7), which from_raw_os_error surfaced as
+        // os error -2147024713, with every ErrorKind mapping lost
+        let err = win32_error(ERROR_ALREADY_EXISTS);
+        let EvntraceNativeError::IoError(err) = err else {
+            panic!("expected an IoError, got {err:?}");
+        };
+        let raw = i32::try_from(ERROR_ALREADY_EXISTS.0).unwrap();
+        assert_eq!(err.raw_os_error(), Some(raw));
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        let err = win32_error(ERROR_INVALID_PARAMETER);
+        let EvntraceNativeError::IoError(err) = err else {
+            panic!("expected an IoError, got {err:?}");
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn win32_result_accepts_success_only() {
+        assert!(win32_result(ERROR_SUCCESS).is_ok());
+        assert!(win32_result(ERROR_INVALID_PARAMETER).is_err());
+    }
 
     #[test]
     fn unbuidable_filters_are_reported() {

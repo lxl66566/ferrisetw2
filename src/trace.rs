@@ -19,7 +19,7 @@ use crate::{
         evntrace::{
             ControlHandle, TraceHandle, capture_provider_state, close_trace, control_trace,
             control_trace_by_name, disable_provider, enable_provider, enable_stack_tracing,
-            open_trace, process_trace, set_extended_kernel_groups, start_trace,
+            open_trace, process_trace, set_extended_kernel_groups, start_trace, win32_error,
         },
         version_helper,
     },
@@ -1439,14 +1439,10 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
     );
 
     let result = control_trace_by_name(&mut properties, &wide_name, Etw::EVENT_TRACE_CONTROL_STOP);
-    if let Err(e) = result {
-        if e.code() == ERROR_WMI_INSTANCE_NOT_FOUND.to_hresult() {
-            // This is not an error, it just means the trace was not running
-            return Ok(());
-        }
-        return Err(TraceError::EtwNativeError(EvntraceNativeError::IoError(
-            std::io::Error::from_raw_os_error(e.code().0),
-        )));
+    match result {
+        // A not-running trace is not an error: there is simply nothing to stop
+        Ok(()) | Err(ERROR_WMI_INSTANCE_NOT_FOUND) => {},
+        Err(status) => return Err(TraceError::EtwNativeError(win32_error(status))),
     }
 
     Ok(())
