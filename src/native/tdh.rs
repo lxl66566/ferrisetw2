@@ -17,12 +17,9 @@ use windows::{
 };
 
 use super::etw_types::*;
-use crate::{
-    native::{
-        etw_types::event_record::EventRecord,
-        tdh_types::{Property, PropertyCount, PropertyFlags, PropertyInfo},
-    },
-    traits::*,
+use crate::native::{
+    etw_types::event_record::EventRecord,
+    tdh_types::{Property, PropertyCount, PropertyFlags, PropertyInfo},
 };
 
 /// Tdh native module errors
@@ -328,13 +325,11 @@ impl<'info> PropertyIterator<'info> {
                 (count > 1).then_some(PropertyCount::Count(count))
             };
 
-            Some(Property {
-                name: property_name,
-                info: match count {
-                    Some(count) => PropertyInfo::StructArray { members, count },
-                    None => PropertyInfo::Struct { members },
-                },
-            })
+            let info = match count {
+                Some(count) => PropertyInfo::StructArray { members, count },
+                None => PropertyInfo::Struct { members },
+            };
+            Some(Property::from_parts(property_name, info))
         } else {
             Some(Property::new(property_name, curr_prop))
         }
@@ -370,13 +365,18 @@ impl Iterator for PropertyIterator<'_> {
     }
 }
 
-pub fn property_size(event: &EventRecord, name: &str) -> TdhNativeResult<u32> {
+/// Total size of a property's data for this event, as computed by TDH.
+///
+/// A round-trip per (property, event): sizes of index-referenced lengths and
+/// counts vary with the event data, so they cannot be cached across events.
+/// Only the UTF-16 name the descriptor takes is cached, on the property
+/// itself (schemas outlive events).
+pub fn property_size(event: &EventRecord, property: &Property) -> TdhNativeResult<u32> {
     let mut property_size = 0;
 
-    let name = name.into_utf16();
     let desc = Etw::PROPERTY_DATA_DESCRIPTOR {
         ArrayIndex: u32::MAX,
-        PropertyName: name.as_ptr() as u64,
+        PropertyName: property.utf16_name().as_ptr() as u64,
         ..Default::default()
     };
 

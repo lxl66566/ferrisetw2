@@ -15,7 +15,10 @@ use crate::{
         DecodingSource,
         etw_types::event_record::EventRecord,
         sddl, tdh,
-        tdh_types::{Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType},
+        tdh_types::{
+            Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType,
+            index_value_from_bytes,
+        },
         time::{FileTime, SystemTime},
     },
     property::PropertySlice,
@@ -179,20 +182,24 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     fn find_property_size(
         &self,
         property: &Property,
+        parsed: &[PropertySlice<'schema, 'record>],
         remaining_user_buffer: &[u8],
     ) -> ParserResult<usize> {
+        // Value of the property a countPropertyIndex/lengthPropertyIndex
+        // points at. Only backward references into the already parsed
+        // top-level properties resolve locally — the usual layout, the
+        // carrier being declared before its user; anything else defers to
+        // TDH
+        let index_value = |index: u16| -> Option<usize> {
+            index_value_from_bytes(parsed.get(usize::from(index))?.buffer)
+        };
+
         match property.info {
             PropertyInfo::Value {
-                in_type, length, ..
+                in_type,
+                out_type,
+                length,
             } => {
-                // There are several cases
-                //  * regular case, where property.len() directly makes sense
-                //  * but EVENT_PROPERTY_INFO.length is an union, and (in its lengthPropertyIndex
-                //    form) can refeer to another field e.g.: the WinInet provider manifest has
-                //    fields such as `<data name="Verb" inType="win:AnsiString"
-                //    length="_VerbLength"/>` In this case, we defer to TDH to know the right
-                //    length.
-
                 // For pointer input types we can immediately infer the size
                 // based on the header flags (SIZET is the deprecated WBEM
                 // pointer: same rule)
@@ -200,14 +207,24 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     return Ok(self.record.pointer_size());
                 }
 
+                // EVENT_PROPERTY_INFO.length is a union: either a literal
+                // size or (with `PropertyParamLength`) the index of the
+                // property holding it, e.g. the WinInet provider manifest has
+                // fields such as `<data name="Verb" inType="win:AnsiString"
+                // length="_VerbLength"/>`. tdh.h: the index carries the size
+                // in the same unit as a literal length (WCHARs/BYTEs per in
+                // type), and fixed-size in types ignore the length property
+                // entirely, whatever its form
                 let prop_len = match length {
-                    PropertyLength::Length(l) => l,
-                    PropertyLength::Index(_) => {
-                        // TODO optimize to cache the lookup, the problem is here this is called
-                        // while the cache is mutably borrowed, so attempting to
-                        // extract and cache a related property will
-                        // panic.
-                        return Ok(tdh::property_size(self.record, &property.name)? as usize);
+                    PropertyLength::Length(l) => usize::from(l),
+                    PropertyLength::Index(index) => {
+                        if let Some(size) = in_type.fixed_size() {
+                            return Ok(size);
+                        }
+                        match index_value(index) {
+                            Some(len) => return Ok(in_type.schema_length_bytes(len)),
+                            None => return self.tdh_property_size(property),
+                        }
                     },
                 };
 
@@ -294,6 +311,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                         let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
                         return Ok(size_of::<u32>() + count as usize);
                     },
+                    TdhInType::InTypeBinary if out_type == TdhOutType::OutTypeIpv6 => {
+                        // tdh.h: a BINARY field with the IPV6 out type spans
+                        // 16 bytes when no length applies
+                        return Ok(16);
+                    },
                     _ => (),
                 }
 
@@ -305,7 +327,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     return Ok(size);
                 }
 
-                Ok(tdh::property_size(self.record, &property.name)? as usize)
+                self.tdh_property_size(property)
             },
             PropertyInfo::Array {
                 in_type,
@@ -313,49 +335,42 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 count,
                 ..
             } => {
-                // For pointer input types we can immediately infer the element
-                // size based on the header flags (SIZET is the deprecated WBEM
-                // pointer: same rule)
-                let prop_len = if matches!(
-                    in_type,
-                    TdhInType::InTypePointer | TdhInType::InTypeSizeT
-                ) {
-                    self.record.pointer_size()
-                } else {
-                    match length {
-                        PropertyLength::Length(l) => in_type.schema_length_bytes(l),
-                        PropertyLength::Index(_) => {
-                            // TODO optimize to cache the lookup, this is
-                            // called while the cache is mutably borrowed, so attempting to
-                            // extract and cache a related property will
-                            // panic.
-                            return Ok(tdh::property_size(self.record, &property.name)? as usize);
-                        },
-                    }
-                };
+                // Element size: pointer input types follow the header flags,
+                // an explicit nonzero length uses the per-in-type unit, a
+                // length by index resolves like a literal one, and fixed-size
+                // in types ignore the length entirely (tdh.h)
+                let elem_size =
+                    if matches!(in_type, TdhInType::InTypePointer | TdhInType::InTypeSizeT) {
+                        Some(self.record.pointer_size())
+                    } else {
+                        match length {
+                            PropertyLength::Length(0) => in_type.fixed_size(),
+                            PropertyLength::Length(l) => {
+                                Some(in_type.schema_length_bytes(usize::from(l)))
+                            },
+                            PropertyLength::Index(index) => in_type.fixed_size().or_else(|| {
+                                index_value(index).map(|len| in_type.schema_length_bytes(len))
+                            }),
+                        }
+                    };
 
-                let prop_count = match count {
+                let element_count = match count {
                     PropertyCount::Count(c) => c as usize,
-                    PropertyCount::Index(_) => {
-                        // TODO optimize to cache the lookup, this is
-                        // called while the cache is mutably borrowed, so attempting to
-                        // extract and cache a related property will
-                        // panic.
-                        return Ok(tdh::property_size(self.record, &property.name)? as usize);
+                    PropertyCount::Index(index) => match index_value(index) {
+                        Some(count) => count,
+                        None => return self.tdh_property_size(property),
                     },
                 };
 
-                if prop_len > 0 {
-                    return Ok(prop_len * prop_count);
+                match elem_size {
+                    Some(elem) => Ok(elem * element_count),
+                    // An empty array occupies no bytes even when its elements
+                    // are variable-length (e.g. NUL-terminated strings)
+                    None if element_count == 0 => Ok(0),
+                    // Variable-length elements (e.g. arrays of NUL-terminated
+                    // strings with no schema length) still need TDH
+                    None => self.tdh_property_size(property),
                 }
-
-                // As for scalar values, fixed-size in types do not need the
-                // schema length
-                if let Some(elem) = in_type.fixed_size() {
-                    return Ok(elem * prop_count);
-                }
-
-                Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
             // Structures span all of their members: when every member has a
             // fixed size the total follows from the schema, otherwise defer
@@ -364,7 +379,25 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 if let Some(size) = property.fixed_size(self.record.pointer_size()) {
                     return Ok(size);
                 }
-                Ok(tdh::property_size(self.record, &property.name)? as usize)
+                // A structure array whose element count travels by reference
+                // is still fixed-size per element: resolve the count the same
+                // way TDH would
+                if let PropertyInfo::StructArray {
+                    members,
+                    count: PropertyCount::Index(index),
+                } = &property.info
+                {
+                    if let (Some(elem), Some(count)) = (
+                        members
+                            .iter()
+                            .map(|m| m.fixed_size(self.record.pointer_size()))
+                            .sum::<Option<usize>>(),
+                        index_value(*index),
+                    ) {
+                        return Ok(elem * count);
+                    }
+                }
+                self.tdh_property_size(property)
             },
             // A property this crate cannot decode still occupies its bytes: a
             // schema-declared length keeps the walk local, otherwise defer to
@@ -372,9 +405,19 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             // support)
             PropertyInfo::Unsupported { length } => match length {
                 PropertyLength::Length(l) if l > 0 => Ok(usize::from(l)),
-                _ => Ok(tdh::property_size(self.record, &property.name)? as usize),
+                PropertyLength::Length(_) => self.tdh_property_size(property),
+                PropertyLength::Index(index) => match index_value(index) {
+                    Some(len) => Ok(len),
+                    None => self.tdh_property_size(property),
+                },
             },
         }
+    }
+
+    /// The sizes that cannot be determined locally: a native
+    /// `TdhGetPropertySize` round-trip per (property, event)
+    fn tdh_property_size(&self, property: &Property) -> ParserResult<usize> {
+        Ok(tdh::property_size(self.record, property)? as usize)
     }
 
     fn find_property(&self, name: &str) -> ParserResult<PropertySlice<'schema, 'record>> {
@@ -430,7 +473,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             ));
         };
 
-        let prop_size = self.find_property_size(property, remaining_user_buffer)?;
+        let prop_size = self.find_property_size(property, &cache.slices, remaining_user_buffer)?;
         let Some(property_buffer) = remaining_user_buffer.get(..prop_size) else {
             return Err(ParserError::PropertyError(
                 "Property length out of buffer bounds".to_owned(),
@@ -1406,7 +1449,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        native::tdh::TraceEventInfo,
+        native::{tdh::TraceEventInfo, tdh_types::PropertyFlags},
         parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
     };
 
@@ -1623,6 +1666,117 @@ mod tests {
 
         assert_eq!(parser.try_parse::<u32>("a").unwrap(), 1);
         assert_eq!(parser.try_parse::<u64>("b").unwrap(), 2);
+    }
+
+    /// tdh.h: with `PropertyParamLength`, `lengthPropertyIndex` points at the
+    /// property holding the field size, in the same unit as a literal length
+    /// (WCHARs for UnicodeString). Resolving it against the already parsed
+    /// prefix keeps the walk local: TdhGetPropertySize fails outright on
+    /// these synthetic records, so any fallback would fail the test
+    #[test]
+    fn length_by_reference_resolves_from_the_parsed_prefix() {
+        static PROPS: [PropSpec; 3] = [
+            PropSpec::new("len", TdhInType::InTypeUInt16, 2),
+            PropSpec {
+                flags: PropertyFlags::PROPERTY_PARAM_LENGTH.bits(),
+                length: 0, // aliases lengthPropertyIndex
+                ..PropSpec::new("s", TdhInType::InTypeUnicodeString, 0)
+            },
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut user_data: Vec<u8> = 3u16.to_ne_bytes().to_vec();
+        user_data.extend(b"abc".iter().flat_map(|b| [*b, 0]));
+        user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        // 3 WCHARs, not 3 bytes: the u32 sits right after the 6 string bytes
+        assert_eq!(parser.try_parse::<String>("s").unwrap(), "abc");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// tdh.h: with `PropertyParamCount`, `countPropertyIndex` points at the
+    /// property holding the element count, which the walk resolves from the
+    /// parsed prefix
+    #[test]
+    fn count_by_reference_resolves_from_the_parsed_prefix() {
+        static PROPS: [PropSpec; 3] = [
+            PropSpec::new("count", TdhInType::InTypeUInt16, 2),
+            PropSpec {
+                count: 0, // aliases countPropertyIndex
+                flags: PropertyFlags::PROPERTY_PARAM_COUNT.bits(),
+                ..PropSpec::new("arr", TdhInType::InTypeUInt32, 4)
+            },
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        let user_data: Vec<u8> = 2u16
+            .to_ne_bytes()
+            .into_iter()
+            .chain(7u32.to_ne_bytes())
+            .chain(9u32.to_ne_bytes())
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        // Both array elements lie before the u32: the count resolved to 2
+        assert_eq!(parser.property_bytes_at(1).unwrap().len(), 8);
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// The GCBulk-style layout: a structure array whose element count travels
+    /// by reference, sized as (fixed members) x (resolved count)
+    #[test]
+    fn struct_array_count_by_reference_resolves_from_the_parsed_prefix() {
+        static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt32, 4)];
+        static PROPS: [PropSpec; 3] = [
+            PropSpec::new("count", TdhInType::InTypeUInt16, 2),
+            PropSpec::structure_array("items", &MEMBERS, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        let user_data: Vec<u8> = 2u16
+            .to_ne_bytes()
+            .into_iter()
+            .chain(0x33u32.to_ne_bytes())
+            .chain(0x44u32.to_ne_bytes())
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.property_bytes_at(1).unwrap().len(), 8);
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// A reference the parsed prefix cannot resolve (a forward reference
+    /// here) defers to TDH — which fails outright on synthetic records,
+    /// pinning that no local guess is made in its place
+    #[test]
+    fn unresolvable_references_still_defer_to_tdh() {
+        static PROPS: [PropSpec; 2] = [
+            PropSpec {
+                count: 1, // countPropertyIndex: the count comes AFTER the array
+                flags: PropertyFlags::PROPERTY_PARAM_COUNT.bits(),
+                ..PropSpec::new("arr", TdhInType::InTypeUInt32, 4)
+            },
+            PropSpec::new("count", TdhInType::InTypeUInt16, 2),
+        ];
+        let user_data: Vec<u8> = 7u32
+            .to_ne_bytes()
+            .into_iter()
+            .chain(2u16.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert!(matches!(
+            parser.try_parse::<u32>("arr"),
+            Err(ParserError::TdhNativeError(_))
+        ));
     }
 
     #[test]
@@ -2177,6 +2331,14 @@ mod tests {
                 ..Default::default()
             },
         ]);
+        // The EVENT_RECORD keeps raw pointers to the blobs and the item
+        // array: leak them so they outlive the event (a drop while TDH or
+        // the parser still reads them made the tests flaky)
+        let ext_items: &'static mut [Etw::EVENT_HEADER_EXTENDED_DATA_ITEM] = Box::leak(ext_items);
+        // The DataPtr fields above point into the blobs: the leaked bindings
+        // only keep the memory alive
+        let _provider_blob: &'static [u8] = Box::leak(provider_blob.into_boxed_slice());
+        let _event_blob: &'static [u8] = Box::leak(event_blob.into_boxed_slice());
         // Header size always fits: synthetic test data
         #[allow(clippy::cast_possible_truncation)]
         let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
@@ -2191,9 +2353,7 @@ mod tests {
                 ..Default::default()
             },
             ExtendedDataCount: 2,
-            ExtendedData: std::ptr::from_ref(&*ext_items)
-                .cast::<Etw::EVENT_HEADER_EXTENDED_DATA_ITEM>()
-                .cast_mut(),
+            ExtendedData: ext_items.as_mut_ptr(),
             UserData: values.as_ptr() as *mut _,
             UserDataLength: u16::try_from(values.len()).unwrap(),
             ..Default::default()
@@ -2216,12 +2376,17 @@ mod tests {
         values.extend_from_slice(&[0, 0]); // wide NUL terminator
 
         let (record, schema) = tlg_ext_record(&meta, &values);
-        let PropertyInfo::Value { length, .. } = &schema.properties()[0].info else {
+        let prop = schema
+            .properties()
+            .iter()
+            .find(|p| p.name == "S")
+            .expect("TDH should report the field");
+        let PropertyInfo::Value { length, .. } = &prop.info else {
             panic!("'S' should be a scalar value");
         };
         assert_eq!(*length, PropertyLength::Length(0));
         assert_eq!(
-            tdh::property_size(&record, "S").unwrap(),
+            tdh::property_size(&record, prop).unwrap(),
             6,
             "TDH must size the string up to and including its NUL"
         );
@@ -2246,8 +2411,13 @@ mod tests {
         values.extend_from_slice(&0x1122_3344u32.to_le_bytes());
 
         let (record, schema) = tlg_ext_record(&meta, &values);
+        let prop = schema
+            .properties()
+            .iter()
+            .find(|p| p.name == "S16")
+            .expect("TDH should report the field");
         assert_eq!(
-            tdh::property_size(&record, "S16").unwrap(),
+            tdh::property_size(&record, prop).unwrap(),
             7,
             "TDH must take the odd count at face value"
         );
@@ -2255,6 +2425,63 @@ mod tests {
         let parser = Parser::create(&record, &schema);
         assert_eq!(parser.try_parse::<String>("S16").unwrap(), "ab");
     }
+
+    /// Pin for the local count/length-by-reference resolution against the
+    /// real TDH: a TraceLogging binary field's size travels in a synthesized
+    /// ".Length" property declared ahead of it, and TDH sizes the field
+    /// itself to the payload only (the u16 prefix belongs to the synthesized
+    /// property). The local walk must read the same bytes
+    #[test]
+    fn tracelogging_binary_field_sizes_from_its_synthesized_length() {
+        let mut meta = b"Blob\0".to_vec();
+        meta.push(tlg::IN_BINARY);
+        let mut values: Vec<u8> = 3u16.to_le_bytes().to_vec();
+        values.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+
+        let (record, schema) = tlg_ext_record(&meta, &values);
+        let props = schema.properties();
+        assert_eq!(
+            props.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["Blob.Length", "Blob"],
+            "TDH must synthesize the length property ahead of the field"
+        );
+        // Ground truth: the field itself is the payload only
+        assert_eq!(tdh::property_size(&record, &props[1]).unwrap(), 3);
+
+        // The local walk: 2 bytes of synthesized length, then the payload
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.property_bytes_at(0).unwrap().len(), 2);
+        assert_eq!(parser.property_bytes_at(1).unwrap(), &[0xaa, 0xbb, 0xcc]);
+    }
+
+    /// Pin for the local resolution against the real TDH: a TraceLogging
+    /// Vcount array's element count travels in a synthesized ".Count"
+    /// property, and TDH sizes the array to elements x count (the count
+    /// prefix belongs to the synthesized property)
+    #[test]
+    fn tracelogging_counted_array_sizes_from_its_synthesized_count() {
+        let mut meta = b"Items\0".to_vec();
+        meta.push(6 | 0x40); // UInt16 with Vcount: the count is serialized with the data
+        let mut values: Vec<u8> = 2u16.to_le_bytes().to_vec();
+        values.extend_from_slice(&[7, 0, 9, 0]);
+
+        let (record, schema) = tlg_ext_record(&meta, &values);
+        let props = schema.properties();
+        let array_index = props
+            .iter()
+            .position(|p| p.name == "Items")
+            .expect("TDH should report the array");
+        assert_eq!(
+            tdh::property_size(&record, &props[array_index]).unwrap(),
+            4,
+            "TDH must size the array to its elements only"
+        );
+
+        // The local walk resolves the same count from the parsed prefix
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.property_bytes_at(array_index).unwrap().len(), 4);
+    }
+
     /// An explicit schema length for a UnicodeString counts WCHARs, not
     /// bytes (tdh.h: "the epi.length field contains number of WCHARs in the
     /// string"; eventman.xsd: "Length indicates the size (in characters)"):

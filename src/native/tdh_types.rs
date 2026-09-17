@@ -10,6 +10,7 @@
 //!
 //! [Property]: crate::native::tdh_types::Property
 use num_traits::FromPrimitive;
+use once_cell::sync::OnceCell;
 use windows::Win32::System::Diagnostics::Etw;
 
 /// Notes if the property count is a concrete length or an index into another property.
@@ -36,6 +37,21 @@ pub enum PropertyLength {
 impl Default for PropertyLength {
     fn default() -> Self {
         PropertyLength::Length(0)
+    }
+}
+
+/// Value of the property a `countPropertyIndex`/`lengthPropertyIndex` points
+/// at, read from that property's own value bytes and interpreted by width.
+///
+/// Whatever the referenced property's in type, its raw value is what TDH
+/// resolves the index to. Returns `None` for widths it cannot interpret.
+pub(crate) fn index_value_from_bytes(bytes: &[u8]) -> Option<usize> {
+    match bytes.len() {
+        1 => Some(usize::from(bytes[0])),
+        2 => Some(usize::from(u16::from_ne_bytes(bytes.try_into().ok()?))),
+        4 => usize::try_from(u32::from_ne_bytes(bytes.try_into().ok()?)).ok(),
+        8 => usize::try_from(u64::from_ne_bytes(bytes.try_into().ok()?)).ok(),
+        _ => None,
     }
 }
 
@@ -129,6 +145,28 @@ pub struct Property {
     pub name: String,
     /// Information about the property.
     pub info: PropertyInfo,
+    /// NUL-terminated UTF-16 form of the name, minted on first use: TDH's
+    /// name-based size lookup takes it in that form, and re-encoding it per
+    /// call would allocate on every event. Schemas outlive events, so the
+    /// cache is shared across the whole session
+    name_utf16: OnceCell<Box<[u16]>>,
+}
+
+impl Property {
+    /// The NUL-terminated UTF-16 name TDH's `PROPERTY_DATA_DESCRIPTOR` takes
+    pub(crate) fn utf16_name(&self) -> &[u16] {
+        self.name_utf16
+            .get_or_init(|| self.name.encode_utf16().chain(std::iter::once(0)).collect())
+    }
+
+    /// Builds a property from its name and decoded info
+    pub(crate) fn from_parts(name: String, info: PropertyInfo) -> Self {
+        Self {
+            name,
+            info,
+            name_utf16: OnceCell::new(),
+        }
+    }
 }
 
 impl Property {
@@ -150,7 +188,9 @@ impl Property {
                     return Some(pointer_size);
                 }
                 match length {
-                    PropertyLength::Length(l) if *l > 0 => Some(in_type.schema_length_bytes(*l)),
+                    PropertyLength::Length(l) if *l > 0 => {
+                        Some(in_type.schema_length_bytes(usize::from(*l)))
+                    },
                     // A zero length means "ask TDH" for a top-level property;
                     // inside a structure it marks a variable-length member —
                     // unless the in type has a fixed size, which tdh.h says
@@ -169,7 +209,9 @@ impl Property {
                     pointer_size
                 } else {
                     match length {
-                        PropertyLength::Length(l) if *l > 0 => in_type.schema_length_bytes(*l),
+                        PropertyLength::Length(l) if *l > 0 => {
+                            in_type.schema_length_bytes(usize::from(*l))
+                        },
                         PropertyLength::Length(_) => in_type.fixed_size()?,
                         PropertyLength::Index(_) => return None,
                     }
@@ -226,10 +268,7 @@ impl Property {
                 // Safety: no PropertyParamLength, the union holds the length
                 PropertyLength::Length(unsafe { property.Anonymous3.length })
             };
-            return Self {
-                name,
-                info: PropertyInfo::Unsupported { length },
-            };
+            return Self::from_parts(name, PropertyInfo::Unsupported { length });
         }
 
         // The property is a non-struct type. It makes sense to access these fields of
@@ -272,23 +311,17 @@ impl Property {
         let in_type = FromPrimitive::from_u16(it).unwrap_or(TdhInType::InTypeNull);
 
         match count {
-            Some(c) => Self {
-                name,
-                info: PropertyInfo::Array {
-                    in_type,
-                    out_type,
-                    length,
-                    count: c,
-                },
-            },
-            None => Self {
-                name,
-                info: PropertyInfo::Value {
-                    in_type,
-                    out_type,
-                    length,
-                },
-            },
+            Some(c) => Self::from_parts(name, PropertyInfo::Array {
+                in_type,
+                out_type,
+                length,
+                count: c,
+            }),
+            None => Self::from_parts(name, PropertyInfo::Value {
+                in_type,
+                out_type,
+                length,
+            }),
         }
     }
 }
@@ -388,10 +421,10 @@ impl TdhInType {
     /// manifest/WBEM schemas, which cannot be installed without elevation.
     /// krabsetw, from which this crate's sizing code originally came, reads
     /// the length as bytes too and shares the issue.
-    pub(crate) fn schema_length_bytes(self, length: u16) -> usize {
+    pub(crate) fn schema_length_bytes(self, length: usize) -> usize {
         match self {
-            Self::InTypeUnicodeString => usize::from(length) * 2,
-            _ => usize::from(length),
+            Self::InTypeUnicodeString => length * 2,
+            _ => length,
         }
     }
 

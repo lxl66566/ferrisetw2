@@ -37,7 +37,10 @@ use crate::{
     native::{
         EVENT_EXTENDED_ITEM_INSTANCE, EventHeaderExtendedDataItem, ExtendedDataItem,
         etw_types::event_record::EventRecord,
-        tdh_types::{Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType},
+        tdh_types::{
+            Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType,
+            index_value_from_bytes,
+        },
         time::{FileTime, SystemTime},
     },
     parser::{Parser, TdhSocketAddress},
@@ -1059,13 +1062,17 @@ mod test {
     #[test]
     fn unlocatable_struct_array_is_null_not_an_empty_array() {
         // A structure array whose element count or bytes cannot be resolved
-        // must not silently serialize as an empty array
+        // must not silently serialize as an empty array. The count index
+        // points into a structure's member region (full array: Count(0),
+        // Items(1), member v(2)), which the parser's top-level prefix cannot
+        // resolve and TDH cannot size on a synthetic event: the element
+        // boundaries are unknown, so the array degrades to null
         use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
 
         static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt32, 4)];
         static PROPS: [PropSpec; 2] = [
             PropSpec::new("Count", TdhInType::InTypeUInt32, 4),
-            PropSpec::structure_array("Items", &MEMBERS, 0),
+            PropSpec::structure_array("Items", &MEMBERS, 2),
         ];
         let mut data = 2u32.to_le_bytes().to_vec();
         data.extend_from_slice(&1u32.to_le_bytes());
@@ -1757,14 +1764,7 @@ fn resolve_struct_count(count: PropertyCount, parser: &Parser) -> Option<usize> 
         // schema must not shadow the referenced one
         PropertyCount::Index(i) => {
             parser.top_level_properties().get(i as usize)?;
-            let bytes = parser.property_bytes_at(i as usize).ok()?;
-            match bytes.len() {
-                1 => Some(bytes[0] as usize),
-                2 => Some(u16::from_ne_bytes(bytes.try_into().ok()?) as usize),
-                4 => Some(u32::from_ne_bytes(bytes.try_into().ok()?) as usize),
-                8 => usize::try_from(u64::from_ne_bytes(bytes.try_into().ok()?)).ok(),
-                _ => None,
-            }
+            index_value_from_bytes(parser.property_bytes_at(i as usize).ok()?)
         },
     }
 }
