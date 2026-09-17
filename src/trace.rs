@@ -956,12 +956,17 @@ impl PrivateRealTimeTraceTrait for UserTrace {
 
 impl PrivateTraceTrait for UserTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.context)?;
-        control_trace(
+        // Always attempt both steps: short-circuiting on the close result would skip the
+        // STOP on a retry (the consumer handle is already closed by then), leaking the
+        // session. The close error is reported first, as it ran first.
+        let closed = close_trace(self.trace_handle, &self.context);
+        let stopped = control_trace(
             &mut self.properties,
             self.control_handle,
             Etw::EVENT_TRACE_CONTROL_STOP,
-        )?;
+        );
+        closed?;
+        stopped?;
         Ok(())
     }
 
@@ -1010,12 +1015,17 @@ impl PrivateRealTimeTraceTrait for KernelTrace {
 
 impl PrivateTraceTrait for KernelTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.context)?;
-        control_trace(
+        // Always attempt both steps: short-circuiting on the close result would skip the
+        // STOP on a retry (the consumer handle is already closed by then), leaking the
+        // session. The close error is reported first, as it ran first.
+        let closed = close_trace(self.trace_handle, &self.context);
+        let stopped = control_trace(
             &mut self.properties,
             self.control_handle,
             Etw::EVENT_TRACE_CONTROL_STOP,
-        )?;
+        );
+        closed?;
+        stopped?;
         Ok(())
     }
 
