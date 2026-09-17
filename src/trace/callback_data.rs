@@ -1,9 +1,6 @@
-use std::{
-    collections::HashMap,
-    sync::{
-        Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+use std::sync::{
+    Arc, Mutex, RwLock,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use rustc_hash::FxHashMap;
@@ -16,9 +13,11 @@ use crate::{
 
 /// Data used by callbacks when the trace is running
 // NOTE: this structure is accessed in an unsafe block in a separate thread (see the
-// `trace_callback_thunk` function)       Thus, this struct must not be mutated (outside of interior
-// mutability and/or using Mutex and other synchronization mechanisms) when the associated trace is
-// running.
+// `trace_callback_thunk` function). Thus, this struct must only be mutated through interior
+// mutability backed by a synchronization primitive (atomics, the provider registry's RwLock, ...)
+// when the associated trace is running. Providers can be added and removed while the trace
+// processes events (see `UserTrace::enable_provider`/`disable_provider`, issue #54): the registry
+// is guarded by a RwLock, and user callbacks are only ever invoked *without* holding it.
 #[derive(Debug)]
 pub enum CallbackData {
     RealTime(RealTimeCallbackData),
@@ -35,12 +34,77 @@ pub struct RealTimeCallbackData {
     /// See [`RealTimeCallbackData::buffers_read`]
     events_lost: AtomicUsize,
     schema_locator: SchemaLocator,
-    /// List of Providers associated with the Trace. This also owns the callback closures and their
-    /// state
-    providers: Vec<Provider>,
-    /// Maps a provider GUID to the indices of `providers` with that GUID, so
-    /// that `on_event` does not linearly scan every provider on each event
-    providers_by_guid: FxHashMap<GUID, Vec<usize>>,
+    /// Providers associated with the Trace, along with their callback closures and
+    /// state. Behind a RwLock so that providers can be enabled/disabled while the
+    /// trace is processing events (issue #54): event dispatch takes a read lock,
+    /// while (un)registration takes the write lock. User callbacks run *after*
+    /// the lock has been released, so a callback may itself enable or disable
+    /// providers.
+    providers: RwLock<ProviderRegistry>,
+}
+
+/// The providers registered on a real-time trace, indexed both by insertion
+/// order and by GUID
+///
+/// Both collections must stay consistent: they are only mutated together, under
+/// the enclosing `RwLock`. Providers are shared as `Arc`s so that `on_event`
+/// can clone the ones it needs, release the lock, and only then run the user
+/// callbacks (which may take the lock again).
+#[derive(Debug, Default)]
+struct ProviderRegistry {
+    /// Providers in insertion order
+    providers: Vec<Arc<Provider>>,
+    /// Providers by GUID, so that `on_event` does not linearly scan every
+    /// provider on each event (a GUID may map to several entries: the library
+    /// allows registering the same provider GUID multiple times, each with its
+    /// own callbacks)
+    by_guid: FxHashMap<GUID, Vec<Arc<Provider>>>,
+}
+
+impl ProviderRegistry {
+    fn add(&mut self, provider: Arc<Provider>) {
+        self.by_guid
+            .entry(provider.guid())
+            .or_default()
+            .push(Arc::clone(&provider));
+        self.providers.push(provider);
+    }
+
+    /// Remove every entry registered for this GUID, returning how many were
+    /// removed
+    fn remove_all_by_guid(&mut self, guid: GUID) -> usize {
+        match self.by_guid.remove(&guid) {
+            None => 0,
+            Some(entries) => {
+                let same_guid = || self.providers.iter().filter(|p| p.guid() == guid).count();
+                debug_assert_eq!(entries.len(), same_guid());
+                self.providers.retain(|p| p.guid() != guid);
+                entries.len()
+            },
+        }
+    }
+
+    /// Remove one specific provider instance (identity comparison, not GUID
+    /// equality), used to roll back a registration whose OS-level enable
+    /// failed. Returns whether the provider was found.
+    fn remove_one(&mut self, provider: &Arc<Provider>) -> bool {
+        let guid = provider.guid();
+        let mut removed = false;
+        if let Some(entries) = self.by_guid.get_mut(&guid) {
+            entries.retain(|p| {
+                let same = Arc::ptr_eq(p, provider);
+                removed |= same;
+                !same
+            });
+        }
+        if removed {
+            if self.by_guid.get(&guid).is_some_and(Vec::is_empty) {
+                self.by_guid.remove(&guid);
+            }
+            self.providers.retain(|p| !Arc::ptr_eq(p, provider));
+        }
+        removed
+    }
 }
 
 pub struct CallbackDataFromFile {
@@ -102,8 +166,7 @@ impl Default for RealTimeCallbackData {
             buffers_read: AtomicUsize::new(0),
             events_lost: AtomicUsize::new(0),
             schema_locator: SchemaLocator::new(),
-            providers: Vec::new(),
-            providers_by_guid: HashMap::default(),
+            providers: RwLock::new(ProviderRegistry::default()),
         }
     }
 }
@@ -113,16 +176,38 @@ impl RealTimeCallbackData {
         Self::default()
     }
 
-    pub fn add_provider(&mut self, provider: Provider) {
-        self.providers_by_guid
-            .entry(provider.guid())
-            .or_default()
-            .push(self.providers.len());
-        self.providers.push(provider);
+    pub fn add_provider(&self, provider: Provider) {
+        self.providers.write().unwrap().add(Arc::new(provider));
     }
 
-    pub fn providers(&self) -> &[Provider] {
-        &self.providers
+    /// Same as [`RealTimeCallbackData::add_provider`], for a provider that is
+    /// already shared (the runtime `enable_provider` path keeps an `Arc` so it
+    /// can roll back the registration by identity)
+    pub(crate) fn add_provider_shared(&self, provider: Arc<Provider>) {
+        self.providers.write().unwrap().add(provider);
+    }
+
+    /// Whether at least one provider is registered for this GUID
+    pub fn has_provider_with_guid(&self, guid: GUID) -> bool {
+        self.providers.read().unwrap().by_guid.contains_key(&guid)
+    }
+
+    /// A snapshot of the registered providers, in registration order
+    pub fn providers(&self) -> Vec<Arc<Provider>> {
+        self.providers.read().unwrap().providers.clone()
+    }
+
+    /// Remove every entry registered for this GUID, returning how many were
+    /// removed. Does not touch the OS-level session configuration: the caller
+    /// is responsible for disabling the provider.
+    pub fn remove_all_by_guid(&self, guid: GUID) -> usize {
+        self.providers.write().unwrap().remove_all_by_guid(guid)
+    }
+
+    /// Rollback counterpart of [`RealTimeCallbackData::add_provider`]:
+    /// unregisters exactly this provider instance
+    pub(crate) fn remove_provider_instance(&self, provider: &Arc<Provider>) -> bool {
+        self.providers.write().unwrap().remove_one(provider)
     }
 
     /// How many events have been handled since this instance was created
@@ -141,16 +226,33 @@ impl RealTimeCallbackData {
     }
 
     pub fn provider_flags<T: RealTimeTraceTrait>(&self) -> Etw::EVENT_TRACE_FLAG {
-        Etw::EVENT_TRACE_FLAG(T::enable_flags(&self.providers))
+        Etw::EVENT_TRACE_FLAG(T::enable_flags(&self.providers()))
     }
 
     pub fn on_event(&self, record: &EventRecord) {
         self.events_handled.fetch_add(1, Ordering::Relaxed);
 
-        if let Some(providers) = self.providers_by_guid.get(&record.provider_id()) {
-            for &prov_idx in providers {
-                self.providers[prov_idx].on_event(record, &self.schema_locator);
-            }
+        // The lock must be released before running user callbacks: they may
+        // enable/disable providers (which takes the write lock), and holding a
+        // read lock over every callback would serialize all events. Hence the
+        // clones of the needed `Arc`s: removals racing with this dispatch are
+        // fine, the cloned providers simply receive their in-flight events.
+        let registry = self.providers.read().unwrap();
+        match registry.by_guid.get(&record.provider_id()) {
+            None => {},
+            // Fast path: a single provider for this GUID, no allocation
+            Some(entries) if entries.len() == 1 => {
+                let provider = Arc::clone(&entries[0]);
+                drop(registry);
+                provider.on_event(record, &self.schema_locator);
+            },
+            Some(entries) => {
+                let providers: Vec<Arc<Provider>> = entries.clone();
+                drop(registry);
+                for provider in providers {
+                    provider.on_event(record, &self.schema_locator);
+                }
+            },
         }
     }
 
@@ -221,7 +323,33 @@ impl std::fmt::Debug for CallbackDataFromFile {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
+
+    /// A record whose only meaningful field is the provider it comes from
+    fn record_for_provider(guid: GUID) -> EventRecord {
+        EventRecord(Etw::EVENT_RECORD {
+            EventHeader: Etw::EVENT_HEADER {
+                ProviderId: guid,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    /// A provider whose callback increments `counter` once per received event
+    fn counting_provider<G: crate::provider::IntoGuid>(
+        guid: G,
+        counter: &Arc<AtomicUsize>,
+    ) -> Provider {
+        let bump = Arc::clone(counter);
+        Provider::by_guid(guid)
+            .add_callback(move |_, _| {
+                bump.fetch_add(1, Ordering::Relaxed);
+            })
+            .build()
+    }
 
     #[test]
     fn buffer_stats_track_the_running_totals_of_a_real_time_trace() {
@@ -250,5 +378,98 @@ mod tests {
         callback_data.on_buffer(4, 1);
         assert_eq!(callback_data.buffers_read(), 5);
         assert_eq!(callback_data.events_lost(), 3);
+    }
+
+    #[test]
+    fn runtime_providers_are_listed_in_registration_order() {
+        let callback_data = RealTimeCallbackData::new();
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+        callback_data.add_provider(Provider::by_guid(0x2222).build());
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+
+        let providers = callback_data.providers();
+        assert_eq!(
+            providers.iter().map(|p| p.guid()).collect::<Vec<_>>(),
+            vec![
+                GUID::from_u128(0x1111),
+                GUID::from_u128(0x2222),
+                GUID::from_u128(0x1111)
+            ]
+        );
+        assert!(callback_data.has_provider_with_guid(GUID::from_u128(0x2222)));
+        assert!(!callback_data.has_provider_with_guid(GUID::from_u128(0x3333)));
+    }
+
+    #[test]
+    fn runtime_disable_removes_every_entry_of_that_guid() {
+        let callback_data = RealTimeCallbackData::new();
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+        callback_data.add_provider(Provider::by_guid(0x2222).build());
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+
+        // Disabling a GUID removes all of its entries, and only them
+        assert_eq!(callback_data.remove_all_by_guid(GUID::from_u128(0x1111)), 2);
+        let remaining = callback_data.providers();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].guid(), GUID::from_u128(0x2222));
+        assert!(!callback_data.has_provider_with_guid(GUID::from_u128(0x1111)));
+
+        // A second disable has nothing left to remove
+        assert_eq!(callback_data.remove_all_by_guid(GUID::from_u128(0x1111)), 0);
+        assert_eq!(callback_data.providers().len(), 1);
+    }
+
+    #[test]
+    fn rollback_removes_only_the_rolled_back_instance() {
+        // Two registrations of the same GUID: rolling back one (because its
+        // OS-level enable failed) must leave the other one dispatching
+        let callback_data = RealTimeCallbackData::new();
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+        callback_data.add_provider(Provider::by_guid(0x1111).build());
+        callback_data.add_provider(Provider::by_guid(0x2222).build());
+
+        let victim = callback_data.providers().remove(0); // first 0x1111 entry
+        assert!(callback_data.remove_provider_instance(&victim));
+        // The instance is gone, but its GUID still has an entry...
+        assert!(callback_data.has_provider_with_guid(GUID::from_u128(0x1111)));
+        assert_eq!(callback_data.providers().len(), 2);
+
+        // ...and the exact same Arc is not registered twice (removal is idempotent)
+        assert!(!callback_data.remove_provider_instance(&victim));
+        assert_eq!(callback_data.providers().len(), 2);
+    }
+
+    #[test]
+    fn on_event_dispatches_to_every_matching_provider_only() {
+        let callback_data = RealTimeCallbackData::new();
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let other = Arc::new(AtomicUsize::new(0));
+        // Same GUID registered twice: both entries must receive the event
+        callback_data.add_provider(counting_provider(0x1111, &first));
+        callback_data.add_provider(counting_provider(0x1111, &second));
+        callback_data.add_provider(counting_provider(0x2222, &other));
+
+        callback_data.on_event(&record_for_provider(GUID::from_u128(0x1111)));
+        assert_eq!(first.load(Ordering::Relaxed), 1);
+        assert_eq!(second.load(Ordering::Relaxed), 1);
+        assert_eq!(other.load(Ordering::Relaxed), 0);
+        assert_eq!(callback_data.events_handled(), 1);
+
+        // Unknown providers are not dispatched, but still counted as handled
+        callback_data.on_event(&record_for_provider(GUID::from_u128(0x3333)));
+        assert_eq!(first.load(Ordering::Relaxed), 1);
+        assert_eq!(callback_data.events_handled(), 2);
+    }
+
+    #[test]
+    fn on_event_does_not_dispatch_disabled_providers() {
+        let callback_data = RealTimeCallbackData::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        callback_data.add_provider(counting_provider(0x1111, &counter));
+
+        callback_data.remove_all_by_guid(GUID::from_u128(0x1111));
+        callback_data.on_event(&record_for_provider(GUID::from_u128(0x1111)));
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

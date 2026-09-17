@@ -18,8 +18,8 @@ use crate::{
         etw_types::{EventTraceProperties, SubscriptionSource},
         evntrace::{
             ControlHandle, TraceHandle, capture_provider_state, close_trace, control_trace,
-            control_trace_by_name, enable_provider, enable_stack_tracing, open_trace,
-            process_trace, set_extended_kernel_groups, start_trace,
+            control_trace_by_name, disable_provider, enable_provider, enable_stack_tracing,
+            open_trace, process_trace, set_extended_kernel_groups, start_trace,
         },
         version_helper,
     },
@@ -705,11 +705,132 @@ impl UserTrace {
         if let CallbackData::RealTime(rt) = &**self.callback_data {
             for provider in rt.providers() {
                 if provider.requests_capture_state() {
-                    capture_provider_state(self.control_handle, provider)?;
+                    capture_provider_state(self.control_handle, &provider)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// Enable an additional provider on a started (possibly processing) trace
+    ///
+    /// This is the runtime counterpart of [`TraceBuilder::enable`]: the
+    /// provider is registered for event dispatch, then enabled on the session
+    /// with `EnableTraceEx2`. Events start flowing to the provider's callbacks
+    /// right away, even if another thread is already blocked in `process`.
+    ///
+    /// If the provider was built with
+    /// [`ProviderBuilder::request_capture_state`](crate::provider::ProviderBuilder::request_capture_state),
+    /// a rundown is requested once the enable succeeded (same order as
+    /// [`TraceBuilder::start`]). A rundown error does not undo the enable: the
+    /// provider stays enabled and registered, but the error is returned.
+    ///
+    /// On failure of the enable itself, the registration is rolled back and
+    /// the error returned.
+    ///
+    /// The same provider GUID may be enabled several times: each entry keeps
+    /// its own callbacks (but see [`UserTrace::disable_provider`] about how
+    /// Windows only keeps one configuration per GUID, the last one enabled).
+    ///
+    /// Only a `UserTrace` owns the session it processes, so this method
+    /// exists here only. Kernel traces select their events through
+    /// `EnableFlags`/group masks, which can only be changed through another
+    /// (unsupported) `ControlTrace` flow, and [`FileTrace`](crate::trace::FileTrace)
+    /// has no session at all. Traces obtained through
+    /// [`TraceBuilder::open_existing`] hold no control handle: this returns
+    /// an error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw::trace::UserTrace;
+    /// # let trace = UserTrace::new().start_and_process().unwrap();
+    /// let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
+    ///     .add_callback(|_event, _schema| { /* ... */ })
+    ///     .build();
+    /// trace.enable_provider(provider).unwrap();
+    /// ```
+    pub fn enable_provider(&self, provider: Provider) -> TraceResult<()> {
+        let provider = Arc::new(provider);
+        // Register first, enable second: once the OS starts delivering events,
+        // the dispatch registry must already know the provider. A UserTrace
+        // always holds real-time callback data.
+        if let CallbackData::RealTime(rt) = &**self.callback_data {
+            rt.add_provider_shared(Arc::clone(&provider));
+        }
+
+        if let Err(e) = enable_provider(self.control_handle, &provider) {
+            // Rollback so the callbacks of a provider the OS rejected never
+            // fire
+            if let CallbackData::RealTime(rt) = &**self.callback_data {
+                rt.remove_provider_instance(&provider);
+            }
+            return Err(e.into());
+        }
+
+        if provider.requests_capture_state() {
+            capture_provider_state(self.control_handle, &provider)?;
+        }
+        Ok(())
+    }
+
+    /// Disable a provider on a started (possibly processing) trace, removing
+    /// **every** entry registered for this GUID
+    ///
+    /// This sends `EVENT_CONTROL_CODE_DISABLE_PROVIDER` to the session, then
+    /// unregisters all the entries with this GUID (the library allows several
+    /// registrations of the same GUID, each with its own callbacks; Windows
+    /// itself only ever holds one configuration per GUID, so all entries are
+    /// removed together). Returns how many entries were removed.
+    ///
+    /// Notes:
+    /// * If no entry is registered for this GUID, this returns `Ok(0)` without touching the
+    ///   session.
+    /// * If the OS rejects the disable (e.g. the provider was not enabled on this session), the
+    ///   error is returned and the registry is left untouched.
+    /// * Events already buffered may still be delivered to the removed callbacks for a short while
+    ///   after this returns.
+    /// * Like [`UserTrace::enable_provider`], this is only available on a `UserTrace` that owns its
+    ///   session: a [`TraceBuilder::open_existing`] trace returns an error, kernel traces and file
+    ///   traces do not offer this method.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ferrisetw::trace::UserTrace;
+    /// # use windows::core::GUID;
+    /// # let trace = UserTrace::new().start_and_process().unwrap();
+    /// # let guid = GUID::new().unwrap();
+    /// let removed = trace.disable_provider(guid).unwrap();
+    /// assert_eq!(removed, 1);
+    /// ```
+    pub fn disable_provider(&self, guid: GUID) -> TraceResult<usize> {
+        // A UserTrace always holds real-time callback data
+        let CallbackData::RealTime(rt) = &**self.callback_data else {
+            return Ok(0);
+        };
+        if !rt.has_provider_with_guid(guid) {
+            // Nothing of ours is registered under this GUID: do not touch the
+            // session (disabling a provider we never enabled would be surprising)
+            return Ok(0);
+        }
+        // Disable at the OS level first, unregister second: should the OS
+        // reject the request, the registry (and thus dispatch) stays unchanged
+        disable_provider(self.control_handle, guid)?;
+        Ok(rt.remove_all_by_guid(guid))
+    }
+
+    /// The providers currently registered on this trace, in registration order
+    ///
+    /// The snapshot includes providers enabled at build time (through
+    /// [`TraceBuilder::enable`]) and at runtime (through
+    /// [`UserTrace::enable_provider`]).
+    #[must_use]
+    pub fn providers(&self) -> Vec<Arc<Provider>> {
+        // A UserTrace always holds real-time callback data
+        match &**self.callback_data {
+            CallbackData::RealTime(rt) => rt.providers(),
+            CallbackData::FromFile(_) => Vec::new(),
+        }
     }
 }
 
@@ -768,7 +889,7 @@ mod private {
             callback_data: Box<Arc<CallbackData>>,
         ) -> Self;
         fn augmented_file_mode() -> u32;
-        fn enable_flags(_providers: &[Provider]) -> u32;
+        fn enable_flags(_providers: &[Arc<Provider>]) -> u32;
     }
 
     pub trait PrivateTraceTrait {
@@ -810,7 +931,7 @@ impl PrivateRealTimeTraceTrait for UserTrace {
         0
     }
 
-    fn enable_flags(_providers: &[Provider]) -> u32 {
+    fn enable_flags(_providers: &[Arc<Provider>]) -> u32 {
         0
     }
 }
@@ -864,7 +985,7 @@ impl PrivateRealTimeTraceTrait for KernelTrace {
         }
     }
 
-    fn enable_flags(providers: &[Provider]) -> u32 {
+    fn enable_flags(providers: &[Arc<Provider>]) -> u32 {
         providers.iter().fold(0, |acc, x| acc | x.kernel_flags())
     }
 }
@@ -956,10 +1077,12 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// This will invoke the provider's callback whenever an event is available
     ///
     /// # Note
-    /// Windows API seems to support removing providers, or changing its properties when the session is processing events (see <https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks>)    /// Currently, this crate only supports defining Providers and their settings when building the trace, because it is easier to ensure memory-safety this way.
-    /// It probably would be possible to support changing Providers when the trace is processing, but this is left as a TODO (see <https://github.com/n4r1b/ferrisetw/issues/54>)
+    /// The provider is enabled when the trace is started. Providers can also be
+    /// enabled (or disabled) later, on a running trace, through
+    /// [`UserTrace::enable_provider`] and [`UserTrace::disable_provider`]
+    /// (user traces only, see <https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-enabletraceex2#remarks>)
     #[must_use]
-    pub fn enable(mut self, provider: Provider) -> Self {
+    pub fn enable(self, provider: Provider) -> Self {
         self.rt_callback_data.add_provider(provider);
         self
     }
@@ -1038,7 +1161,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
 
         if T::TRACE_KIND == private::TraceKind::User {
             for prov in self.rt_callback_data.providers() {
-                enable_provider(control_handle, prov)?;
+                enable_provider(control_handle, &prov)?;
             }
         }
 
@@ -1056,7 +1179,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             if let CallbackData::RealTime(rt) = &**callback_data {
                 for prov in rt.providers() {
                     if prov.requests_capture_state() {
-                        capture_provider_state(control_handle, prov)?;
+                        capture_provider_state(control_handle, &prov)?;
                     }
                 }
             }
@@ -1316,6 +1439,29 @@ mod test {
         native::etw_types::PerfinfoGroupmask, provider::kernel_providers::SYSTEM_CALL_PROVIDER,
     };
 
+    /// A `UserTrace` whose control handle is invalid (value 0), as if it had
+    /// been obtained through `open_existing`: enough to exercise the runtime
+    /// provider registry and the error paths of enable/disable, without an
+    /// actual ETW session (which would need administrator privileges)
+    fn trace_without_session(providers: Vec<Provider>) -> UserTrace {
+        let rt_callback_data = RealTimeCallbackData::new();
+        for provider in providers {
+            rt_callback_data.add_provider(provider);
+        }
+        let wide_name = U16CString::from_str_truncate("ferrisetw-test-trace");
+        UserTrace {
+            properties: EventTraceProperties::new::<UserTrace>(
+                &wide_name,
+                None,
+                &TraceProperties::default(),
+                Etw::EVENT_TRACE_FLAG::default(),
+            ),
+            control_handle: ControlHandle { Value: 0 },
+            trace_handle: TraceHandle { Value: 0 },
+            callback_data: Box::new(Arc::new(CallbackData::RealTime(rt_callback_data))),
+        }
+    }
+
     #[test]
     fn test_enable_multiple_providers() {
         let prov = Provider::by_guid(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716).build();
@@ -1324,6 +1470,40 @@ mod test {
         let trace_builder = UserTrace::new().enable(prov).enable(prov1);
 
         assert_eq!(trace_builder.rt_callback_data.providers().len(), 2);
+    }
+
+    #[test]
+    fn runtime_enable_without_control_handle_fails_and_rolls_back() {
+        let trace = trace_without_session(vec![Provider::by_guid(0x1111).build()]);
+
+        let result = trace.enable_provider(Provider::by_guid(0x2222).build());
+        assert!(matches!(
+            result,
+            Err(TraceError::EtwNativeError(
+                EvntraceNativeError::InvalidHandle
+            ))
+        ));
+        // The pre-existing registration is intact, the failed one was rolled back
+        assert_eq!(trace.providers().len(), 1);
+        assert_eq!(trace.providers()[0].guid(), GUID::from_u128(0x1111));
+    }
+
+    #[test]
+    fn runtime_disable_without_control_handle_fails_and_keeps_the_registry() {
+        let guid = GUID::from_u128(0x1111);
+        let trace = trace_without_session(vec![Provider::by_guid(guid).build()]);
+
+        let result = trace.disable_provider(guid);
+        assert!(matches!(
+            result,
+            Err(TraceError::EtwNativeError(
+                EvntraceNativeError::InvalidHandle
+            ))
+        ));
+        assert_eq!(trace.providers().len(), 1);
+
+        // A GUID nothing is registered under is a no-op, session untouched
+        assert_eq!(trace.disable_provider(GUID::from_u128(0x3333)).unwrap(), 0);
     }
 
     #[test]

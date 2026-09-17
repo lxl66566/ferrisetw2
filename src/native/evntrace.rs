@@ -21,8 +21,9 @@ use windows::{
         System::Diagnostics::{
             Etw,
             Etw::{
-                EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
-                EVENT_FILTER_TYPE_STACKWALK, TRACE_QUERY_INFO_CLASS,
+                EVENT_CONTROL_CODE_CAPTURE_STATE, EVENT_CONTROL_CODE_DISABLE_PROVIDER,
+                EVENT_CONTROL_CODE_ENABLE_PROVIDER, EVENT_FILTER_TYPE_STACKWALK,
+                TRACE_QUERY_INFO_CLASS,
             },
         },
     },
@@ -130,11 +131,14 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
                 //    allocated and created
                 //  * we've just checked using UNIQUE_VALID_CONTEXTS that this `CallbackData` has
                 //    not been dropped
-                //  * the API of this crate guarantees this `CallbackData` is not mutated from
-                //    another thread during the trace:
+                //  * the API of this crate guarantees this `CallbackData` is not unsynchronizedly
+                //    mutated from another thread during the trace:
                 //      * we're the only one to change CallbackData::events_handled (and that's an
                 //        atomic, so it's fine)
-                //      * the list of Providers is a constant (may change in the future with #54)
+                //      * the provider registry may be mutated at any time (providers can be
+                //        enabled/disabled while the trace runs, issue #54), but only under its
+                //        RwLock, which `on_event` also takes (and it never holds it while running
+                //        user callbacks)
                 //      * the schema_locator only has interior mutability
                 p_callback_data.as_ref()
             };
@@ -382,6 +386,42 @@ pub(crate) fn enable_provider(
                     provider.all(),
                     0,
                     Some(parameters.as_ptr()),
+                )
+            }
+            .ok();
+
+            res.map_err(|err| {
+                EvntraceNativeError::IoError(std::io::Error::from_raw_os_error(err.code().0))
+            })
+        },
+    }
+}
+
+/// Detach a provider from a trace
+///
+/// Sends `EVENT_CONTROL_CODE_DISABLE_PROVIDER` through `EnableTraceEx2`, so the
+/// session stops collecting the provider's events. Level, keywords and filters
+/// are irrelevant for a disable, so they are zeroed/not passed.
+pub(crate) fn disable_provider(
+    control_handle: ControlHandle,
+    guid: GUID,
+) -> EvntraceNativeResult<()> {
+    match filter_invalid_control_handle(control_handle) {
+        None => Err(EvntraceNativeError::InvalidHandle),
+        Some(handle) => {
+            let res = unsafe {
+                // Safety:
+                //  * the control handle is valid (by construction)
+                //  * the provider GUID is a valid, readable GUID
+                Etw::EnableTraceEx2(
+                    handle,
+                    std::ptr::from_ref::<GUID>(&guid),
+                    EVENT_CONTROL_CODE_DISABLE_PROVIDER.0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
                 )
             }
             .ok();
