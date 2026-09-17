@@ -852,11 +852,45 @@ pub(crate) fn set_extended_kernel_groups(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Barrier, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
     use widestring::U16CString;
     use windows::Win32::Foundation::ERROR_INVALID_PARAMETER;
 
     use super::*;
     use crate::{provider::EventFilter, trace::callback_data::RealTimeCallbackData};
+
+    /// The provider GUID of the counting provider used by the thunk tests
+    const COUNTED_PROVIDER: u128 = 0x1212;
+
+    /// A real-time callback data whose well-known provider increments `counter` per event
+    fn counting_callback_data(counter: &Arc<AtomicUsize>) -> Arc<CallbackData> {
+        let bump = Arc::clone(counter);
+        let data = RealTimeCallbackData::new();
+        data.add_provider(
+            Provider::by_guid(COUNTED_PROVIDER)
+                .add_callback(move |_, _| {
+                    bump.fetch_add(1, Ordering::Relaxed);
+                })
+                .build(),
+        );
+        Arc::new(CallbackData::RealTime(data))
+    }
+
+    /// An event record whose only meaningful fields are the provider and the user context
+    fn record_for(provider: u128, user_context: *mut c_void) -> Etw::EVENT_RECORD {
+        Etw::EVENT_RECORD {
+            EventHeader: Etw::EVENT_HEADER {
+                ProviderId: GUID::from_u128(provider),
+                ..Default::default()
+            },
+            UserContext: user_context,
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn win32_errors_map_to_their_raw_code_not_the_hresult() {
@@ -983,5 +1017,227 @@ mod tests {
         // The context of the failed open was dropped inside `open_trace`, which
         // unregistered it (see `TraceContext::drop`): no dead id piles up in the
         // registry
+    }
+
+    #[test]
+    fn thunk_drops_events_of_unknown_contexts() {
+        // A minted-but-never-registered id: no `TraceContext` was built with it, so the
+        // thunk must drop the event without touching any callback
+        let counter = Arc::new(AtomicUsize::new(0));
+        let _unregistered = counting_callback_data(&counter);
+        let id = TraceContextId::mint();
+
+        let mut record = record_for(COUNTED_PROVIDER, id.as_user_context());
+        trace_callback_thunk(&raw mut record);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn registered_contexts_dispatch_until_they_are_unregistered() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let context = TraceContext::new(counting_callback_data(&counter));
+
+        let mut record = record_for(COUNTED_PROVIDER, context.id().as_user_context());
+        trace_callback_thunk(&raw mut record);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(context.events_handled(), 1);
+
+        // What `close_trace` does before `CloseTrace`: from then on, the events still
+        // queued by ETW carry a retired id and must be dropped, not dispatched
+        context.unregister();
+        trace_callback_thunk(&raw mut record);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(context.events_handled(), 1);
+    }
+
+    #[test]
+    fn a_callback_past_the_lookup_survives_close_and_drop() {
+        // The P1-1 race: a delivery thread resolved its context, then the trace was closed
+        // and fully dropped before the callback body ran. The `Arc` handed out by the
+        // registry keeps the callback data alive, so the in-flight callback must dispatch
+        // on live memory, while events looked up after the retirement must be dropped.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let data = counting_callback_data(&counter);
+        let context = TraceContext::new(Arc::clone(&data));
+        let id = context.id();
+
+        // The delivery thread won the race against the close: it holds its own `Arc`
+        let in_flight = CONTEXT_REGISTRY.get(id).unwrap();
+
+        // ... then the trace closes and is entirely dropped (retiring the context)
+        context.unregister();
+        drop(context);
+        drop(data);
+
+        let record = EventRecord(record_for(COUNTED_PROVIDER, id.as_user_context()));
+        in_flight.on_event(&record);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+
+        // Later lookups of the retired context miss: their events are dropped
+        assert!(CONTEXT_REGISTRY.get(id).is_none());
+    }
+
+    #[test]
+    fn a_new_trace_never_reuses_a_closed_context_id() {
+        // ABA: a stale event of a closed trace carries its retired id. Even if a newer
+        // trace's callback data landed on the very same memory, the ids differ, so the
+        // stale event can only miss the registry instead of dispatching into the new trace
+        let counter = Arc::new(AtomicUsize::new(0));
+        let first = TraceContext::new(counting_callback_data(&counter));
+        let first_id = first.id();
+        drop(first);
+
+        let second = TraceContext::new(counting_callback_data(&counter));
+        assert_ne!(second.id(), first_id);
+        assert!(CONTEXT_REGISTRY.get(first_id).is_none());
+        assert!(CONTEXT_REGISTRY.get(second.id()).is_some());
+
+        let mut stale = record_for(COUNTED_PROVIDER, first_id.as_user_context());
+        trace_callback_thunk(&raw mut stale);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+
+        let mut fresh = record_for(COUNTED_PROVIDER, second.id().as_user_context());
+        trace_callback_thunk(&raw mut fresh);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        assert_eq!(second.events_handled(), 1);
+    }
+
+    #[test]
+    fn buffer_thunk_records_the_totals_of_registered_contexts_only() {
+        let data = Arc::new(CallbackData::RealTime(RealTimeCallbackData::new()));
+        let context = TraceContext::new(Arc::clone(&data));
+
+        let mut log_file = Etw::EVENT_TRACE_LOGFILEW {
+            Context: context.id().as_user_context(),
+            BuffersRead: 3,
+            EventsLost: 1,
+            ..Default::default()
+        };
+        buffer_callback_thunk(&raw mut log_file);
+        assert_eq!(data.buffers_read(), 3);
+        assert_eq!(data.events_lost(), 1);
+
+        // Stale buffer reports of a retired context are dropped too
+        context.unregister();
+        let mut stale = Etw::EVENT_TRACE_LOGFILEW {
+            Context: context.id().as_user_context(),
+            BuffersRead: 9,
+            EventsLost: 9,
+            ..Default::default()
+        };
+        buffer_callback_thunk(&raw mut stale);
+        assert_eq!(data.buffers_read(), 3);
+        assert_eq!(data.events_lost(), 1);
+    }
+
+    #[test]
+    fn dispatch_survives_racing_registrations_and_unregistrations() {
+        // Stress the lookup/close interleaving: dispatcher threads simulate ETW delivery
+        // (registry lookup + dispatch, replaying both live and stale ids), while closer
+        // threads churn registrations (as open/close races do). Whatever the interleaving:
+        // a successful lookup must hand out a live `Arc`, dispatch exactly once into the
+        // instance it resolved, retired ids must never dispatch again, and the ids left
+        // registered must all resolve.
+        const DISPATCHERS: usize = 4;
+        const CLOSERS: usize = 2;
+        const INSTANCES: usize = 4;
+        const DISPATCH_ROUNDS: usize = 20_000;
+        const CHURN_ROUNDS: usize = 2_000;
+
+        /// One registered trace instance: its context id, and which of the fixed
+        /// callback data it dispatches to
+        struct Registration {
+            id: TraceContextId,
+            instance: usize,
+        }
+
+        // The instances are owned here so their counters stay readable after unregistration
+        let instances: Vec<Arc<CallbackData>> = (0..INSTANCES)
+            .map(|_| Arc::new(CallbackData::RealTime(RealTimeCallbackData::new())))
+            .collect();
+        let live: Mutex<Vec<Registration>> = Mutex::new(
+            (0..INSTANCES)
+                .map(|instance| {
+                    let id = TraceContextId::mint();
+                    CONTEXT_REGISTRY.insert(id, Arc::clone(&instances[instance]));
+                    Registration { id, instance }
+                })
+                .collect(),
+        );
+        // The initially registered ids: the closers retire all of them and replace them
+        // with fresh ones, so the dispatchers replay a mix of live and stale ids
+        let replayed_ids: Vec<TraceContextId> = live.lock().unwrap().iter().map(|r| r.id).collect();
+        let next_slot = AtomicUsize::new(0);
+        let dispatched = AtomicUsize::new(0);
+
+        let barrier = Arc::new(Barrier::new(DISPATCHERS + CLOSERS));
+        std::thread::scope(|s| {
+            for _ in 0..DISPATCHERS {
+                let barrier = Arc::clone(&barrier);
+                let (replayed_ids, next_slot, dispatched) =
+                    (&replayed_ids, &next_slot, &dispatched);
+                s.spawn(move || {
+                    barrier.wait();
+                    // No provider matches this GUID: on_event only counts the dispatch
+                    let record = EventRecord(Etw::EVENT_RECORD {
+                        EventHeader: Etw::EVENT_HEADER {
+                            ProviderId: GUID::from_u128(0x9999),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                    for _ in 0..DISPATCH_ROUNDS {
+                        let slot = next_slot.fetch_add(1, Ordering::Relaxed) % replayed_ids.len();
+                        if let Some(callback_data) = CONTEXT_REGISTRY.get(replayed_ids[slot]) {
+                            dispatched.fetch_add(1, Ordering::Relaxed);
+                            callback_data.on_event(&record);
+                        }
+                    }
+                });
+            }
+            for _ in 0..CLOSERS {
+                let barrier = Arc::clone(&barrier);
+                let (live, instances) = (&live, &instances);
+                s.spawn(move || {
+                    barrier.wait();
+                    for round in 0..CHURN_ROUNDS {
+                        // Close a registration (as `close_trace` does), then register the
+                        // same instance afresh (as a new open would: a brand-new id). The
+                        // instance is picked round-robin, so every initially registered id
+                        // is deterministically retired along the way.
+                        let target = round % INSTANCES;
+                        let retired = {
+                            let mut guard = live.lock().unwrap();
+                            match guard.iter().position(|reg| reg.instance == target) {
+                                Some(pos) => guard.remove(pos),
+                                // The same instance is mid-re-registration in the other
+                                // closer: nothing to retire this round
+                                None => continue,
+                            }
+                        };
+                        CONTEXT_REGISTRY.remove(retired.id);
+                        let id = TraceContextId::mint();
+                        CONTEXT_REGISTRY.insert(id, Arc::clone(&instances[retired.instance]));
+                        live.lock().unwrap().push(Registration {
+                            id,
+                            instance: retired.instance,
+                        });
+                    }
+                });
+            }
+        });
+
+        // Every successful lookup dispatched exactly once, into a live instance
+        let total_handled: usize = instances.iter().map(|d| d.events_handled()).sum();
+        assert_eq!(dispatched.load(Ordering::Relaxed), total_handled);
+
+        // All the initially registered ids were retired by the churn: none resolves
+        for id in replayed_ids {
+            assert!(CONTEXT_REGISTRY.get(id).is_none());
+        }
+        // The registrations left by the closers all resolve
+        for registration in live.lock().unwrap().iter() {
+            assert!(CONTEXT_REGISTRY.get(registration.id).is_some());
+        }
     }
 }
