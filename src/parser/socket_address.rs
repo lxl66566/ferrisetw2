@@ -73,8 +73,15 @@ impl std::fmt::Display for AddressFamily {
 /// Only IPv4 and IPv6 socket addresses are decoded (`sa_family`, address and
 /// port); anything else keeps the raw bytes as reported by TDH.
 ///
-/// Byte order: `sa_family` is a host-order struct field, while the port,
-/// flow info and scope id are stored in network order, as on the wire.
+/// Byte order: `sa_family` is a host-order struct field, while the port, flow
+/// info and scope id are parsed as network order, as documented for `sockaddr`
+/// ("Except for the *sin\*_family* parameter, sockaddr contents are expressed
+/// in network byte order"; likewise `SOCKADDR_IN6`: "All of the data in the
+/// SOCKADDR_IN6 structure, except for the address family, must be specified in
+/// network-byte-order"). Some providers reportedly store host-order flow
+/// info/scope id anyway (e.g. by copying their in-memory `sockaddr_in6`, whose
+/// `sin6_scope_id` holds an interface index): the payload alone cannot tell
+/// the two layouts apart, so such values come out byte-swapped.
 ///
 /// # Example
 /// ```
