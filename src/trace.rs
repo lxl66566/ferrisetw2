@@ -1035,6 +1035,56 @@ impl PrivateTraceTrait for FileTrace {
     }
 }
 
+/// Stops a half-started session when [`TraceBuilder::start`] fails after `StartTraceW`
+///
+/// `StartTraceW` leaves a live session behind, under a random name the caller never sees
+/// when `start` fails: the returned error cannot tell them how to stop it. This guard stops
+/// the session on the way out (and closes the consumer once `OpenTraceW` provided one),
+/// with the same steps as `PrivateTraceTrait::non_consuming_stop`: it is the `Drop` path of
+/// a trace that never made it to a `Trace`.
+struct StartedSessionGuard<'a> {
+    /// The session properties, also serving as the in/out buffer of the STOP call
+    properties: &'a mut EventTraceProperties,
+    control_handle: ControlHandle,
+    /// The consumer side, registered as soon as `open_trace` succeeded
+    consumer: Option<(TraceHandle, TraceContext)>,
+    /// Whether the session was handed over to the built trace
+    handed_over: bool,
+}
+
+impl StartedSessionGuard<'_> {
+    /// Marks the session as owned by the built trace, returning its consumer half
+    fn hand_over(&mut self) -> (TraceHandle, TraceContext) {
+        self.handed_over = true;
+        self.consumer
+            .take()
+            .expect("the consumer is registered right after `open_trace`")
+    }
+}
+
+impl Drop for StartedSessionGuard<'_> {
+    fn drop(&mut self) {
+        if self.handed_over {
+            return;
+        }
+        // Best-effort: this runs on a failure path whose original error is the one worth
+        // reporting. A failed STOP is logged, as it leaves a live session behind.
+        if let Some((trace_handle, context)) = self.consumer.take() {
+            let _ignored_error_in_drop = close_trace(trace_handle, &context);
+        }
+        if let Err(err) = control_trace(
+            self.properties,
+            self.control_handle,
+            Etw::EVENT_TRACE_CONTROL_STOP,
+        ) {
+            log::error!(
+                "failed to stop a session that `TraceBuilder::start` could not finish building: \
+                 {err:?}"
+            );
+        }
+    }
+}
+
 impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Define the trace name
     ///
@@ -1130,6 +1180,11 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     ///   spawns a thread for you, call [`TraceBuilder::start`] on the trace, and returns
     ///   immediately.<br/> This option returns a `T`, so you can explicitly stop the trace, but
     ///   there is no way to get the status code of the ProcessTrace API.
+    ///
+    /// If a failure happens once the session is already running (a rejected provider enable,
+    /// a failed `OpenTraceW`, ...), the half-built session is stopped (and its consumer
+    /// closed) before the error is returned: no session is left running behind the caller's
+    /// back.
     pub fn start(self) -> TraceResult<(T, TraceHandle)> {
         if self.stop_if_exist {
             stop_trace_by_name(&self.name)?;
@@ -1160,7 +1215,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
         };
 
         let flags = self.rt_callback_data.provider_flags::<T>();
-        let (full_properties, control_handle) = start_trace::<T>(
+        let (mut full_properties, control_handle) = start_trace::<T>(
             &trace_wide_name,
             wide_etl_dump_file
                 .as_ref()
@@ -1168,6 +1223,15 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             &self.properties,
             flags,
         )?;
+
+        // From here on, a session is running in the kernel: any failure must stop it on
+        // the way out, or it would keep running under a name the caller never sees
+        let mut started = StartedSessionGuard {
+            properties: &mut full_properties,
+            control_handle,
+            consumer: None,
+            handed_over: false,
+        };
 
         // Kernel-only TraceSetInformation configuration, applied between StartTraceW and
         // OpenTraceW (the control handle is valid as soon as the session is started, and the
@@ -1187,21 +1251,31 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             SubscriptionSource::RealTimeSession(trace_wide_name),
             Arc::new(CallbackData::RealTime(self.rt_callback_data)),
         )?;
+        // Registered before anything that may fail past this point: a failure from here on
+        // must close the consumer, not just stop the session
+        started.consumer = Some((trace_handle, context));
 
         // Request provider states (rundown) now that the consumer is attached:
         // real-time sessions drop events nobody listens to, so this must happen
         // after `open_trace` (same ordering as krabsetw, which fires it right
         // before ProcessTrace)
         if T::TRACE_KIND == private::TraceKind::User {
-            if let CallbackData::RealTime(rt) = &*context {
-                for prov in rt.providers() {
-                    if prov.requests_capture_state() {
-                        capture_provider_state(control_handle, &prov)?;
+            if let Some((_, context)) = started.consumer.as_ref() {
+                if let CallbackData::RealTime(rt) = &**context {
+                    for prov in rt.providers() {
+                        if prov.requests_capture_state() {
+                            capture_provider_state(control_handle, &prov)?;
+                        }
                     }
                 }
             }
         }
 
+        // The built trace now owns the session. The guard holds a mutable borrow of
+        // `full_properties`, and a type with `Drop` keeps its borrows until the end of
+        // the scope: end it explicitly, so the properties can move into `T::build`
+        let (trace_handle, context) = started.hand_over();
+        drop(started);
         Ok((
             T::build(full_properties, control_handle, trace_handle, context),
             trace_handle,
