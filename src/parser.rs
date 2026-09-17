@@ -101,9 +101,6 @@ pub use socket_address::{AddressFamily, TdhSocketAddress};
 /// allocating a key per parsed property.
 struct CachedSlices<'schema, 'record> {
     slices: Vec<PropertySlice<'schema, 'record>>,
-    /// Structure member lookups (registered by `try_parse_member`); they are
-    /// not part of the top-level walk, so they must not advance it
-    members: Vec<PropertySlice<'schema, 'record>>,
     /// Where the next name lookup starts probing
     next_probe: usize,
     /// The user buffer index we've cached up to
@@ -325,45 +322,51 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             }
         }
 
-        // Top-level properties shadow same-named structure members
-        if let Some(slice) = cache.members.iter().find(|s| s.property.name == name) {
-            return Ok(*slice);
-        }
-
-        // If we've parsed every property already, that means no property matches this name
-        let Some(properties_not_parsed_yet) = self.properties.get(cache.slices.len()..) else {
-            return Err(ParserError::NotFound);
-        };
-
-        for property in properties_not_parsed_yet {
-            let Some(remaining_user_buffer) =
-                self.record.user_buffer().get(cache.last_cached_offset..)
-            else {
-                return Err(ParserError::PropertyError(
-                    "Invalid buffer bounds".to_owned(),
-                ));
-            };
-
-            let prop_size = self.find_property_size(property, remaining_user_buffer)?;
-            let Some(property_buffer) = remaining_user_buffer.get(..prop_size) else {
-                return Err(ParserError::PropertyError(
-                    "Property length out of buffer bounds".to_owned(),
-                ));
-            };
-
-            let prop_slice = PropertySlice {
-                property,
-                buffer: property_buffer,
-            };
-            cache.slices.push(prop_slice);
-            cache.last_cached_offset += prop_size;
-
-            if property.name == name {
-                return Ok(prop_slice);
+        // Parse properties in schema order until the name matches; a name
+        // that survives the whole schema does not exist. Manifests may repeat
+        // property names, so this keeps the "first same-named match"
+        // semantics: the probe above finds the oldest cached entry first
+        while cache.slices.len() < self.properties.len() {
+            self.parse_next_property(&mut cache)?;
+            let last = cache.slices.last().expect("a property was just pushed");
+            if last.property.name == name {
+                return Ok(*last);
             }
         }
 
         Err(ParserError::NotFound)
+    }
+
+    /// Parses the next unparsed top-level property into the cache, advancing
+    /// `last_cached_offset` by its size.
+    ///
+    /// Shared by the name-based lookup ([`Parser::find_property`]) and the
+    /// serializer's index-based access ([`Parser::property_bytes_at`]): parse
+    /// order is schema order
+    fn parse_next_property(&self, cache: &mut CachedSlices<'schema, 'record>) -> ParserResult<()> {
+        let Some(property) = self.properties.get(cache.slices.len()) else {
+            return Err(ParserError::NotFound);
+        };
+        let Some(remaining_user_buffer) = self.record.user_buffer().get(cache.last_cached_offset..)
+        else {
+            return Err(ParserError::PropertyError(
+                "Invalid buffer bounds".to_owned(),
+            ));
+        };
+
+        let prop_size = self.find_property_size(property, remaining_user_buffer)?;
+        let Some(property_buffer) = remaining_user_buffer.get(..prop_size) else {
+            return Err(ParserError::PropertyError(
+                "Property length out of buffer bounds".to_owned(),
+            ));
+        };
+
+        cache.slices.push(PropertySlice {
+            property,
+            buffer: property_buffer,
+        });
+        cache.last_cached_offset += prop_size;
+        Ok(())
     }
 
     /// Return a property from the event, or an error in case the parsing failed.
@@ -373,17 +376,28 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     /// returned.
     pub fn try_parse<T>(&self, name: &str) -> ParserResult<T>
     where
-        Parser<'schema, 'record>: private::TryParse<T>,
+        Parser<'schema, 'record>: private::TryParse<'schema, 'record, T>,
     {
-        use crate::parser::private::TryParse;
-        self.try_parse_impl(name)
+        private::TryParse::<'schema, 'record, T>::try_parse_slice(self, self.find_property(name)?)
     }
 
-    /// Bytes of a top-level property, located through the parse cache
+    /// Bytes of the `index`-th top-level property (schema order), located
+    /// through the parse cache.
+    ///
+    /// Unlike a name-based lookup this tells same-named properties apart:
+    /// manifests may repeat a property name, and the serializer walks the
+    /// properties in schema order.
     // Read by the serializer, which slices structures out of them
-    #[allow(dead_code)]
-    pub(crate) fn property_bytes(&self, name: &str) -> ParserResult<&'record [u8]> {
-        Ok(self.find_property(name)?.buffer)
+    #[allow(dead_code)] // Compiled out without the serde feature
+    pub(crate) fn property_bytes_at(&self, index: usize) -> ParserResult<&'record [u8]> {
+        {
+            let mut cache = self.cache.borrow_mut();
+            while cache.slices.len() <= index {
+                self.parse_next_property(&mut cache)?;
+            }
+        }
+        let cache = self.cache.borrow();
+        Ok(cache.slices[index].buffer)
     }
 
     /// The top-level properties of the schema behind this parser
@@ -398,30 +412,22 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     /// Structure members are not top-level properties, so they cannot be
     /// found by name like `try_parse` does: the caller (the serializer)
     /// slices them out of the enclosing structure's bytes and hands the
-    /// slice over. The member is registered under its name so the regular
-    /// decoding paths (`TryParse`) can locate it; top-level properties keep
-    /// shadowing same-named members.
-    #[allow(dead_code)]
+    /// slice over. Decoding works on that slice directly, so a member whose
+    /// name matches a top-level property (manifests may repeat names) still
+    /// reads its own bytes.
+    #[allow(dead_code)] // Compiled out without the serde feature
     pub(crate) fn try_parse_member<T>(
         &self,
         member: &'schema Property,
         buffer: &'record [u8],
     ) -> ParserResult<T>
     where
-        Parser<'schema, 'record>: private::TryParse<T>,
+        Parser<'schema, 'record>: private::TryParse<'schema, 'record, T>,
     {
-        use crate::parser::private::TryParse;
-
-        // Replace any stale entry for this member name (successive array
-        // elements re-register the same members with different bytes)
-        let mut cache = self.cache.borrow_mut();
-        cache.members.retain(|s| s.property.name != member.name);
-        cache.members.push(PropertySlice {
+        private::TryParse::<'schema, 'record, T>::try_parse_slice(self, PropertySlice {
             property: member,
             buffer,
-        });
-        drop(cache);
-        self.try_parse_impl(&member.name)
+        })
     }
 }
 
@@ -435,22 +441,29 @@ mod private {
     ///
     /// An implementation for most of the Primitive Types is created by using a Macro, any other
     /// needed type requires this trait to be implemented
-    pub trait TryParse<T> {
-        /// Implement the `try_parse` function to provide a way to Parse `T` from an ETW event or
-        /// return an Error in case the type `T` can't be parsed
+    pub trait TryParse<'schema, 'record, T> {
+        /// Decode `T` out of an already-located property slice, or return an
+        /// error in case the type `T` can't be parsed
         ///
-        /// # Arguments
-        /// * `name` - Name of the property to be found in the Schema
-        fn try_parse_impl(&self, name: &str) -> Result<T, ParserError>;
+        /// Working on the slice (instead of a property name) keeps the
+        /// decoding of same-named properties and of structure members on the
+        /// exact bytes the caller located
+        fn try_parse_slice(
+            &self,
+            prop_slice: PropertySlice<'schema, 'record>,
+        ) -> Result<T, ParserError>;
     }
 }
 
 macro_rules! impl_try_parse_primitive {
     ($T:ident) => {
-        impl private::TryParse<$T> for Parser<'_, '_> {
-            fn try_parse_impl(&self, name: &str) -> ParserResult<$T> {
-                let prop_slice = self.find_property(name)?;
-
+        impl<'schema, 'record> private::TryParse<'schema, 'record, $T>
+            for Parser<'schema, 'record>
+        {
+            fn try_parse_slice(
+                &self,
+                prop_slice: PropertySlice<'schema, 'record>,
+            ) -> ParserResult<$T> {
                 match prop_slice.property.info {
                     PropertyInfo::Value { .. } => {
                         // TODO: Check In and Out type and do a better type checking
@@ -468,10 +481,13 @@ macro_rules! impl_try_parse_primitive {
 
 macro_rules! impl_try_parse_primitive_array {
     ($T:ident) => {
-        impl<'schema, 'record> private::TryParse<&'record [$T]> for Parser<'schema, 'record> {
-            fn try_parse_impl(&self, name: &str) -> ParserResult<&'record [$T]> {
-                let prop_slice = self.find_property(name)?;
-
+        impl<'schema, 'record> private::TryParse<'schema, 'record, &'record [$T]>
+            for Parser<'schema, 'record>
+        {
+            fn try_parse_slice(
+                &self,
+                prop_slice: PropertySlice<'schema, 'record>,
+            ) -> ParserResult<&'record [$T]> {
                 match prop_slice.property.info {
                     PropertyInfo::Array { .. } => {
                         // TODO: Check In and Out type and do a better type checking
@@ -589,10 +605,8 @@ fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
 /// ```
 ///
 /// [TdhInTypes]: TdhInType
-impl private::TryParse<String> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<String> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'schema, 'record> {
+    fn try_parse_slice(&self, prop_slice: PropertySlice<'schema, 'record>) -> ParserResult<String> {
         match prop_slice.property.info {
             PropertyInfo::Value { in_type, .. } => match in_type {
                 TdhInType::InTypeUnicodeString => {
@@ -647,10 +661,11 @@ impl private::TryParse<String> for Parser<'_, '_> {
     }
 }
 
-impl private::TryParse<GUID> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> Result<GUID, ParserError> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, GUID> for Parser<'schema, 'record> {
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> Result<GUID, ParserError> {
         match prop_slice.property.info {
             PropertyInfo::Value { in_type, .. } => {
                 if in_type != TdhInType::InTypeGuid {
@@ -677,10 +692,8 @@ impl private::TryParse<GUID> for Parser<'_, '_> {
     }
 }
 
-impl private::TryParse<IpAddr> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<IpAddr> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, IpAddr> for Parser<'schema, 'record> {
+    fn try_parse_slice(&self, prop_slice: PropertySlice<'schema, 'record>) -> ParserResult<IpAddr> {
         match prop_slice.property.info {
             PropertyInfo::Value { out_type, .. } => {
                 if out_type != TdhOutType::OutTypeIpv4 && out_type != TdhOutType::OutTypeIpv6 {
@@ -709,10 +722,8 @@ impl private::TryParse<IpAddr> for Parser<'_, '_> {
     }
 }
 
-impl private::TryParse<bool> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<bool> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, bool> for Parser<'schema, 'record> {
+    fn try_parse_slice(&self, prop_slice: PropertySlice<'schema, 'record>) -> ParserResult<bool> {
         match prop_slice.property.info {
             PropertyInfo::Value { in_type, .. } => {
                 if in_type != TdhInType::InTypeBoolean {
@@ -747,10 +758,13 @@ impl private::TryParse<bool> for Parser<'_, '_> {
 ///     let addr: TdhSocketAddress = parser.try_parse("RemoteAddress").unwrap();
 /// };
 /// ```
-impl private::TryParse<TdhSocketAddress> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<TdhSocketAddress> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, TdhSocketAddress>
+    for Parser<'schema, 'record>
+{
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> ParserResult<TdhSocketAddress> {
         match prop_slice.property.info {
             PropertyInfo::Value { out_type, .. } => {
                 if out_type != TdhOutType::OutTypeSocketAddress {
@@ -766,10 +780,11 @@ impl private::TryParse<TdhSocketAddress> for Parser<'_, '_> {
     }
 }
 
-impl private::TryParse<FileTime> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<FileTime> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, FileTime> for Parser<'schema, 'record> {
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> ParserResult<FileTime> {
         match prop_slice.property.info {
             PropertyInfo::Value { in_type, .. } => {
                 if in_type != TdhInType::InTypeFileTime {
@@ -785,10 +800,13 @@ impl private::TryParse<FileTime> for Parser<'_, '_> {
     }
 }
 
-impl private::TryParse<SystemTime> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<SystemTime> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, SystemTime>
+    for Parser<'schema, 'record>
+{
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> ParserResult<SystemTime> {
         match prop_slice.property.info {
             PropertyInfo::Value { in_type, .. } => {
                 if in_type != TdhInType::InTypeSystemTime {
@@ -845,26 +863,31 @@ impl std::fmt::Display for Pointer {
     }
 }
 
-impl private::TryParse<Pointer> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> ParserResult<Pointer> {
-        let prop_slice = self.find_property(name)?;
-
+impl<'schema, 'record> private::TryParse<'schema, 'record, Pointer> for Parser<'schema, 'record> {
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> ParserResult<Pointer> {
         let mut res = Pointer::default();
         // Pointers wider than usize (i.e. on 16-bit targets) are truncated
         #[allow(clippy::cast_possible_truncation)]
         if prop_slice.buffer.len() == size_of::<u32>() {
-            res.0 = private::TryParse::<u32>::try_parse_impl(self, name)? as usize;
+            res.0 = private::TryParse::<'schema, 'record, u32>::try_parse_slice(self, prop_slice)?
+                as usize;
         } else {
-            res.0 = private::TryParse::<u64>::try_parse_impl(self, name)? as usize;
+            res.0 = private::TryParse::<'schema, 'record, u64>::try_parse_slice(self, prop_slice)?
+                as usize;
         }
 
         Ok(res)
     }
 }
 
-impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
-    fn try_parse_impl(&self, name: &str) -> Result<Vec<u8>, ParserError> {
-        let prop_slice = self.find_property(name)?;
+impl<'schema, 'record> private::TryParse<'schema, 'record, Vec<u8>> for Parser<'schema, 'record> {
+    fn try_parse_slice(
+        &self,
+        prop_slice: PropertySlice<'schema, 'record>,
+    ) -> Result<Vec<u8>, ParserError> {
         Ok(prop_slice.buffer.to_vec())
     }
 }
@@ -1206,6 +1229,37 @@ mod tests {
         // out-of-bounds error caused by re-parsing consumed properties
         assert!(matches!(
             parser.try_parse::<u32>("missing"),
+            Err(ParserError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn property_bytes_at_tells_same_named_properties_apart() {
+        // Manifests allow several properties with the same name: the
+        // positional accessor must yield each one's own bytes, where a
+        // name-based lookup would return the first match for all of them
+        let props = [
+            PropSpec::new("dup", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("b", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("dup", TdhInType::InTypeUInt32, 4),
+        ];
+        let user_data: [u8; 12] = [
+            1, 0, 0, 0, // dup #1
+            2, 0, 0, 0, // b
+            3, 0, 0, 0, // dup #2
+        ];
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&props);
+        let parser = Parser::create(&record, &schema);
+
+        for (index, expected) in [1u32, 2, 3].into_iter().enumerate() {
+            let bytes = parser.property_bytes_at(index).unwrap();
+            assert_eq!(u32::from_ne_bytes(bytes.try_into().unwrap()), expected);
+        }
+
+        // Beyond the schema there is nothing left to parse
+        assert!(matches!(
+            parser.property_bytes_at(3),
             Err(ParserError::NotFound)
         ));
     }

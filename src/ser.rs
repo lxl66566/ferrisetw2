@@ -464,10 +464,12 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
         }
 
         let mut state = serializer.serialize_map(Some(len))?;
-        for prop in self.props {
+        for (index, prop) in self.props.iter().enumerate() {
+            // Positional access: a name-based lookup would hand every
+            // same-named property the bytes of the first one
             let buffer = self
                 .parser
-                .property_bytes(&prop.name)
+                .property_bytes_at(index)
                 .map_err(serde::ser::Error::custom)?;
             ser_property::<S>(&mut state, prop, buffer, self.parser, self.record)?;
         }
@@ -609,6 +611,35 @@ mod test {
                 ],
             })
         );
+    }
+
+    #[test]
+    fn duplicate_property_names_serialize_in_schema_order() {
+        // Manifests allow several properties with the same name; resolving
+        // bytes by name used to emit the first match's value for all of them
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [
+            PropSpec::new("a", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("b", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("a", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut data = Vec::new();
+        for v in [1u32, 2, 3] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let ser = EventSerializer::new(&record, &schema, EventSerializerOptions {
+            include_schema: false,
+            include_header: false,
+            ..Default::default()
+        });
+        // serde_json::to_value would collapse the duplicate "a" keys: compare
+        // the streamed output instead
+        let json = serde_json::to_vec(&ser).unwrap();
+        assert_eq!(json, br#"{"Event":{"a":1,"b":2,"a":3}}"#);
     }
 
     #[test]
@@ -917,9 +948,11 @@ where
 fn resolve_struct_count(count: PropertyCount, parser: &Parser) -> Option<usize> {
     match count {
         PropertyCount::Count(c) => Some(c as usize),
+        // The index is positional: a same-named property earlier in the
+        // schema must not shadow the referenced one
         PropertyCount::Index(i) => {
-            let prop = parser.top_level_properties().get(i as usize)?;
-            let bytes = parser.property_bytes(&prop.name).ok()?;
+            parser.top_level_properties().get(i as usize)?;
+            let bytes = parser.property_bytes_at(i as usize).ok()?;
             match bytes.len() {
                 1 => Some(bytes[0] as usize),
                 2 => Some(u16::from_ne_bytes(bytes.try_into().ok()?) as usize),
