@@ -46,10 +46,16 @@ struct SchemaKey {
     // type of a field or the addition of a new field.
     version: u8,
 
-    // TODO: not sure why these ones are required in a SchemaKey. If they are, document why.
-    //       note that krabsetw also uses these fields (without an explanation)
-    //       however, krabsetw's `schema::operator==` do not use them to compare schemas for
-    // equality.       see https://github.com/microsoft/krabsetw/issues/195
+    // Required for classic (MOF-decoded) events: they carry no Id, and TDH
+    // selects their decoded MOF class from the event class GUID, version and
+    // event type, so two events differing only by opcode/level can decode to
+    // different property tables. For manifest and TraceLogging events these
+    // fields are redundant (schemas depend only on Id+Version, resp. the
+    // in-event metadata), so a template written at several levels/opcodes
+    // occupies one cache entry per variant: harmless duplication, bounded by
+    // MAX_CACHED_SCHEMAS.
+    // See https://github.com/microsoft/krabsetw/issues/195 (krabsetw keys its
+    // cache on these fields too, and its schema equality ignores them).
     opcode: u8,
     level: u8,
 }
@@ -382,6 +388,34 @@ mod tests {
             _user_data: user_data,
             _ext_items: ext_items,
         }
+    }
+
+    #[test]
+    fn tlg_level_opcode_variants_share_schema_content() {
+        // TDH decodes TraceLogging events from the metadata embedded in the
+        // event: the descriptor's level/opcode take no part in it, so variants
+        // of the same template carry identical schema content. The cache still
+        // keys them apart (level/opcode must stay in the key for classic MOF
+        // events, see `SchemaKey`), one entry per variant
+        let locator = SchemaLocator::new();
+
+        let event1 = tlg_record("Event1", "Port");
+        let mut event2 = tlg_record("Event1", "Port");
+        event2.record.0.EventHeader.EventDescriptor.Level = 5;
+        event2.record.0.EventHeader.EventDescriptor.Opcode = 10;
+
+        let s1 = locator.event_schema(&event1.record).unwrap();
+        let s2 = locator.event_schema(&event2.record).unwrap();
+
+        // Distinct cache entries (distinct keys), each holding the same
+        // property table (Property has no PartialEq: compare the Debug dump,
+        // which covers names, in/out types, lengths and structure members)
+        assert!(!Arc::ptr_eq(&s1, &s2));
+        assert_eq!(locator.schemas.lock().unwrap().len, 2);
+        assert_eq!(
+            format!("{:?}", s1.properties()),
+            format!("{:?}", s2.properties())
+        );
     }
 
     #[test]
