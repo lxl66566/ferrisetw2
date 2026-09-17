@@ -1,6 +1,6 @@
 //! A module to handle Extended Data from ETW traces
 
-use std::{borrow::Cow, convert::TryInto, ffi::CStr};
+use std::{borrow::Cow, convert::TryInto};
 
 use windows::{
     Win32::System::Diagnostics::Etw::{
@@ -327,51 +327,50 @@ impl EventHeaderExtendedDataItem {
     /// The name borrows from the metadata blob whenever it is valid UTF-8
     /// (the common case), so probing a cache with it does not allocate.
     ///
+    /// Every read is bounded by the declared sizes: a malformed (e.g. ETL-fed)
+    /// blob without a NUL terminator yields `None` instead of an unbounded scan
+    /// past the extended data buffer.
+    ///
     /// # Safety
     ///
-    /// The returned string borrows the metadata blob: it must stay valid and
-    /// unmodified as long as the borrow is alive.
+    /// `DataSize` bytes must be readable from `DataPtr`, and the returned string
+    /// borrows the metadata blob: it must stay valid and unmodified as long as
+    /// the borrow is alive.
     ///
     /// As per the MS header 'This structure may change in future revisions of this header.'
     /// **Keep an eye on it!**
-    // TODO: Make this function more robust
     pub(crate) unsafe fn get_event_name(&self) -> Option<Cow<'_, str>> {
-        const TAGS_SIZE: usize = 1;
         debug_assert!(self.is_tlg());
 
-        let mut data_ptr = self.0.DataPtr as *const u8;
-        if data_ptr.is_null() {
+        let data_size = self.0.DataSize as usize;
+        if self.0.DataPtr == 0 || data_size < size_of::<u16>() {
             return None;
         }
+        // Safety: DataPtr is non-null and DataSize bytes are readable
+        let blob = unsafe { std::slice::from_raw_parts(self.0.DataPtr as *const u8, data_size) };
 
         // The size is a u16: read both of its bytes (it used to be read as a
-        // single byte, so any metadata >= 256 bytes got a bogus size)
-        // Safety: reading the 2 first bytes of the extended data item
-        let size = unsafe { data_ptr.cast::<u16>().read_unaligned() }.min(self.0.DataSize);
-        data_ptr = unsafe { data_ptr.add(size_of::<u16>()) };
+        // single byte, so any metadata >= 256 bytes got a bogus size).
+        // The declared size is untrusted input: clamp it to the blob
+        let size = u16::from_le_bytes([blob[0], blob[1]]) as usize;
+        let size = size.min(data_size);
 
-        let mut n = 0;
-        while n < size {
-            // Read until you hit a byte with high bit unset.
-            // Safety: n < size <= DataSize bytes are readable from the blob
-            let tag = unsafe { data_ptr.read_unaligned() };
-            data_ptr = unsafe { data_ptr.add(TAGS_SIZE) };
-
-            if tag & 0b1000_0000 == 0 {
-                break;
-            }
-
-            n += 1;
+        // Skip the tags: read until you hit a byte with high bit unset
+        let mut tags_end = size_of::<u16>();
+        while tags_end < size && blob[tags_end] & 0b1000_0000 != 0 {
+            tags_end += 1;
         }
-
-        // If debug let's assert here since this is a case we want to investigate
-        debug_assert_ne!(n, size);
-        if n == size {
+        // The tag chain ran through the whole declared metadata (or there is no
+        // room left after it): there cannot be a name in there
+        if tags_end >= size {
             return None;
         }
 
-        // Safety: the name starts within the blob and the blob is NUL-terminated
-        Some(unsafe { CStr::from_ptr(data_ptr.cast()) }.to_string_lossy())
+        // The name is NUL-terminated within the declared metadata size: a
+        // missing NUL means malformed metadata
+        let name = &blob[tags_end + 1..size];
+        let name_len = memchr::memchr(0, name)?;
+        Some(String::from_utf8_lossy(&name[..name_len]))
     }
 }
 
@@ -441,6 +440,58 @@ mod tests {
             panic!("expected the TraceLogging variant");
         };
         assert_eq!(event_name, "MyEvent");
+    }
+
+    /// Parses the event name out of a raw TLG metadata blob (owned result, so
+    /// the item does not need to outlive the assertion)
+    fn tlg_event_name(blob: &[u8]) -> Option<String> {
+        let item = EventHeaderExtendedDataItem::from_raw_parts(
+            EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL,
+            blob,
+        );
+        // Safety: the item points at `blob`, which is alive for the whole call
+        unsafe { item.get_event_name() }.map(Cow::into_owned)
+    }
+
+    #[test]
+    fn tlg_event_name_without_nul_is_rejected() {
+        // No NUL within the declared metadata size: the old code ran an
+        // unbounded `CStr` scan past the blob
+        let name = b"Event1"; // missing terminator
+        let total = u16::try_from(2 + 1 + name.len()).unwrap();
+        let mut blob = Vec::with_capacity(usize::from(total));
+        blob.extend_from_slice(&total.to_le_bytes());
+        blob.push(0x00); // tag = 0
+        blob.extend_from_slice(name);
+
+        assert!(tlg_event_name(&blob).is_none());
+    }
+
+    #[test]
+    fn tlg_metadata_shorter_than_the_size_field_is_rejected() {
+        // Blobs of 0/1 bytes cannot even hold the declared size
+        for size in [0usize, 1] {
+            let blob = vec![0u8; size];
+            assert!(tlg_event_name(&blob).is_none());
+        }
+    }
+
+    #[test]
+    fn tlg_tag_chain_filling_the_declared_size_is_rejected() {
+        // No terminating tag byte within the declared size: the old tag loop
+        // kept reading up to 2 bytes past the blob before giving up
+        let blob = [6u8, 0, 0x81, 0x82, 0x83, 0x84];
+
+        assert!(tlg_event_name(&blob).is_none());
+    }
+
+    #[test]
+    fn tlg_declared_size_larger_than_the_blob_is_clamped() {
+        // Declares 100 bytes of metadata but only 6 are present: parsing must
+        // stay within the blob (the name is complete inside it)
+        let blob = [100u8, 0, 0x00, b'H', b'i', 0];
+
+        assert_eq!(tlg_event_name(&blob).as_deref(), Some("Hi"));
     }
 
     /// Builds S-1-5-21-100-200-300-999: 5 sub-authorities (i.e. longer than the
