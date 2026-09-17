@@ -211,7 +211,7 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 };
 
                 if prop_len > 0 {
-                    return Ok(prop_len as usize);
+                    return Ok(in_type.schema_length_bytes(prop_len));
                 }
 
                 // Length is not set. We'll have to ask TDH for the right length.
@@ -276,9 +276,9 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     self.record.pointer_size()
                 } else {
                     match length {
-                        PropertyLength::Length(l) => l as usize,
+                        PropertyLength::Length(l) => in_type.schema_length_bytes(l),
                         PropertyLength::Index(_) => {
-                            // TODO optimize to cache the lookup, the problem is here this is
+                            // TODO optimize to cache the lookup, this is
                             // called while the cache is mutably borrowed, so attempting to
                             // extract and cache a related property will
                             // panic.
@@ -290,8 +290,8 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 let prop_count = match count {
                     PropertyCount::Count(c) => c as usize,
                     PropertyCount::Index(_) => {
-                        // TODO optimize to cache the lookup, the problem is here this is called
-                        // while the cache is mutably borrowed, so attempting to
+                        // TODO optimize to cache the lookup, this is
+                        // called while the cache is mutably borrowed, so attempting to
                         // extract and cache a related property will
                         // panic.
                         return Ok(tdh::property_size(self.record, &property.name)? as usize);
@@ -1605,6 +1605,7 @@ mod tests {
     /// TraceLogging in/out type codes, as encoded in the event metadata
     /// (values differ from the TDH enums for out types, e.g. Win32Error is 13 here)
     mod tlg {
+        pub const IN_STR: u8 = 1;
         pub const IN_U16: u8 = 6;
         pub const IN_I32: u8 = 7;
         pub const IN_U32: u8 = 8;
@@ -1721,6 +1722,25 @@ mod tests {
         // travels in extended data items and the user data holds the values
         // only. This must keep parsing (no false positive from the embedded
         // layout detection above)
+        let mut meta = b"Port\0".to_vec();
+        meta.push(tlg::IN_U16);
+        let (record, schema) = tlg_ext_record(&meta, &[80, 0]);
+
+        assert!(matches!(
+            schema.decoding_source(),
+            DecodingSource::DecodingSourceTlg
+        ));
+
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<u16>("Port").unwrap(), 80);
+    }
+
+    /// Builds a TraceLogging event whose metadata travels in extended data
+    /// items (how real-time sessions and ETL replays deliver it) and whose
+    /// user data holds the property values only, decoded through the real
+    /// `TdhGetEventInformation`: `meta` is the event metadata (field
+    /// descriptors), `values` the property values
+    fn tlg_ext_record(meta: &[u8], values: &[u8]) -> (EventRecord, Schema) {
         let sized = |payload: &[u8]| -> Vec<u8> {
             (u16::try_from(payload.len() + 2).unwrap())
                 .to_le_bytes()
@@ -1728,17 +1748,14 @@ mod tests {
                 .chain(payload.iter().copied())
                 .collect()
         };
-
-        let mut event_meta = vec![0u8]; // tags
-        event_meta.extend_from_slice(b"Event1\0Port\0");
-        event_meta.push(tlg::IN_U16);
+        let mut event_meta = Vec::new();
+        event_meta.push(0u8); // tags
+        event_meta.extend_from_slice(b"Event1\0");
+        event_meta.extend_from_slice(meta);
         let event_blob = sized(&event_meta);
-
         let mut provider_blob = b"ferrisETW.TraceLoggingTest\0".to_vec();
-        provider_blob.push(0); // no trait
+        provider_blob.push(0);
         let provider_blob = sized(&provider_blob);
-
-        let user_data: Vec<u8> = vec![80, 0]; // the Port value
 
         // Test data uses known-small ext type constants
         #[allow(clippy::cast_possible_truncation)]
@@ -1756,16 +1773,15 @@ mod tests {
                 ..Default::default()
             },
         ]);
-
-        // Header size and user data length always fit: synthetic test data
+        // Header size always fits: synthetic test data
         #[allow(clippy::cast_possible_truncation)]
         let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
         let record = EventRecord(Etw::EVENT_RECORD {
             EventHeader: Etw::EVENT_HEADER {
                 Size: header_size,
-                Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+                Flags: 0x0002,
                 EventDescriptor: Etw::EVENT_DESCRIPTOR {
-                    Channel: 11, // TraceLogging channel
+                    Channel: 11,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -1774,21 +1790,95 @@ mod tests {
             ExtendedData: std::ptr::from_ref(&*ext_items)
                 .cast::<Etw::EVENT_HEADER_EXTENDED_DATA_ITEM>()
                 .cast_mut(),
-            UserData: user_data.as_ptr() as *mut _,
-            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            UserData: values.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(values.len()).unwrap(),
             ..Default::default()
         });
         let info = TraceEventInfo::build_from_event(&record)
-            .expect("TDH should decode the extended data layout");
-        let schema = Schema::new(info);
+            .expect("TDH should decode the extended-data TraceLogging event");
+        (record, Schema::new(info))
+    }
 
-        assert!(matches!(
-            schema.decoding_source(),
-            DecodingSource::DecodingSourceTlg
-        ));
+    /// Empirical pin for the InTypeUnicodeString length semantics: on a
+    /// TraceLogging event TDH reports the NUL-terminated wide string with a
+    /// zero schema length and sizes it by scanning for the NUL (6 bytes for
+    /// "hï" plus terminator) — the explicit-length branch below is only
+    /// reachable through manifest/WBEM schemas
+    #[test]
+    fn tracelogging_terminated_wide_string_has_no_schema_length() {
+        let mut meta = b"S\0".to_vec();
+        meta.push(tlg::IN_STR);
+        let mut values: Vec<u8> = "hï".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        values.extend_from_slice(&[0, 0]); // wide NUL terminator
+
+        let (record, schema) = tlg_ext_record(&meta, &values);
+        let PropertyInfo::Value { length, .. } = &schema.properties()[0].info else {
+            panic!("'S' should be a scalar value");
+        };
+        assert_eq!(*length, PropertyLength::Length(0));
+        assert_eq!(
+            tdh::property_size(&record, "S").unwrap(),
+            6,
+            "TDH must size the string up to and including its NUL"
+        );
 
         let parser = Parser::create(&record, &schema);
-        assert_eq!(parser.try_parse::<u16>("Port").unwrap(), 80);
+        assert_eq!(parser.try_parse::<String>("S").unwrap(), "hï");
+    }
+
+    /// An explicit schema length for a UnicodeString counts WCHARs, not
+    /// bytes (tdh.h: "the epi.length field contains number of WCHARs in the
+    /// string"; eventman.xsd: "Length indicates the size (in characters)"):
+    /// sizing it as bytes would steal half the field and shift everything
+    /// that follows
+    #[test]
+    fn fixed_length_unicode_string_counts_wchars_not_bytes() {
+        // "abc" exactly fills the 3 WCHARs; a NUL-padded member stops at
+        // its first NUL but still spans the full 6 bytes
+        for (payload, expected) in [(b"abc", "abc"), (b"ab\0", "ab")] {
+            let mut user_data: Vec<u8> = payload.iter().flat_map(|b| [*b, 0]).collect();
+            user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+            let record = synthetic_record(&user_data);
+            let schema = synthetic_schema(&[
+                PropSpec::new("s", TdhInType::InTypeUnicodeString, 3),
+                PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+            ]);
+            let parser = Parser::create(&record, &schema);
+
+            assert_eq!(parser.try_parse::<String>("s").unwrap(), expected);
+            // The u32 sits right after the 6 string bytes: this verifies the
+            // property size computation
+            assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+        }
+    }
+
+    /// Array elements follow the same WCHAR-counting rule: length 3 with
+    /// count 2 spans 12 bytes
+    #[test]
+    fn fixed_length_unicode_string_array_occupies_wchars_times_elements() {
+        let mut user_data: Vec<u8> = "abcdef".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec {
+                count: 2,
+                ..PropSpec::new("s", TdhInType::InTypeUnicodeString, 3)
+            },
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        assert!(matches!(schema.properties()[0].info, PropertyInfo::Array {
+            count: PropertyCount::Count(2),
+            ..
+        }));
+
+        // The array property itself does not decode as a String; the point
+        // is that the u32 lands after the whole 12-byte array
+        let parser = Parser::create(&record, &schema);
+        assert!(matches!(
+            parser.try_parse::<String>("s"),
+            Err(ParserError::InvalidType)
+        ));
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
     }
 
     /// Pins down how TDH maps TraceLogging metadata to its own in/out types:

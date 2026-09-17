@@ -580,8 +580,9 @@ mod test {
         static MEMBERS: [PropSpec; 3] = [
             PropSpec::new("x", TdhInType::InTypeUInt32, 4),
             PropSpec::structure("inner", &NESTED_MEMBERS),
-            // Fixed-length string member: NUL-padded to 8 bytes (4 UTF-16 units)
-            PropSpec::new("label", TdhInType::InTypeUnicodeString, 8),
+            // Fixed-length string member: NUL-padded to 4 UTF-16 units
+            // (the schema length counts WCHARs, so 4 = 8 bytes)
+            PropSpec::new("label", TdhInType::InTypeUnicodeString, 4),
         ];
         static PROPS: [PropSpec; 1] = [PropSpec::structure("s", &MEMBERS)];
 

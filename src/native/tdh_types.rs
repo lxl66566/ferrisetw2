@@ -152,7 +152,7 @@ impl Property {
                 match length {
                     // A zero length means "ask TDH" for a top-level property; inside
                     // a structure it marks a variable-length member
-                    PropertyLength::Length(l) if *l > 0 => Some(*l as usize),
+                    PropertyLength::Length(l) if *l > 0 => Some(in_type.schema_length_bytes(*l)),
                     _ => None,
                 }
             },
@@ -166,7 +166,7 @@ impl Property {
                     pointer_size
                 } else {
                     match length {
-                        PropertyLength::Length(l) if *l > 0 => *l as usize,
+                        PropertyLength::Length(l) if *l > 0 => in_type.schema_length_bytes(*l),
                         _ => return None,
                     }
                 };
@@ -327,6 +327,34 @@ pub enum TdhInType {
     InTypeCountedString = 300,
     /// WBEM twin of [`TdhInType::InTypeManifestCountedAnsiString`], same layout
     InTypeCountedAnsiString,
+}
+
+impl TdhInType {
+    /// Byte size of one element whose schema declares an explicit nonzero
+    /// length (`EVENT_PROPERTY_INFO.length`).
+    ///
+    /// The unit of that length is documented per in type, and two Microsoft
+    /// sources disagree:
+    ///
+    /// * `tdh.h` (SDK per-type rules): for `TDH_INTYPE_UNICODESTRING` "the epi.length field
+    ///   contains number of WCHARs in the string" — its AnsiString twin counts BYTEs
+    /// * the generic `EVENT_PROPERTY_INFO` documentation (MSDN): "Size of the property, in bytes"
+    ///
+    /// The manifest schema (eventman.xsd, shipped with the SDK) settles the
+    /// contradiction in favor of tdh.h: "Length indicates the size (in
+    /// characters) of the property value" for UnicodeString and AnsiString.
+    /// Real TDH behavior cannot disprove it: on TraceLogging events TDH
+    /// always reports length 0 for strings (NUL-terminated, see the parser
+    /// test), so the explicit-length branch is only reachable through
+    /// manifest/WBEM schemas, which cannot be installed without elevation.
+    /// krabsetw, from which this crate's sizing code originally came, reads
+    /// the length as bytes too and shares the issue.
+    pub(crate) fn schema_length_bytes(self, length: u16) -> usize {
+        match self {
+            Self::InTypeUnicodeString => usize::from(length) * 2,
+            _ => usize::from(length),
+        }
+    }
 }
 
 /// Represent a TDH_OUT_TYPE
