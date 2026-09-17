@@ -247,10 +247,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     | TdhInType::InTypeManifestCountedAnsiString
                     | TdhInType::InTypeCountedAnsiString
                     | TdhInType::InTypeReversedCountedString
-                    | TdhInType::InTypeReversedCountedAnsiString => {
-                        // All counted string variants share the same layout:
-                        // a 16-bit byte count (little-endian, big-endian for
-                        // the deprecated REVERSED twins) then the payload.
+                    | TdhInType::InTypeReversedCountedAnsiString
+                    | TdhInType::InTypeManifestCountedBinary => {
+                        // All counted variants share the same layout: a 16-bit
+                        // byte count (little-endian, big-endian for the
+                        // deprecated REVERSED twins) then the payload.
                         // (TraceLogging events leave the TDH length at 0, and
                         // TdhGetPropertySize is a costly round-trip)
                         let big_endian = matches!(
@@ -1047,6 +1048,27 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, Vec<u8>> for Parser<'
         &self,
         prop_slice: PropertySlice<'schema, 'record>,
     ) -> Result<Vec<u8>, ParserError> {
+        if matches!(prop_slice.property.info, PropertyInfo::Value {
+            in_type: TdhInType::InTypeManifestCountedBinary,
+            ..
+        }) {
+            // The property bytes include the leading u16 byte count: the
+            // payload starts after it
+            let buffer = prop_slice.buffer;
+            let count = buffer
+                .get(..size_of::<u16>())
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u16::from_le_bytes)
+                .ok_or(ParserError::PropertyError(
+                    "counted binary does not have length".into(),
+                ))? as usize;
+            return Ok(buffer
+                .get(size_of::<u16>()..size_of::<u16>() + count)
+                .ok_or(ParserError::PropertyError(
+                    "invalid counted binary length".into(),
+                ))?
+                .to_vec());
+        }
         Ok(prop_slice.buffer.to_vec())
     }
 }
@@ -1750,6 +1772,45 @@ mod tests {
         )]);
         let parser = Parser::create(&record, &schema);
         assert_eq!(parser.try_parse::<String>("s").unwrap(), "hi");
+    }
+
+    #[test]
+    fn manifest_counted_binary_parses_and_advances_the_offset() {
+        // TDH_INTYPE_MANIFEST_COUNTEDBINARY: little-endian u16 byte count,
+        // then the raw payload (the count prefix is not part of the value)
+        let user_data: Vec<u8> = 3u16
+            .to_le_bytes()
+            .into_iter()
+            .chain([0xaa, 0xbb, 0xcc])
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("blob", TdhInType::InTypeManifestCountedBinary, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.try_parse::<Vec<u8>>("blob").unwrap(), vec![
+            0xaa, 0xbb, 0xcc
+        ]);
+        // The u32 sits right after the counted binary: this verifies the
+        // property size computation
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    #[test]
+    fn manifest_counted_binary_with_invalid_length_is_an_error() {
+        // The byte count exceeds what the buffer holds
+        let user_data = 42u16.to_le_bytes();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new(
+            "blob",
+            TdhInType::InTypeManifestCountedBinary,
+            2,
+        )]);
+        let parser = Parser::create(&record, &schema);
+        assert!(parser.try_parse::<Vec<u8>>("blob").is_err());
     }
 
     #[test]

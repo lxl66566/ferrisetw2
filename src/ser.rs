@@ -1158,6 +1158,205 @@ mod test {
             serde_json::json!("0xffffffffffffffff")
         );
     }
+
+    fn array_info(in_type: TdhInType, out_type: TdhOutType) -> PropertyInfo {
+        PropertyInfo::Array {
+            in_type,
+            out_type,
+            length: PropertyLength::Length(4),
+            count: PropertyCount::Count(2),
+        }
+    }
+
+    /// 8-byte-aligned byte holder: the parser rejects misaligned array buffers
+    #[repr(align(8))]
+    struct AlignedBytes([u8; 8]);
+
+    #[test]
+    fn array_out_types_select_hex_handlers_like_scalars() {
+        // Array elements honor the out type exactly like scalar values: a
+        // TraceLogging `hex` array used to serialize as decimal numbers
+        for (out_type, handler) in [
+            (TdhOutType::OutTypeHexInt32, PropHandler::ArrayHexInt32),
+            (TdhOutType::OutTypeHexInt64, PropHandler::ArrayHexInt64),
+        ] {
+            assert_eq!(
+                array_info(TdhInType::InTypeUInt32, out_type)
+                    .get_parser()
+                    .map(|p| p.0),
+                Some(handler)
+            );
+        }
+
+        // Hex in types resolve to the same handlers
+        for (in_type, handler) in [
+            (TdhInType::InTypeHexInt32, PropHandler::ArrayHexInt32),
+            (TdhInType::InTypeHexInt64, PropHandler::ArrayHexInt64),
+        ] {
+            assert_eq!(
+                array_info(in_type, TdhOutType::OutTypeNull)
+                    .get_parser()
+                    .map(|p| p.0),
+                Some(handler)
+            );
+        }
+
+        // A non-hex out type keeps the plain in-type handler
+        assert_eq!(
+            array_info(TdhInType::InTypeUInt32, TdhOutType::OutTypeNull)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::ArrayUInt32)
+        );
+    }
+
+    #[test]
+    fn pointer_properties_default_to_hex_display() {
+        // TDH applies the HexInt64 out type to pointers by default
+        assert_eq!(
+            value_info(TdhInType::InTypePointer)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::HexPointer)
+        );
+
+        // An explicit out type keeps the plain pointer handler
+        assert_eq!(
+            value_info_with_out(TdhInType::InTypePointer, TdhOutType::OutTypeUInt32)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::Pointer)
+        );
+
+        // Same default for pointer arrays
+        assert_eq!(
+            array_info(TdhInType::InTypePointer, TdhOutType::OutTypeNull)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::ArrayHexPointer)
+        );
+    }
+
+    /// A fixed-size integer array property with its raw element bytes,
+    /// 8-byte aligned (the parser rejects misaligned array buffers).
+    ///
+    /// The bytes are leaked: the record holds a raw pointer to them, so they
+    /// must not move (returning them by value would leave the record pointing
+    /// into a dead stack frame)
+    fn aligned_array_record(elements: [u32; 2]) -> (Schema, EventRecord) {
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static PROPS: [PropSpec; 1] = [PropSpec {
+            count: 2,
+            ..PropSpec::new("hexes", TdhInType::InTypeUInt32, 4)
+                .with_out_type(TdhOutType::OutTypeHexInt32)
+        }];
+
+        let mut bytes = [0u8; 8];
+        for (chunk, value) in bytes.chunks_exact_mut(4).zip(elements) {
+            chunk.copy_from_slice(&value.to_le_bytes());
+        }
+        let data = Box::leak(Box::new(AlignedBytes(bytes)));
+
+        let schema = synthetic_schema(&PROPS);
+        let record = synthetic_record(&data.0);
+        (schema, record)
+    }
+
+    #[test]
+    fn hex_out_type_arrays_serialize_elements_as_hex() {
+        let (schema, record) = aligned_array_record([0x1122_3344, 0x5566_7788]);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({"hexes": ["0x11223344", "0x55667788"]})
+        );
+    }
+
+    #[test]
+    fn pointer_values_serialize_as_hex_by_default() {
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [PropSpec::new("ptr", TdhInType::InTypePointer, 8)];
+        let mut data = 0x0000_7ffd_1234_5678u64.to_le_bytes().to_vec();
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(value["Event"], serde_json::json!({"ptr": "0x7ffd12345678"}));
+
+        // An explicit out type keeps the plain decimal rendering
+        let props = [PropSpec::new("ptr", TdhInType::InTypePointer, 8)
+            .with_out_type(TdhOutType::OutTypeUInt32)];
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"]["ptr"],
+            serde_json::json!(0x0000_7ffd_1234_5678_u64)
+        );
+    }
+
+    #[test]
+    fn struct_array_elements_without_bytes_degrade_to_null() {
+        // count > 0 with no element bytes: each missing element must serialize
+        // as null, not as an empty (mislocated) object
+        use crate::{
+            native::tdh_types::PropertyFlags,
+            parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
+        };
+
+        static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt32, 4)];
+        static PROPS: [PropSpec; 1] = [PropSpec {
+            flags: PropertyFlags::PROPERTY_STRUCT.bits(),
+            count: 3,
+            structure: Some(&MEMBERS),
+            ..PropSpec::new("items", TdhInType::InTypeNull, 0)
+        }];
+        let record = synthetic_record(&[]);
+        let schema = synthetic_schema(&PROPS);
+
+        let PropertyInfo::StructArray { members, .. } = &schema.properties()[0].info else {
+            panic!("expected a structure array property");
+        };
+        let parser = Parser::create(&record, &schema);
+        let ser = StructArraySer {
+            members,
+            count: 3,
+            bytes: &[],
+            parser: &parser,
+            record: &record,
+            strict: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&ser).unwrap(),
+            serde_json::json!([null, null, null])
+        );
+    }
+
+    #[test]
+    fn counted_binary_serializes_as_bytes() {
+        // TDH_INTYPE_MANIFEST_COUNTEDBINARY: u16 byte count then raw bytes
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [
+            PropSpec::new("blob", TdhInType::InTypeManifestCountedBinary, 0),
+            PropSpec::new("after", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut data = 3u16.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0xaa, 0xbb, 0xcc]);
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({"blob": [0xaa, 0xbb, 0xcc], "after": 7})
+        );
+    }
 }
 
 trait PropSerable {
@@ -1196,7 +1395,13 @@ enum PropHandler {
     ArrayUInt32,
     ArrayInt64,
     ArrayUInt64,
+    ArrayHexInt32,
+    ArrayHexInt64,
     ArrayPointer,
+    ArrayHexPointer,
+    /// `InTypePointer` with the default (unset) out type: TDH applies
+    /// `HexInt64` display semantics to pointers by default
+    HexPointer,
 }
 
 /// Serializes an integer with a hex out type as a `"0x..."` string, keeping
@@ -1225,6 +1430,29 @@ macro_rules! prop_ser_type {
             .try_parse_member::<$typ>($prop, $buffer)
             .map_err(serde::ser::Error::custom)?;
         $map.serialize_entry(&$prop.name, &v)
+    }};
+}
+
+/// A single integer with hex display semantics (hex out type, or a pointer
+/// with the default TDH out type)
+macro_rules! prop_ser_hex {
+    ($typ:ty, $map:expr, $prop:expr, $parser:expr, $buffer:expr) => {{
+        let v = $parser
+            .try_parse_member::<$typ>($prop, $buffer)
+            .map_err(serde::ser::Error::custom)?;
+        $map.serialize_entry(&$prop.name, &HexDisplay(v))
+    }};
+}
+
+/// An integer array whose elements carry hex display semantics: the array
+/// handler must honor the out type exactly like the scalar one does
+macro_rules! prop_ser_hex_array {
+    ($typ:ty, $map:expr, $prop:expr, $parser:expr, $buffer:expr) => {{
+        let v = $parser
+            .try_parse_member::<&[$typ]>($prop, $buffer)
+            .map_err(serde::ser::Error::custom)?;
+        let hex: Vec<HexDisplay<$typ>> = v.iter().copied().map(HexDisplay).collect();
+        $map.serialize_entry(&$prop.name, &hex)
     }};
 }
 
@@ -1257,7 +1485,8 @@ fn variable_member_size(member: &Property, remaining: &[u8]) -> Option<usize> {
         TdhInType::InTypeManifestCountedString
         | TdhInType::InTypeCountedString
         | TdhInType::InTypeManifestCountedAnsiString
-        | TdhInType::InTypeCountedAnsiString => {
+        | TdhInType::InTypeCountedAnsiString
+        | TdhInType::InTypeManifestCountedBinary => {
             let count = remaining.get(..size_of::<u16>())?;
             Some(size_of::<u16>() + u16::from_le_bytes(count.try_into().ok()?) as usize)
         },
@@ -1520,18 +1749,8 @@ impl PropHandler {
             PropHandler::UInt32 => prop_ser_type!(u32, map, prop, parser, buffer),
             PropHandler::Int64 => prop_ser_type!(i64, map, prop, parser, buffer),
             PropHandler::UInt64 => prop_ser_type!(u64, map, prop, parser, buffer),
-            PropHandler::HexInt32 => {
-                let v = parser
-                    .try_parse_member::<u32>(prop, buffer)
-                    .map_err(serde::ser::Error::custom)?;
-                map.serialize_entry(&prop.name, &HexDisplay(v))
-            },
-            PropHandler::HexInt64 => {
-                let v = parser
-                    .try_parse_member::<u64>(prop, buffer)
-                    .map_err(serde::ser::Error::custom)?;
-                map.serialize_entry(&prop.name, &HexDisplay(v))
-            },
+            PropHandler::HexInt32 => prop_ser_hex!(u32, map, prop, parser, buffer),
+            PropHandler::HexInt64 => prop_ser_hex!(u64, map, prop, parser, buffer),
             PropHandler::Float => prop_ser_type!(f32, map, prop, parser, buffer),
             PropHandler::Double => prop_ser_type!(f64, map, prop, parser, buffer),
             PropHandler::String => prop_ser_type!(String, map, prop, parser, buffer),
@@ -1548,6 +1767,8 @@ impl PropHandler {
             PropHandler::ArrayUInt32 => prop_ser_type!(&[u32], map, prop, parser, buffer),
             PropHandler::ArrayInt64 => prop_ser_type!(&[i64], map, prop, parser, buffer),
             PropHandler::ArrayUInt64 => prop_ser_type!(&[u64], map, prop, parser, buffer),
+            PropHandler::ArrayHexInt32 => prop_ser_hex_array!(u32, map, prop, parser, buffer),
+            PropHandler::ArrayHexInt64 => prop_ser_hex_array!(u64, map, prop, parser, buffer),
             PropHandler::Null => {
                 let value: Option<usize> = None;
                 map.serialize_entry(&prop.name, &value)
@@ -1559,11 +1780,26 @@ impl PropHandler {
                     prop_ser_type!(u64, map, prop, parser, buffer)
                 }
             },
+            PropHandler::HexPointer => {
+                // Same width selection as `Pointer`, hex display semantics
+                if record.pointer_size() == 4 {
+                    prop_ser_hex!(u32, map, prop, parser, buffer)
+                } else {
+                    prop_ser_hex!(u64, map, prop, parser, buffer)
+                }
+            },
             PropHandler::ArrayPointer => {
                 if record.pointer_size() == 4 {
                     prop_ser_type!(&[u32], map, prop, parser, buffer)
                 } else {
                     prop_ser_type!(&[u64], map, prop, parser, buffer)
+                }
+            },
+            PropHandler::ArrayHexPointer => {
+                if record.pointer_size() == 4 {
+                    prop_ser_hex_array!(u32, map, prop, parser, buffer)
+                } else {
+                    prop_ser_hex_array!(u64, map, prop, parser, buffer)
                 }
             },
             PropHandler::Guid => {
@@ -1617,6 +1853,11 @@ impl PropSerable for PropertyInfo {
                         | TdhInType::InTypeNonNullTerminatedAnsiString => {
                             Some(PropSer(PropHandler::String))
                         },
+                        // u16 byte count followed by raw bytes, like the
+                        // counted strings above
+                        TdhInType::InTypeManifestCountedBinary => {
+                            Some(PropSer(PropHandler::Binary))
+                        },
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
                         TdhInType::InTypeInt16 => Some(PropSer(PropHandler::Int16)),
@@ -1634,22 +1875,49 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypeBoolean => Some(PropSer(PropHandler::Bool)),
                         TdhInType::InTypeBinary => Some(PropSer(PropHandler::Binary)),
                         TdhInType::InTypeGuid => Some(PropSer(PropHandler::Guid)),
-                        TdhInType::InTypePointer => Some(PropSer(PropHandler::Pointer)),
+                        TdhInType::InTypePointer => {
+                            // TDH applies the HexInt64 out type to pointers
+                            // by default (see tdh.h)
+                            if *out_type == TdhOutType::OutTypeNull {
+                                Some(PropSer(PropHandler::HexPointer))
+                            } else {
+                                Some(PropSer(PropHandler::Pointer))
+                            }
+                        },
                         TdhInType::InTypeFileTime => Some(PropSer(PropHandler::FileTime)),
                         TdhInType::InTypeSystemTime => Some(PropSer(PropHandler::SystemTime)),
                     },
                 }
             },
-            PropertyInfo::Array { in_type, .. } => {
-                match in_type {
-                    TdhInType::InTypeInt16 => Some(PropSer(PropHandler::ArrayInt16)),
-                    TdhInType::InTypeUInt16 => Some(PropSer(PropHandler::ArrayUInt16)),
-                    TdhInType::InTypeInt32 => Some(PropSer(PropHandler::ArrayInt32)),
-                    TdhInType::InTypeUInt32 => Some(PropSer(PropHandler::ArrayUInt32)),
-                    TdhInType::InTypeInt64 => Some(PropSer(PropHandler::ArrayInt64)),
-                    TdhInType::InTypeUInt64 => Some(PropSer(PropHandler::ArrayUInt64)),
-                    TdhInType::InTypePointer => Some(PropSer(PropHandler::ArrayPointer)),
-                    _ => None, // TODO
+            PropertyInfo::Array {
+                in_type, out_type, ..
+            } => {
+                // Array elements honor the out type exactly like scalar
+                // values do (e.g. a TraceLogging `hex` array)
+                match out_type {
+                    TdhOutType::OutTypeHexInt32 => Some(PropSer(PropHandler::ArrayHexInt32)),
+                    TdhOutType::OutTypeHexInt64 => Some(PropSer(PropHandler::ArrayHexInt64)),
+                    _ => match in_type {
+                        TdhInType::InTypeInt16 => Some(PropSer(PropHandler::ArrayInt16)),
+                        TdhInType::InTypeUInt16 => Some(PropSer(PropHandler::ArrayUInt16)),
+                        TdhInType::InTypeInt32 => Some(PropSer(PropHandler::ArrayInt32)),
+                        TdhInType::InTypeUInt32 => Some(PropSer(PropHandler::ArrayUInt32)),
+                        TdhInType::InTypeInt64 => Some(PropSer(PropHandler::ArrayInt64)),
+                        TdhInType::InTypeUInt64 => Some(PropSer(PropHandler::ArrayUInt64)),
+                        // Hex display semantics, whatever the width of the
+                        // underlying integer
+                        TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::ArrayHexInt32)),
+                        TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::ArrayHexInt64)),
+                        TdhInType::InTypePointer => {
+                            // Same default hex semantics as scalar pointers
+                            if *out_type == TdhOutType::OutTypeNull {
+                                Some(PropSer(PropHandler::ArrayHexPointer))
+                            } else {
+                                Some(PropSer(PropHandler::ArrayPointer))
+                            }
+                        },
+                        _ => None, // TODO
+                    },
                 }
             },
             // Structures serialize as nested maps/arrays (see `ser_property`)

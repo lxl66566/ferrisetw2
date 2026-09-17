@@ -62,9 +62,8 @@ pub enum PropertyInfo {
         /// TDH In type of the property
         in_type: TdhInType,
         /// TDH Out type of the property
-        // Not read yet: modeled for completeness, the array handlers select on
-        // the in type
-        #[allow(dead_code)]
+        // Read by the serializer: array elements honor the out type (e.g.
+        // hex display) just like scalar values do
         out_type: TdhOutType,
         /// The length of the property
         length: PropertyLength,
@@ -327,6 +326,10 @@ pub enum TdhInType {
     /// Little-endian 16-bit byte count followed by 8-bit characters
     /// (TDH_INTYPE_MANIFEST_COUNTEDANSISTRING, a.k.a. win:CountedAnsiString)
     InTypeManifestCountedAnsiString,
+    /// Little-endian 16-bit byte count followed by raw bytes
+    /// (TDH_INTYPE_MANIFEST_COUNTEDBINARY). TDH_INTYPE_RESERVED24 sits at 24,
+    /// so the discriminant must be explicit
+    InTypeManifestCountedBinary = 25,
     /// WBEM twin of [`TdhInType::InTypeManifestCountedString`], same layout
     InTypeCountedString = 300,
     /// WBEM twin of [`TdhInType::InTypeManifestCountedAnsiString`], same layout
@@ -578,5 +581,18 @@ mod tests {
         info.Anonymous1.nonStructType.InType = TdhInType::InTypeUInt16 as u16;
         info.Anonymous3.lengthPropertyIndex = 3;
         assert_eq!(Property::new("prop".into(), &info).fixed_size(8), None);
+    }
+
+    #[test]
+    fn manifest_counted_binary_maps_from_its_tdh_discriminant() {
+        // TDH_INTYPE_MANIFEST_COUNTEDBINARY = 25 (24 is RESERVED24): it used
+        // to fall back to InTypeNull and serialize as a null property
+        let mut info = Etw::EVENT_PROPERTY_INFO::default();
+        info.Anonymous1.nonStructType.InType = TdhInType::InTypeManifestCountedBinary as u16;
+        let property = Property::new("blob".into(), &info);
+        assert!(matches!(property.info, PropertyInfo::Value {
+            in_type: TdhInType::InTypeManifestCountedBinary,
+            ..
+        }));
     }
 }
