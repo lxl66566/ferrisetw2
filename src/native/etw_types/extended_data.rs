@@ -84,31 +84,50 @@ pub struct EventHeaderExtendedDataItem(EVENT_HEADER_EXTENDED_DATA_ITEM);
 /// value would lose every sub-authority but the first, and any later use
 /// (e.g. by `ConvertSidToStringSid`) would read out of bounds. `Sid` owns the
 /// full buffer instead.
+///
+/// Extended data coming from an ETL file is untrusted input: a `Sid` is only
+/// built when the item holds the complete SID (`8 + 4 * SubAuthorityCount`
+/// bytes), which guarantees the buffer is self-consistent and valid to hand
+/// over to SID-related Win32 APIs. Truncated items are dropped (the extended
+/// data becomes [`ExtendedDataItem::Unsupported`]).
 #[derive(Debug)]
 pub struct Sid {
     /// `Revision`, `SubAuthorityCount`, `IdentifierAuthority`, then one
-    /// little-endian `u32` per sub-authority
+    /// little-endian `u32` per sub-authority. Always exactly
+    /// `8 + 4 * SubAuthorityCount` bytes long.
     data: Vec<u8>,
 }
 
 impl Sid {
     /// Deep-copies the full variable-length SID starting at `data_ptr`.
     ///
+    /// Returns `None` if the item is too short to hold the declared SID
+    /// (e.g. `SubAuthorityCount` announces more sub-authorities than
+    /// `data_size` can contain): rendering such a truncated SID would either
+    /// panic on access or make Win32 read past the copied buffer.
+    ///
     /// The copy is bounded by `data_size`, the extended data item's declared size.
     ///
     /// # Safety
     ///
     /// `min(8 + 4 * SubAuthorityCount, data_size)` bytes must be readable from `data_ptr`
-    unsafe fn from_raw(data_ptr: *const u8, data_size: u16) -> Self {
+    unsafe fn from_raw(data_ptr: *const u8, data_size: u16) -> Option<Self> {
+        // The count byte lives at offset 1: anything shorter cannot even hold
+        // the fixed-size prefix
+        if data_size < 2 {
+            return None;
+        }
         // Safety: the SID prefix (2 first bytes) is part of the readable data
         let sub_authority_count = unsafe { data_ptr.add(1).read_unaligned() };
         let full_len = 8 + 4 * sub_authority_count as usize;
-        let len = full_len.min(data_size as usize);
-        // Safety: forwarded to the caller (at most data_size bytes are read)
-        let bytes = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-        Self {
-            data: bytes.to_vec(),
+        if full_len > data_size as usize {
+            return None;
         }
+        // Safety: forwarded to the caller (data_size bytes are readable)
+        let bytes = unsafe { std::slice::from_raw_parts(data_ptr, full_len) };
+        Some(Self {
+            data: bytes.to_vec(),
+        })
     }
 
     /// The raw SID bytes, as expected by SID-related Win32 APIs taking a `PSID`
@@ -118,6 +137,7 @@ impl Sid {
     }
 
     /// Number of sub-authorities (e.g. 5 for `S-1-5-21-...-...-...-RID`)
+    // In-bounds: `from_raw` guarantees the complete SID prefix (8 bytes)
     #[must_use]
     pub fn sub_authority_count(&self) -> u8 {
         self.data[1]
@@ -129,6 +149,7 @@ impl Sid {
         if index >= self.sub_authority_count() as usize {
             return None;
         }
+        // In-bounds: `from_raw` guarantees `4 * sub_authority_count()` trailing bytes
         let start = 8 + 4 * index;
         Some(u32::from_le_bytes(
             self.data[start..start + 4].try_into().unwrap(),
@@ -201,9 +222,13 @@ impl EventHeaderExtendedDataItem {
                 ExtendedDataItem::RelatedActivityId(unsafe { *data_ptr }.RelatedActivityId)
             },
 
-            EVENT_HEADER_EXT_TYPE_SID => ExtendedDataItem::Sid(unsafe {
-                Sid::from_raw(data_ptr.cast::<u8>(), self.0.DataSize)
-            }),
+            // A truncated SID (declared count larger than the data) is untrusted
+            // input: drop it rather than build a `Sid` that would panic on access
+            // or make Win32 read past its buffer
+            EVENT_HEADER_EXT_TYPE_SID => {
+                let sid = unsafe { Sid::from_raw(data_ptr.cast::<u8>(), self.0.DataSize) };
+                sid.map_or(ExtendedDataItem::Unsupported, ExtendedDataItem::Sid)
+            },
 
             EVENT_HEADER_EXT_TYPE_TS_ID => {
                 let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_TS_ID>();
@@ -426,6 +451,64 @@ mod tests {
             bytes.extend_from_slice(&sub_authority.to_le_bytes());
         }
         bytes
+    }
+
+    #[test]
+    fn truncated_sid_extended_data_is_dropped() {
+        // Declares 3 sub-authorities (20 bytes) but only holds 10: the old code
+        // kept the declared count, so `sub_authority(2)` panicked and
+        // `to_sddl_string` made Win32 read past the 10-byte buffer
+        let bytes = vec![1u8, 3, 0, 0, 0, 0, 0, 5, 21, 0];
+
+        assert!(matches!(
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &bytes)
+                .to_extended_data_item(),
+            ExtendedDataItem::Unsupported
+        ));
+    }
+
+    #[test]
+    fn sid_shorter_than_the_fixed_prefix_is_dropped() {
+        // The old code read the count byte out of bounds when DataSize < 2 and
+        // indexed `data[1]` on an empty buffer
+        for size in [0usize, 1] {
+            let bytes = vec![1u8; size];
+            assert!(matches!(
+                EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &bytes)
+                    .to_extended_data_item(),
+                ExtendedDataItem::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn sid_prefix_without_room_for_sub_authorities_is_dropped() {
+        // Complete 8-byte prefix declaring a sub-authority it does not hold
+        let bytes = vec![1u8, 1, 0, 0, 0, 0, 0, 5];
+
+        assert!(matches!(
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &bytes)
+                .to_extended_data_item(),
+            ExtendedDataItem::Unsupported
+        ));
+    }
+
+    #[test]
+    fn exactly_sized_sid_is_accepted() {
+        // Minimal well-formed SID: the completeness check must not reject it
+        let mut bytes = vec![1u8, 1, 0, 0, 0, 0, 0, 5];
+        bytes.extend_from_slice(&32u32.to_le_bytes());
+
+        let ExtendedDataItem::Sid(sid) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_SID, &bytes)
+                .to_extended_data_item()
+        else {
+            panic!("expected the Sid variant");
+        };
+
+        assert_eq!(sid.sub_authority_count(), 1);
+        assert_eq!(sid.sub_authority(0), Some(32));
+        assert_eq!(sid.to_sddl_string().unwrap(), "S-1-5-32");
     }
 
     #[test]
