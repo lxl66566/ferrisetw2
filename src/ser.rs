@@ -1115,6 +1115,40 @@ mod test {
     }
 
     #[test]
+    fn deprecated_wbem_in_types_pick_their_handlers() {
+        // The rest of the WBEM block (306-310): single-char and SID values
+        // go through the String handler, hexdump through the Binary one,
+        // and SIZET keeps the pointer handlers (hex display by default,
+        // like InTypePointer)
+        for in_type in [
+            TdhInType::InTypeUnicodeChar,
+            TdhInType::InTypeAnsiChar,
+            TdhInType::InTypeWbemSid,
+        ] {
+            assert_eq!(
+                value_info(in_type).get_parser().map(|p| p.0),
+                Some(PropHandler::String)
+            );
+        }
+        assert_eq!(
+            value_info(TdhInType::InTypeHexDump)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::Binary)
+        );
+        assert_eq!(
+            value_info(TdhInType::InTypeSizeT).get_parser().map(|p| p.0),
+            Some(PropHandler::HexPointer)
+        );
+        assert_eq!(
+            value_info_with_out(TdhInType::InTypeSizeT, TdhOutType::OutTypeUInt32)
+                .get_parser()
+                .map(|p| p.0),
+            Some(PropHandler::Pointer)
+        );
+    }
+
+    #[test]
     fn socket_address_serializes_via_dedicated_handler() {
         let info = value_info_with_out(TdhInType::InTypeBinary, TdhOutType::OutTypeSocketAddress);
         assert_eq!(
@@ -1494,12 +1528,20 @@ fn variable_member_size(member: &Property, remaining: &[u8]) -> Option<usize> {
             let count = remaining.get(..size_of::<u16>())?;
             Some(size_of::<u16>() + u16::from_be_bytes(count.try_into().ok()?) as usize)
         },
+        // The deprecated WBEM hexdump prefixes a u32 byte count
+        TdhInType::InTypeHexDump => {
+            let count = remaining.get(..size_of::<u32>())?;
+            Some(size_of::<u32>() + u32::from_le_bytes(count.try_into().ok()?) as usize)
+        },
         // The field spans the remaining bytes of the event
         TdhInType::InTypeNonNullTerminatedString | TdhInType::InTypeNonNullTerminatedAnsiString => {
             Some(remaining.len())
         },
-        // Revision (1) + sub-authority count (1) + authority (6) + RIDs (4 each)
-        TdhInType::InTypeSid => Some(8 + 4 * usize::from(*remaining.get(1)?)),
+        // Revision (1) + sub-authority count (1) + authority (6) + RIDs (4
+        // each); WBEMSID is the deprecated WBEM SID twin
+        TdhInType::InTypeSid | TdhInType::InTypeWbemSid => {
+            Some(8 + 4 * usize::from(*remaining.get(1)?))
+        },
         _ => None,
     }
 }
@@ -1843,6 +1885,11 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypeUnicodeString
                         | TdhInType::InTypeAnsiString
                         | TdhInType::InTypeSid
+                        // WBEMSID is the deprecated WBEM SID twin, and the
+                        // single-char types its deprecated string twins
+                        | TdhInType::InTypeWbemSid
+                        | TdhInType::InTypeUnicodeChar
+                        | TdhInType::InTypeAnsiChar
                         | TdhInType::InTypeManifestCountedString
                         | TdhInType::InTypeCountedString
                         | TdhInType::InTypeManifestCountedAnsiString
@@ -1853,9 +1900,10 @@ impl PropSerable for PropertyInfo {
                         | TdhInType::InTypeNonNullTerminatedAnsiString => {
                             Some(PropSer(PropHandler::String))
                         },
-                        // u16 byte count followed by raw bytes, like the
-                        // counted strings above
-                        TdhInType::InTypeManifestCountedBinary => {
+                        // A byte count followed by raw bytes (u16 for the
+                        // manifest type, u32 for the deprecated WBEM hexdump)
+                        TdhInType::InTypeManifestCountedBinary
+                        | TdhInType::InTypeHexDump => {
                             Some(PropSer(PropHandler::Binary))
                         },
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
@@ -1875,9 +1923,10 @@ impl PropSerable for PropertyInfo {
                         TdhInType::InTypeBoolean => Some(PropSer(PropHandler::Bool)),
                         TdhInType::InTypeBinary => Some(PropSer(PropHandler::Binary)),
                         TdhInType::InTypeGuid => Some(PropSer(PropHandler::Guid)),
-                        TdhInType::InTypePointer => {
-                            // TDH applies the HexInt64 out type to pointers
-                            // by default (see tdh.h)
+                        // SIZET is the deprecated WBEM pointer; TDH applies
+                        // the HexInt64 out type to pointers by default
+                        // (see tdh.h)
+                        TdhInType::InTypePointer | TdhInType::InTypeSizeT => {
                             if *out_type == TdhOutType::OutTypeNull {
                                 Some(PropSer(PropHandler::HexPointer))
                             } else {
@@ -1908,7 +1957,7 @@ impl PropSerable for PropertyInfo {
                         // underlying integer
                         TdhInType::InTypeHexInt32 => Some(PropSer(PropHandler::ArrayHexInt32)),
                         TdhInType::InTypeHexInt64 => Some(PropSer(PropHandler::ArrayHexInt64)),
-                        TdhInType::InTypePointer => {
+                        TdhInType::InTypePointer | TdhInType::InTypeSizeT => {
                             // Same default hex semantics as scalar pointers
                             if *out_type == TdhOutType::OutTypeNull {
                                 Some(PropSer(PropHandler::ArrayHexPointer))

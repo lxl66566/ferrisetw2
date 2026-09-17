@@ -145,7 +145,8 @@ impl Property {
             PropertyInfo::Value {
                 in_type, length, ..
             } => {
-                if *in_type == TdhInType::InTypePointer {
+                // SIZET is the deprecated WBEM pointer: same sizing rules
+                if matches!(in_type, TdhInType::InTypePointer | TdhInType::InTypeSizeT) {
                     return Some(pointer_size);
                 }
                 match length {
@@ -164,7 +165,7 @@ impl Property {
                 count,
                 ..
             } => {
-                let elem = if *in_type == TdhInType::InTypePointer {
+                let elem = if matches!(in_type, TdhInType::InTypePointer | TdhInType::InTypeSizeT) {
                     pointer_size
                 } else {
                     match length {
@@ -349,6 +350,22 @@ pub enum TdhInType {
     /// ANSI twin of [`TdhInType::InTypeNonNullTerminatedString`]
     /// (TDH_INTYPE_NONNULLTERMINATEDANSISTRING)
     InTypeNonNullTerminatedAnsiString,
+    /// Deprecated (TDH_INTYPE_UNICODECHAR): a single WCHAR. tdh.h: "Field
+    /// size is 2 bytes", default OutType STRING
+    InTypeUnicodeChar = 306,
+    /// Deprecated (TDH_INTYPE_ANSICHAR): a single CHAR. tdh.h: "Field size
+    /// is 1 byte", default OutType STRING
+    InTypeAnsiChar,
+    /// Deprecated (TDH_INTYPE_SIZET): a SIZE_T (UINT_PTR) value, sized from
+    /// the event header flags exactly like [`TdhInType::InTypePointer`].
+    /// Default OutType is HEXINT64
+    InTypeSizeT,
+    /// Deprecated (TDH_INTYPE_HEXDUMP): a little-endian 32-bit byte count
+    /// followed by that many raw bytes. Default OutType is HEXBINARY
+    InTypeHexDump,
+    /// Deprecated (TDH_INTYPE_WBEMSID): a security identifier (SID), laid
+    /// out like [`TdhInType::InTypeSid`]
+    InTypeWbemSid,
 }
 
 impl TdhInType {
@@ -388,8 +405,8 @@ impl TdhInType {
     /// lengths from the in type alone (see the parser tests).
     pub(crate) fn fixed_size(self) -> Option<usize> {
         match self {
-            Self::InTypeInt8 | Self::InTypeUInt8 => Some(1),
-            Self::InTypeInt16 | Self::InTypeUInt16 => Some(2),
+            Self::InTypeInt8 | Self::InTypeUInt8 | Self::InTypeAnsiChar => Some(1),
+            Self::InTypeInt16 | Self::InTypeUInt16 | Self::InTypeUnicodeChar => Some(2),
             Self::InTypeInt32
             | Self::InTypeUInt32
             | Self::InTypeFloat

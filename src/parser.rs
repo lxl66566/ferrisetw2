@@ -193,9 +193,10 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 //    length="_VerbLength"/>` In this case, we defer to TDH to know the right
                 //    length.
 
-                // For pointer input type we can immediately infer the size based on the header
-                // flags.
-                if in_type == TdhInType::InTypePointer {
+                // For pointer input types we can immediately infer the size
+                // based on the header flags (SIZET is the deprecated WBEM
+                // pointer: same rule)
+                if matches!(in_type, TdhInType::InTypePointer | TdhInType::InTypeSizeT) {
                     return Ok(self.record.pointer_size());
                 }
 
@@ -268,6 +269,31 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                         // in the event", so it can only be the last one
                         return Ok(remaining_user_buffer.len());
                     },
+                    TdhInType::InTypeSid | TdhInType::InTypeWbemSid => {
+                        // tdh.h: a SID's size "is determined by reading the
+                        // first few bytes of the field value to determine the
+                        // number of relative IDs": revision (1) + count (1) +
+                        // authority (6) + 4 bytes per relative ID
+                        let Some(sub_authority_count) = remaining_user_buffer.get(1) else {
+                            return Err(ParserError::PropertyError(
+                                "SID property is truncated".into(),
+                            ));
+                        };
+                        return Ok(8 + 4 * usize::from(*sub_authority_count));
+                    },
+                    TdhInType::InTypeHexDump => {
+                        // Deprecated WBEM TDH_INTYPE_HEXDUMP: a little-endian
+                        // 32-bit byte count, then that many payload bytes
+                        let Some(count_bytes) = remaining_user_buffer.get(..size_of::<u32>())
+                        else {
+                            return Err(ParserError::PropertyError(
+                                "hexdump property is truncated".into(),
+                            ));
+                        };
+                        // Guaranteed by the slice length above
+                        let count = u32::from_le_bytes(count_bytes.try_into().unwrap());
+                        return Ok(size_of::<u32>() + count as usize);
+                    },
                     _ => (),
                 }
 
@@ -287,9 +313,13 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 count,
                 ..
             } => {
-                // For pointer input type we can immediately infer the size based on the header
-                // flags.
-                let prop_len = if in_type == TdhInType::InTypePointer {
+                // For pointer input types we can immediately infer the element
+                // size based on the header flags (SIZET is the deprecated WBEM
+                // pointer: same rule)
+                let prop_len = if matches!(
+                    in_type,
+                    TdhInType::InTypePointer | TdhInType::InTypeSizeT
+                ) {
                     self.record.pointer_size()
                 } else {
                     match length {
@@ -726,6 +756,8 @@ fn parse_non_null_terminated_string(buffer: &[u8], wide: bool) -> ParserResult<S
 /// * InTypeCountedString (+ its manifest and deprecated big-endian twins)
 /// * InTypeCountedAnsiString (+ its manifest and deprecated big-endian twins)
 /// * InTypeNonNullTerminatedString / InTypeNonNullTerminatedAnsiString
+/// * the deprecated WBEM single-char twins (TDH_INTYPE_UNICODECHAR / ANSICHAR) and
+///   TDH_INTYPE_WBEMSID
 /// * InTypeGuid
 ///
 /// On success a `String` with the with the data from the `name` property will be returned
@@ -777,9 +809,23 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'s
                     let string = std::str::from_utf8(prop_slice.buffer)?;
                     Ok(string.trim_matches(char::default()).to_string())
                 },
-                TdhInType::InTypeSid => {
+                TdhInType::InTypeSid | TdhInType::InTypeWbemSid => {
                     let string = sddl::convert_sid_to_string(prop_slice.buffer.as_ptr().cast())?;
                     Ok(string)
+                },
+                TdhInType::InTypeUnicodeChar => {
+                    // Deprecated WBEM TDH_INTYPE_UNICODECHAR: one little-endian
+                    // WCHAR, decoded as a one-character string
+                    let unit = u16::from_le_bytes(prop_slice.buffer.try_into()?);
+                    Ok(widestring::decode_utf16_lossy([unit]).collect())
+                },
+                TdhInType::InTypeAnsiChar => {
+                    // Deprecated WBEM TDH_INTYPE_ANSICHAR: one CHAR byte, held
+                    // to the same strict UTF-8 rule as the ANSI strings (a
+                    // lone non-ASCII byte cannot be mapped without assuming a
+                    // codepage)
+                    let string = std::str::from_utf8(prop_slice.buffer)?;
+                    Ok(string.to_owned())
                 },
                 TdhInType::InTypeManifestCountedString | TdhInType::InTypeCountedString => {
                     parse_counted_string(prop_slice.buffer, true)
@@ -1042,29 +1088,45 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, Vec<u8>> for Parser<'
         &self,
         prop_slice: PropertySlice<'schema, 'record>,
     ) -> Result<Vec<u8>, ParserError> {
-        if matches!(prop_slice.property.info, PropertyInfo::Value {
-            in_type: TdhInType::InTypeManifestCountedBinary,
-            ..
-        }) {
-            // The property bytes include the leading u16 byte count: the
-            // payload starts after it
-            let buffer = prop_slice.buffer;
-            let count = buffer
-                .get(..size_of::<u16>())
-                .and_then(|bytes| bytes.try_into().ok())
-                .map(u16::from_le_bytes)
-                .ok_or(ParserError::PropertyError(
-                    "counted binary does not have length".into(),
-                ))? as usize;
-            return Ok(buffer
-                .get(size_of::<u16>()..size_of::<u16>() + count)
-                .ok_or(ParserError::PropertyError(
-                    "invalid counted binary length".into(),
-                ))?
-                .to_vec());
+        match prop_slice.property.info {
+            // The property bytes include the leading count: the payload starts
+            // after it
+            PropertyInfo::Value {
+                in_type: TdhInType::InTypeManifestCountedBinary,
+                ..
+            } => {
+                // TDH_INTYPE_MANIFEST_COUNTEDBINARY: u16 byte count
+                count_prefixed_binary(prop_slice.buffer, size_of::<u16>())
+            },
+            PropertyInfo::Value {
+                in_type: TdhInType::InTypeHexDump,
+                ..
+            } => {
+                // Deprecated WBEM TDH_INTYPE_HEXDUMP: u32 byte count
+                count_prefixed_binary(prop_slice.buffer, size_of::<u32>())
+            },
+            _ => Ok(prop_slice.buffer.to_vec()),
         }
-        Ok(prop_slice.buffer.to_vec())
     }
+}
+
+/// Payload of a count-prefixed binary field: a `width`-byte little-endian byte
+/// count followed by that many raw bytes
+fn count_prefixed_binary(buffer: &[u8], width: usize) -> ParserResult<Vec<u8>> {
+    let count_bytes = buffer.get(..width).ok_or(ParserError::PropertyError(
+        "counted binary does not have length".into(),
+    ))?;
+    // Guaranteed by the slice length above
+    let count = match width {
+        2 => u16::from_le_bytes(count_bytes.try_into().unwrap()) as usize,
+        _ => u32::from_le_bytes(count_bytes.try_into().unwrap()) as usize,
+    };
+    Ok(buffer
+        .get(width..width + count)
+        .ok_or(ParserError::PropertyError(
+            "invalid counted binary length".into(),
+        ))?
+        .to_vec())
 }
 
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
@@ -1766,6 +1828,102 @@ mod tests {
         )]);
         let parser = Parser::create(&record, &schema);
         assert_eq!(parser.try_parse::<String>("s").unwrap(), "hi");
+    }
+
+    /// The deprecated WBEM UNICODECHAR (306) / ANSICHAR (307) twins: a
+    /// single WCHAR/CHAR decoded as a one-character string, occupying
+    /// exactly its fixed size (2/1 bytes)
+    #[test]
+    fn deprecated_wbem_single_char_types_parse_and_advance_the_offset() {
+        // UNICODECHAR: one little-endian WCHAR ('é', a lone surrogate would
+        // degrade through the lossy decode)
+        let user_data: Vec<u8> = 0x00e9u16
+            .to_le_bytes()
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("c", TdhInType::InTypeUnicodeChar, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<String>("c").unwrap(), "é");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+
+        // ANSICHAR: one CHAR byte
+        let user_data: Vec<u8> = b"A"
+            .to_vec()
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("c", TdhInType::InTypeAnsiChar, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<String>("c").unwrap(), "A");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// The deprecated WBEM SIZET (308) / HEXDUMP (309) / WBEMSID (310)
+    /// values: layouts and sizing follow tdh.h (which TDH cannot confirm on
+    /// synthetic records — TraceLogging metadata only carries in types
+    /// 0..=31), so the u32 marker after each property verifies the sizing
+    #[test]
+    fn deprecated_wbem_sizet_hexdump_wbemsid_parse_and_advance_the_offset() {
+        // SIZET: sized from the header flags like a pointer (8 bytes here)
+        let user_data: Vec<u8> = 0x1122_3344_5566_7788u64
+            .to_ne_bytes()
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("sz", TdhInType::InTypeSizeT, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(
+            *parser.try_parse::<Pointer>("sz").unwrap(),
+            0x1122_3344_5566_7788
+        );
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+
+        // HEXDUMP: little-endian u32 byte count, then the payload
+        let user_data: Vec<u8> = 3u32
+            .to_le_bytes()
+            .into_iter()
+            .chain([0xaa, 0xbb, 0xcc])
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("dump", TdhInType::InTypeHexDump, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<Vec<u8>>("dump").unwrap(), vec![
+            0xaa, 0xbb, 0xcc
+        ]);
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+
+        // WBEMSID: the SID S-1-5-20 as it sits in an event (revision,
+        // sub-authority count, 6-byte identifier authority, one relative
+        // ID), rendered through the same SDDL conversion as InTypeSid
+        let user_data: Vec<u8> = [1u8, 1, 0, 0, 0, 0, 0, 5, 20, 0, 0, 0]
+            .into_iter()
+            .chain(0x1122_3344u32.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("sid", TdhInType::InTypeWbemSid, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<String>("sid").unwrap(), "S-1-5-20");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
     }
 
     #[test]
