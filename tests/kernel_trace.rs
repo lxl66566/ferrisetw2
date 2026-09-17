@@ -11,7 +11,7 @@ use ferrisetw::{
     parser::Parser,
     provider::{EventFilter, Provider, kernel_providers},
     schema_locator::SchemaLocator,
-    trace::KernelTrace,
+    trace::{KernelTrace, TraceTrait},
 };
 use windows::{
     Win32::System::LibraryLoader::{LOAD_LIBRARY_FLAGS, LoadLibraryExW},

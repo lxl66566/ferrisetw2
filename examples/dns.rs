@@ -9,7 +9,7 @@ use ferrisetw::{
     provider::{Provider, TraceFlags},
     schema::Schema,
     schema_locator::SchemaLocator,
-    trace::UserTrace,
+    trace::{TraceTrait, UserTrace},
 };
 
 static N_EVENTS: AtomicU32 = AtomicU32::new(0);

@@ -671,14 +671,6 @@ impl UserTrace {
         }
     }
 
-    /// Stops the trace
-    ///
-    /// This consumes the trace, that can no longer be used afterwards.
-    /// The same result is achieved by dropping `Self`
-    pub fn stop(mut self) -> TraceResult<()> {
-        self.non_consuming_stop()
-    }
-
     /// Ask every provider created with
     /// [`ProviderBuilder::request_capture_state`](crate::provider::ProviderBuilder::request_capture_state)
     /// to log its current state (rundown)
@@ -881,14 +873,6 @@ impl KernelTrace {
         };
         // Not all names are valid. Let's use the setter to check them for us
         builder.named(format!("n4r1b-trace-{}", utils::rand_string()))
-    }
-
-    /// Stops the trace
-    ///
-    /// This consumes the trace, that can no longer be used afterwards.
-    /// The same result is achieved by dropping `Self`
-    pub fn stop(mut self) -> TraceResult<()> {
-        self.non_consuming_stop()
     }
 }
 
