@@ -13,7 +13,7 @@ use std::{ffi::OsString, fmt::Formatter, marker::PhantomData};
 use widestring::{U16CStr, U16CString};
 use windows::{
     Win32::System::Diagnostics::{Etw, Etw::EVENT_FILTER_DESCRIPTOR},
-    core::{GUID, PWSTR},
+    core::PWSTR,
 };
 
 use super::evntrace::TraceContextId;
@@ -505,15 +505,13 @@ pub struct EnableTraceParameters<'filters> {
 }
 
 impl<'filters> EnableTraceParameters<'filters> {
-    pub fn create(
-        guid: GUID,
-        trace_flags: TraceFlags,
-        filters: &'filters [EventFilterDescriptor],
-    ) -> Self {
+    pub fn create(trace_flags: TraceFlags, filters: &'filters [EventFilterDescriptor]) -> Self {
         let mut params = EnableTraceParameters::default();
         params.native.ControlFlags = 0;
         params.native.Version = Etw::ENABLE_TRACE_PARAMETERS_VERSION_2;
-        params.native.SourceId = guid;
+        // SourceId identifies the *enabler* (the session issuing the request),
+        // not the enabled provider: the provider GUID is passed separately to
+        // EnableTraceEx2. Keep it zeroed, as krabsetw does.
         params.native.EnableProperty = trace_flags.bits();
 
         // Note: > Each type of filter (a specific Type member) may only appear once in a call to

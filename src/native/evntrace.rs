@@ -426,11 +426,8 @@ pub(crate) fn enable_provider(
                 enable_property |= TraceFlags::EVENT_ENABLE_PROPERTY_STACK_TRACE;
             }
 
-            let parameters = EnableTraceParameters::create(
-                provider.guid(),
-                enable_property,
-                &owned_event_filter_descriptors,
-            );
+            let parameters =
+                EnableTraceParameters::create(enable_property, &owned_event_filter_descriptors);
 
             let res = unsafe {
                 Etw::EnableTraceEx2(
