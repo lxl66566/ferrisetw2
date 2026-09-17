@@ -739,7 +739,7 @@ impl UserTrace {
     /// Only a `UserTrace` owns the session it processes, so this method
     /// exists here only. Kernel traces select their events through
     /// `EnableFlags`/group masks, which can only be changed through another
-    /// (unsupported) `ControlTrace` flow, and [`FileTrace`](crate::trace::FileTrace)
+    /// (unsupported) `ControlTrace` flow, and [`FileTrace`]
     /// has no session at all. Traces obtained through
     /// [`TraceBuilder::open_existing`] hold no control handle: this returns
     /// an error.
