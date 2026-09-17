@@ -756,7 +756,13 @@ impl UserTrace {
     /// ```
     pub fn enable_provider(&self, provider: Provider) -> TraceResult<()> {
         let provider = Arc::new(provider);
-        // A UserTrace always holds real-time callback data
+        // A UserTrace always holds real-time callback data: the let-else below is
+        // unreachable by construction, but a broken invariant must fail loudly in
+        // debug builds instead of silently skipping the registration
+        debug_assert!(
+            matches!(&*self.context, CallbackData::RealTime(_)),
+            "a UserTrace always holds real-time callback data"
+        );
         let CallbackData::RealTime(rt) = &*self.context else {
             return Ok(());
         };
@@ -816,7 +822,13 @@ impl UserTrace {
     /// assert_eq!(removed, 1);
     /// ```
     pub fn disable_provider(&self, guid: GUID) -> TraceResult<usize> {
-        // A UserTrace always holds real-time callback data
+        // A UserTrace always holds real-time callback data: the let-else below is
+        // unreachable by construction, but a broken invariant must fail loudly in
+        // debug builds instead of silently reporting "nothing to disable"
+        debug_assert!(
+            matches!(&*self.context, CallbackData::RealTime(_)),
+            "a UserTrace always holds real-time callback data"
+        );
         let CallbackData::RealTime(rt) = &*self.context else {
             return Ok(0);
         };
