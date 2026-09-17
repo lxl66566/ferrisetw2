@@ -98,6 +98,61 @@ const PERF_INFO_GUID: GUID = GUID::from_values(0xce1d_bfb4, 0x137e, 0x4da6, [
     0x87, 0xb0, 0x3f, 0x59, 0xaa, 0x10, 0x2c, 0xbc,
 ]);
 
+/// A snapshot of the statistics of a running trace session
+///
+/// This is returned by [`RealTimeTraceTrait::statistics`], which queries the session live
+/// (through `ControlTraceW` with `EVENT_TRACE_CONTROL_QUERY`). The values can be re-queried
+/// at any time while the session is running, e.g. to detect a growing `events_lost` counter
+/// on a long-running real-time trace.
+///
+/// These are the **logger-side** statistics, as maintained by the ETW session itself. The
+/// **consumer-side** counters exposed by [`TraceTrait::events_handled`] and
+/// [`TraceTrait::buffers_read`] are a complementary view of the same session.
+///
+/// A [`FileTrace`] has no session handle, so it does not offer this query; the loss counters
+/// recorded in an ETL file are reported to it through [`TraceTrait::events_lost`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TraceStatistics {
+    /// Number of events the session has dropped because no buffer was available to hold them
+    /// (e.g. a burst of events while all buffers were busy flushing)
+    pub events_lost: u32,
+    /// Number of buffers lost while logging to the dump file: e.g. the disk was too slow, or
+    /// the file system errored out. Non-zero only for sessions with a dump file.
+    pub log_buffers_lost: u32,
+    /// Number of buffers lost while delivering events to real-time consumers: e.g. the
+    /// consumer was not attached, or did not drain the buffers fast enough
+    pub real_time_buffers_lost: u32,
+    /// Total number of buffers written so far
+    pub buffers_written: u32,
+    /// Number of buffers currently allocated for the session
+    pub number_of_buffers: u32,
+    /// Number of allocated buffers currently free (a `free_buffers` of 0 with a non-zero
+    /// `events_lost` is the signature of a session dropping events for lack of buffers)
+    pub free_buffers: u32,
+    /// Identifier of the thread running the logger
+    pub logger_thread_id: u32,
+}
+
+impl TraceStatistics {
+    /// Maps the statistics fields of a raw [`Etw::EVENT_TRACE_PROPERTIES`], as filled in by
+    /// the `ControlTraceW` QUERY control code
+    pub(crate) fn from_properties(props: &Etw::EVENT_TRACE_PROPERTIES) -> Self {
+        // The logger thread id is a thread id disguised as a HANDLE: only its low 32 bits can
+        // ever be meaningful
+        #[allow(clippy::cast_possible_truncation)]
+        let logger_thread_id = props.LoggerThreadId.0 as usize as u32;
+        Self {
+            events_lost: props.EventsLost,
+            log_buffers_lost: props.LogBuffersLost,
+            real_time_buffers_lost: props.RealTimeBuffersLost,
+            buffers_written: props.BuffersWritten,
+            number_of_buffers: props.NumberOfBuffers,
+            free_buffers: props.FreeBuffers,
+            logger_thread_id,
+        }
+    }
+}
+
 /// A kernel event to collect call stacks for
 ///
 /// Kernel loggers cannot use the per-provider stack trace flag of user traces
@@ -396,6 +451,34 @@ pub trait RealTimeTraceTrait: TraceTrait + PrivateRealTimeTraceTrait {
 
     // This utility function should be implemented for every trace
     fn trace_name(&self) -> OsString;
+
+    /// Query the current statistics of the session (events lost, buffer usage, ...)
+    ///
+    /// This calls `ControlTraceW` with `EVENT_TRACE_CONTROL_QUERY`, and can be issued at any
+    /// time while the session is running, as often as needed.
+    ///
+    /// Traces obtained through [`TraceBuilder::open_existing`] do not own their session and
+    /// hold no control handle: querying them returns an error.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ferrisetw::trace::{RealTimeTraceTrait, UserTrace};
+    /// # let mut trace = UserTrace::new().start().unwrap().0;
+    /// let stats = trace.statistics().unwrap();
+    /// if stats.events_lost > 0 || stats.real_time_buffers_lost > 0 {
+    ///     eprintln!("the trace session is dropping events: {stats:?}");
+    /// }
+    /// ```
+    fn statistics(&mut self) -> TraceResult<TraceStatistics> {
+        // The QUERY is an in/out call: Windows fills the statistics fields of `properties`,
+        // and copies the session (and dump file, if any) name back into the name buffers of
+        // `properties`. The offsets and buffers are ours and untouched, so subsequent QUERY
+        // or STOP calls keep working (STOP passes the handle anyway, not the name).
+        let control_handle = self.control_handle();
+        let properties = self.properties_mut();
+        control_trace(properties, control_handle, Etw::EVENT_TRACE_CONTROL_QUERY)?;
+        Ok(TraceStatistics::from_properties(properties.as_native()))
+    }
 }
 
 impl TraceTrait for UserTrace {
@@ -647,6 +730,9 @@ mod private {
 
     pub trait PrivateRealTimeTraceTrait: PrivateTraceTrait {
         const TRACE_KIND: TraceKind;
+        // Accessors used by the default methods of `RealTimeTraceTrait` (e.g. `statistics`)
+        fn properties_mut(&mut self) -> &mut EventTraceProperties;
+        fn control_handle(&self) -> ControlHandle;
         // The properties are moved into the built trace: passing by value is the point
         #[allow(clippy::large_types_passed_by_value)]
         #[allow(clippy::redundant_allocation)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer (see https://github.com/n4r1b/ferrisetw/issues/72)
@@ -670,6 +756,14 @@ mod private {
 
 impl PrivateRealTimeTraceTrait for UserTrace {
     const TRACE_KIND: private::TraceKind = private::TraceKind::User;
+
+    fn properties_mut(&mut self) -> &mut EventTraceProperties {
+        &mut self.properties
+    }
+
+    fn control_handle(&self) -> ControlHandle {
+        self.control_handle
+    }
 
     fn build(
         properties: EventTraceProperties,
@@ -708,6 +802,14 @@ impl PrivateTraceTrait for UserTrace {
 
 impl PrivateRealTimeTraceTrait for KernelTrace {
     const TRACE_KIND: private::TraceKind = private::TraceKind::Kernel;
+
+    fn properties_mut(&mut self) -> &mut EventTraceProperties {
+        &mut self.properties
+    }
+
+    fn control_handle(&self) -> ControlHandle {
+        self.control_handle
+    }
 
     fn build(
         properties: EventTraceProperties,
@@ -1245,5 +1347,40 @@ mod test {
             StackTracingEvent::SYSCALL_ENTER
         ]);
         assert_eq!(builder.extended_kernel_groups, [ExtendedKernelGroup::Pool]);
+    }
+
+    #[test]
+    fn trace_statistics_are_mapped_from_the_native_properties() {
+        use windows::Win32::Foundation::HANDLE;
+
+        // Simulate what ControlTraceW(QUERY) does: an EVENT_TRACE_PROPERTIES whose
+        // statistics fields have been filled in
+        let native = Etw::EVENT_TRACE_PROPERTIES {
+            EventsLost: 11,
+            LogBuffersLost: 22,
+            RealTimeBuffersLost: 33,
+            BuffersWritten: 44,
+            NumberOfBuffers: 55,
+            FreeBuffers: 66,
+            LoggerThreadId: HANDLE(std::ptr::with_exposed_provenance_mut(0x1a2b)),
+            ..Default::default()
+        };
+
+        assert_eq!(TraceStatistics::from_properties(&native), TraceStatistics {
+            events_lost: 11,
+            log_buffers_lost: 22,
+            real_time_buffers_lost: 33,
+            buffers_written: 44,
+            number_of_buffers: 55,
+            free_buffers: 66,
+            logger_thread_id: 0x1a2b,
+        });
+
+        // Everything zeroed (e.g. before any event was processed) maps to zeroed statistics
+        let zeroed = Etw::EVENT_TRACE_PROPERTIES::default();
+        assert_eq!(
+            TraceStatistics::from_properties(&zeroed).logger_thread_id,
+            0
+        );
     }
 }

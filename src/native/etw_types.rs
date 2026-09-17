@@ -395,6 +395,14 @@ impl EventTraceProperties {
         &raw mut self.etw_trace_properties
     }
 
+    /// A read-only view over the wrapped [Etw::EVENT_TRACE_PROPERTIES]
+    ///
+    /// After a `ControlTraceW` call, this is where the statistics fields filled in by the
+    /// OS can be read from
+    pub(crate) fn as_native(&self) -> &Etw::EVENT_TRACE_PROPERTIES {
+        &self.etw_trace_properties
+    }
+
     pub fn trace_name_array(&self) -> &[u16] {
         &self.wide_trace_name
     }
