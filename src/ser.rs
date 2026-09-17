@@ -1261,6 +1261,14 @@ fn variable_member_size(member: &Property, remaining: &[u8]) -> Option<usize> {
             let count = remaining.get(..size_of::<u16>())?;
             Some(size_of::<u16>() + u16::from_le_bytes(count.try_into().ok()?) as usize)
         },
+        TdhInType::InTypeReversedCountedString | TdhInType::InTypeReversedCountedAnsiString => {
+            let count = remaining.get(..size_of::<u16>())?;
+            Some(size_of::<u16>() + u16::from_be_bytes(count.try_into().ok()?) as usize)
+        },
+        // The field spans the remaining bytes of the event
+        TdhInType::InTypeNonNullTerminatedString | TdhInType::InTypeNonNullTerminatedAnsiString => {
+            Some(remaining.len())
+        },
         // Revision (1) + sub-authority count (1) + authority (6) + RIDs (4 each)
         TdhInType::InTypeSid => Some(8 + 4 * usize::from(*remaining.get(1)?)),
         _ => None,
@@ -1594,7 +1602,7 @@ impl PropSerable for PropertyInfo {
                     TdhOutType::OutTypeHexInt64 => Some(PropSer(PropHandler::HexInt64)),
                     _ => match in_type {
                         TdhInType::InTypeNull => Some(PropSer(PropHandler::Null)),
-                        // `try_parse::<String>` is implemented for the counted string
+                        // `try_parse::<String>` is implemented for the string
                         // in types (see parser.rs)
                         TdhInType::InTypeUnicodeString
                         | TdhInType::InTypeAnsiString
@@ -1602,7 +1610,13 @@ impl PropSerable for PropertyInfo {
                         | TdhInType::InTypeManifestCountedString
                         | TdhInType::InTypeCountedString
                         | TdhInType::InTypeManifestCountedAnsiString
-                        | TdhInType::InTypeCountedAnsiString => Some(PropSer(PropHandler::String)),
+                        | TdhInType::InTypeCountedAnsiString
+                        | TdhInType::InTypeReversedCountedString
+                        | TdhInType::InTypeReversedCountedAnsiString
+                        | TdhInType::InTypeNonNullTerminatedString
+                        | TdhInType::InTypeNonNullTerminatedAnsiString => {
+                            Some(PropSer(PropHandler::String))
+                        },
                         TdhInType::InTypeInt8 => Some(PropSer(PropHandler::Int8)),
                         TdhInType::InTypeUInt8 => Some(PropSer(PropHandler::UInt8)),
                         TdhInType::InTypeInt16 => Some(PropSer(PropHandler::Int16)),

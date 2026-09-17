@@ -245,19 +245,27 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     TdhInType::InTypeManifestCountedString
                     | TdhInType::InTypeCountedString
                     | TdhInType::InTypeManifestCountedAnsiString
-                    | TdhInType::InTypeCountedAnsiString => {
+                    | TdhInType::InTypeCountedAnsiString
+                    | TdhInType::InTypeReversedCountedString
+                    | TdhInType::InTypeReversedCountedAnsiString => {
                         // All counted string variants share the same layout:
-                        // a little-endian u16 byte count then the payload
+                        // a 16-bit byte count (little-endian, big-endian for
+                        // the deprecated REVERSED twins) then the payload.
                         // (TraceLogging events leave the TDH length at 0, and
                         // TdhGetPropertySize is a costly round-trip)
-                        let Some(count) = remaining_user_buffer.get(..size_of::<u16>()) else {
-                            return Err(ParserError::PropertyError(
-                                "counted string does not have length".into(),
-                            ));
-                        };
-                        // Guaranteed by the slice length above
-                        let byte_count = u16::from_le_bytes(count.try_into().unwrap()) as usize;
+                        let big_endian = matches!(
+                            in_type,
+                            TdhInType::InTypeReversedCountedString
+                                | TdhInType::InTypeReversedCountedAnsiString
+                        );
+                        let byte_count = read_count_prefix(remaining_user_buffer, big_endian)?;
                         return Ok(size_of::<u16>() + byte_count);
+                    },
+                    TdhInType::InTypeNonNullTerminatedString
+                    | TdhInType::InTypeNonNullTerminatedAnsiString => {
+                        // tdh.h: the field spans "the remaining bytes of data
+                        // in the event", so it can only be the last one
+                        return Ok(remaining_user_buffer.len());
                     },
                     _ => (),
                 }
@@ -622,24 +630,20 @@ impl_try_parse_primitive_array!(i32);
 impl_try_parse_primitive_array!(u64);
 impl_try_parse_primitive_array!(i64);
 
-/// Parses a count-prefixed string: a little-endian `u16` byte count followed by
-/// the payload (UTF-16 code units when `wide`, bytes otherwise)
-fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
-    const COUNT_LEN: usize = size_of::<u16>();
-    let Some(count_bytes) = buffer.get(..COUNT_LEN) else {
-        return Err(ParserError::PropertyError(
-            "counted string does not have length".into(),
-        ));
-    };
-    // Guaranteed by the slice length above
-    let byte_count = u16::from_le_bytes(count_bytes.try_into().unwrap()) as usize;
-    let Some(data) = buffer.get(COUNT_LEN..COUNT_LEN + byte_count) else {
+/// Decodes the payload of a count-prefixed string: `byte_count` bytes of
+/// UTF-16 (`wide`) or ANSI data following the count
+fn decode_counted_payload(buffer: &[u8], byte_count: usize, wide: bool) -> ParserResult<String> {
+    let count_len = size_of::<u16>();
+    let Some(data) = buffer.get(count_len..count_len + byte_count) else {
         return Err(ParserError::PropertyError(
             "invalid counted string length".into(),
         ));
     };
 
     if wide {
+        // tdh.h sizes counted strings as "the number of additional bytes (not
+        // characters)": a trailing odd byte is a truncated final code unit,
+        // which is dropped here
         Ok(widestring::decode_utf16_lossy(
             data.chunks_exact(2)
                 .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
@@ -650,12 +654,63 @@ fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
     }
 }
 
+/// Reads the 16-bit byte count that prefixes a counted string
+fn read_count_prefix(buffer: &[u8], big_endian: bool) -> ParserResult<usize> {
+    let Some(count_bytes) = buffer.get(..size_of::<u16>()) else {
+        return Err(ParserError::PropertyError(
+            "counted string does not have length".into(),
+        ));
+    };
+    // Guaranteed by the slice length above
+    let count_bytes = count_bytes.try_into().unwrap();
+    Ok((if big_endian {
+        u16::from_be_bytes(count_bytes)
+    } else {
+        u16::from_le_bytes(count_bytes)
+    }) as usize)
+}
+
+/// Parses a count-prefixed string: a little-endian `u16` byte count followed by
+/// the payload (UTF-16 code units when `wide`, bytes otherwise)
+fn parse_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
+    let byte_count = read_count_prefix(buffer, false)?;
+    decode_counted_payload(buffer, byte_count, wide)
+}
+
+/// [`parse_counted_string`] for the deprecated WBEM in types whose count
+/// prefix is big-endian (TDH_INTYPE_REVERSEDCOUNTEDSTRING /
+/// REVERSEDCOUNTEDANSISTRING)
+fn parse_reversed_counted_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
+    let byte_count = read_count_prefix(buffer, true)?;
+    decode_counted_payload(buffer, byte_count, wide)
+}
+
+/// Parses a string with neither count prefix nor NUL terminator (deprecated
+/// WBEM TDH_INTYPE_NONNULLTERMINATEDSTRING / NONNULLTERMINATEDANSISTRING):
+/// tdh.h sizes the field as "the remaining bytes of data in the event", so
+/// the whole property payload is the string
+fn parse_non_null_terminated_string(buffer: &[u8], wide: bool) -> ParserResult<String> {
+    if wide {
+        // A trailing odd byte is a truncated final code unit, dropped like
+        // for the counted strings
+        Ok(widestring::decode_utf16_lossy(
+            buffer
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes(c.try_into().unwrap())),
+        )
+        .collect())
+    } else {
+        Ok(std::str::from_utf8(buffer)?.to_string())
+    }
+}
+
 /// The `String` impl of the `TryParse` trait should be used to retrieve the following [TdhInTypes]:
 ///
 /// * InTypeUnicodeString
 /// * InTypeAnsiString
-/// * InTypeCountedString (+ its manifest twin)
-/// * InTypeCountedAnsiString (+ its manifest twin)
+/// * InTypeCountedString (+ its manifest and deprecated big-endian twins)
+/// * InTypeCountedAnsiString (+ its manifest and deprecated big-endian twins)
+/// * InTypeNonNullTerminatedString / InTypeNonNullTerminatedAnsiString
 /// * InTypeGuid
 ///
 /// On success a `String` with the with the data from the `name` property will be returned
@@ -722,6 +777,18 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'s
                 },
                 TdhInType::InTypeManifestCountedAnsiString | TdhInType::InTypeCountedAnsiString => {
                     parse_counted_string(prop_slice.buffer, false)
+                },
+                TdhInType::InTypeReversedCountedString => {
+                    parse_reversed_counted_string(prop_slice.buffer, true)
+                },
+                TdhInType::InTypeReversedCountedAnsiString => {
+                    parse_reversed_counted_string(prop_slice.buffer, false)
+                },
+                TdhInType::InTypeNonNullTerminatedString => {
+                    parse_non_null_terminated_string(prop_slice.buffer, true)
+                },
+                TdhInType::InTypeNonNullTerminatedAnsiString => {
+                    parse_non_null_terminated_string(prop_slice.buffer, false)
                 },
                 _ => Err(ParserError::InvalidType),
             },
@@ -1561,6 +1628,91 @@ mod tests {
         let schema = synthetic_schema(&[PropSpec::new("s", TdhInType::InTypeCountedString, 2)]);
         let parser = Parser::create(&record, &schema);
         assert!(parser.try_parse::<String>("s").is_err());
+    }
+
+    /// The deprecated WBEM string twins: 302/303 prefix their payload with a
+    /// big-endian byte count, 304/305 span the whole remaining buffer with
+    /// neither count nor NUL terminator
+    ///
+    /// The real TDH cannot validate these: TraceLogging event metadata only
+    /// carries in-type values 0..=31 (TlgIn_t in TraceLoggingProvider.h), far
+    /// below the 300-series, so these stay byte-level tests against the
+    /// documented layouts
+    #[test]
+    fn deprecated_wbem_string_types_parse_and_advance_the_offset() {
+        let wide: Vec<u8> = "hï".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ansi = b"hi".to_vec();
+
+        // 302/303: big-endian count prefix, then the payload
+        let counted_cases = [
+            (
+                TdhInType::InTypeReversedCountedString,
+                wide.as_slice(),
+                "hï",
+            ),
+            (
+                TdhInType::InTypeReversedCountedAnsiString,
+                ansi.as_slice(),
+                "hi",
+            ),
+        ];
+        for (in_type, payload, expected) in counted_cases {
+            let user_data: Vec<u8> = u16::try_from(payload.len())
+                .unwrap()
+                .to_be_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .chain(0x1122_3344u32.to_ne_bytes())
+                .collect();
+            let record = synthetic_record(&user_data);
+            let schema = synthetic_schema(&[
+                PropSpec::new("s", in_type, u16::try_from(2 + payload.len()).unwrap()),
+                PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+            ]);
+            let parser = Parser::create(&record, &schema);
+
+            assert_eq!(parser.try_parse::<String>("s").unwrap(), expected);
+            // The u32 sits right after the counted string: this verifies the
+            // property size computation
+            assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+        }
+
+        // 304/305: the field is the whole remaining buffer (zero schema
+        // length exercises that sizing), so it must come last
+        let unterminated_cases = [
+            (
+                TdhInType::InTypeNonNullTerminatedString,
+                wide.as_slice(),
+                "hï",
+            ),
+            (
+                TdhInType::InTypeNonNullTerminatedAnsiString,
+                ansi.as_slice(),
+                "hi",
+            ),
+        ];
+        for (in_type, payload, expected) in unterminated_cases {
+            let record = synthetic_record(payload);
+            let schema = synthetic_schema(&[PropSpec::new("s", in_type, 0)]);
+            let parser = Parser::create(&record, &schema);
+            assert_eq!(parser.try_parse::<String>("s").unwrap(), expected);
+        }
+
+        // 303: the big-endian count is read as such — 0x0002 as a
+        // little-endian count would claim 512 bytes and fail
+        let user_data: Vec<u8> = 2u16
+            .to_be_bytes()
+            .into_iter()
+            .chain(b"hi".iter().copied())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[PropSpec::new(
+            "s",
+            TdhInType::InTypeReversedCountedAnsiString,
+            4,
+        )]);
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<String>("s").unwrap(), "hi");
     }
 
     #[test]

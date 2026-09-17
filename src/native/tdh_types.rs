@@ -327,6 +327,21 @@ pub enum TdhInType {
     InTypeCountedString = 300,
     /// WBEM twin of [`TdhInType::InTypeManifestCountedAnsiString`], same layout
     InTypeCountedAnsiString,
+    /// Deprecated big-endian twin of [`TdhInType::InTypeCountedString`]
+    /// (TDH_INTYPE_REVERSEDCOUNTEDSTRING): a big-endian 16-bit byte count
+    /// followed by UTF-16 data
+    InTypeReversedCountedString,
+    /// Deprecated big-endian twin of [`TdhInType::InTypeCountedAnsiString`]
+    /// (TDH_INTYPE_REVERSEDCOUNTEDANSISTRING): a big-endian 16-bit byte
+    /// count followed by 8-bit characters
+    InTypeReversedCountedAnsiString,
+    /// Deprecated (TDH_INTYPE_NONNULLTERMINATEDSTRING): UTF-16 data with
+    /// neither count prefix nor NUL terminator — tdh.h sizes the field as
+    /// "the remaining bytes of data in the event"
+    InTypeNonNullTerminatedString,
+    /// ANSI twin of [`TdhInType::InTypeNonNullTerminatedString`]
+    /// (TDH_INTYPE_NONNULLTERMINATEDANSISTRING)
+    InTypeNonNullTerminatedAnsiString,
 }
 
 impl TdhInType {
