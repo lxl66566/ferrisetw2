@@ -270,6 +270,14 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     _ => (),
                 }
 
+                // Fixed-size in types carry their size in the in type itself:
+                // tdh.h says the length property "can be ignored by decoders",
+                // which also spares a TDH round-trip when a WBEM/MOF schema
+                // leaves it at 0
+                if let Some(size) = in_type.fixed_size() {
+                    return Ok(size);
+                }
+
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
             PropertyInfo::Array {
@@ -308,6 +316,12 @@ impl<'schema, 'record> Parser<'schema, 'record> {
 
                 if prop_len > 0 {
                     return Ok(prop_len * prop_count);
+                }
+
+                // As for scalar values, fixed-size in types do not need the
+                // schema length
+                if let Some(elem) = in_type.fixed_size() {
+                    return Ok(elem * prop_count);
                 }
 
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
@@ -1510,6 +1524,29 @@ mod tests {
         ));
     }
 
+    /// tdh.h: for fixed-size in types "the length property of the
+    /// EVENT_PROPERTY_INFO structure can be ignored by decoders" — a
+    /// WBEM/MOF schema that leaves it at 0 must size the property from the
+    /// in type instead of asking TDH (which fails outright on these
+    /// synthetic records, as it used to)
+    #[test]
+    fn scalars_without_schema_length_fall_back_to_the_in_type_size() {
+        let user_data: Vec<u8> = 1u32
+            .to_ne_bytes()
+            .into_iter()
+            .chain(2u64.to_ne_bytes())
+            .collect();
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("a", TdhInType::InTypeUInt32, 0),
+            PropSpec::new("b", TdhInType::InTypeUInt64, 0),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.try_parse::<u32>("a").unwrap(), 1);
+        assert_eq!(parser.try_parse::<u64>("b").unwrap(), 2);
+    }
+
     #[test]
     fn cached_properties_are_found_out_of_order() {
         // Parsing "c" first has to walk through "a" and "b"; asking for them
@@ -1761,6 +1798,8 @@ mod tests {
         pub const IN_U16: u8 = 6;
         pub const IN_I32: u8 = 7;
         pub const IN_U32: u8 = 8;
+        pub const IN_U64: u8 = 10;
+        pub const IN_GUID: u8 = 15;
         pub const IN_BINARY: u8 = 14;
         pub const IN_FILETIME: u8 = 17;
         pub const IN_HEX64: u8 = 21;
@@ -2199,5 +2238,46 @@ mod tests {
             panic!("'Items' should be a counted array, got {:?}", props[1].info);
         };
         assert_eq!(*index, 0);
+    }
+
+    /// Empirical pin backing the fixed-size fallback: TraceLogging field
+    /// metadata carries no length at all, and the real TDH still synthesizes
+    /// exactly the fixed size of each scalar in type
+    #[test]
+    fn tracelogging_scalar_lengths_follow_the_in_type() {
+        let mut meta: Vec<u8> = Vec::new();
+        for (name, in_type) in [
+            ("U16", tlg::IN_U16),
+            ("U32", tlg::IN_U32),
+            ("U64", tlg::IN_U64),
+            ("FT", tlg::IN_FILETIME),
+            ("G", tlg::IN_GUID),
+        ] {
+            meta.extend_from_slice(name.as_bytes());
+            meta.push(0);
+            meta.push(in_type);
+        }
+        let mut values: Vec<u8> = 1u16.to_le_bytes().to_vec();
+        values.extend_from_slice(&2u32.to_le_bytes());
+        values.extend_from_slice(&3u64.to_le_bytes());
+        values.extend_from_slice(&[0; 8]); // filetime
+        values.extend_from_slice(&[0; 16]); // guid
+
+        let (_record, schema) = tlg_ext_record(&meta, &values);
+
+        for (name, length) in [("U16", 2), ("U32", 4), ("U64", 8), ("FT", 8), ("G", 16)] {
+            let prop = schema
+                .properties()
+                .iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("TDH should report {name}"));
+            let PropertyInfo::Value {
+                length: reported, ..
+            } = &prop.info
+            else {
+                panic!("{name} should be a scalar value");
+            };
+            assert_eq!(*reported, PropertyLength::Length(length));
+        }
     }
 }

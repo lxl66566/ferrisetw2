@@ -150,10 +150,13 @@ impl Property {
                     return Some(pointer_size);
                 }
                 match length {
-                    // A zero length means "ask TDH" for a top-level property; inside
-                    // a structure it marks a variable-length member
                     PropertyLength::Length(l) if *l > 0 => Some(in_type.schema_length_bytes(*l)),
-                    _ => None,
+                    // A zero length means "ask TDH" for a top-level property;
+                    // inside a structure it marks a variable-length member —
+                    // unless the in type has a fixed size, which tdh.h says
+                    // overrides the (ignorable) length
+                    PropertyLength::Length(_) => in_type.fixed_size(),
+                    PropertyLength::Index(_) => None,
                 }
             },
             PropertyInfo::Array {
@@ -167,7 +170,8 @@ impl Property {
                 } else {
                     match length {
                         PropertyLength::Length(l) if *l > 0 => in_type.schema_length_bytes(*l),
-                        _ => return None,
+                        PropertyLength::Length(_) => in_type.fixed_size()?,
+                        PropertyLength::Index(_) => return None,
                     }
                 };
                 let count = match count {
@@ -370,6 +374,33 @@ impl TdhInType {
             _ => usize::from(length),
         }
     }
+
+    /// Fixed byte size of the in types whose size follows from the in type
+    /// alone, per the tdh.h comments ("Field size is N bytes").
+    ///
+    /// tdh.h: "Some InTypes have a fixed size. For these fields, the length
+    /// property of the EVENT_PROPERTY_INFO structure can be ignored by
+    /// decoders." Verified against the real TDH: TraceLogging field metadata
+    /// carries no length at all, and TDH still synthesizes exactly these
+    /// lengths from the in type alone (see the parser tests).
+    pub(crate) fn fixed_size(self) -> Option<usize> {
+        match self {
+            Self::InTypeInt8 | Self::InTypeUInt8 => Some(1),
+            Self::InTypeInt16 | Self::InTypeUInt16 => Some(2),
+            Self::InTypeInt32
+            | Self::InTypeUInt32
+            | Self::InTypeFloat
+            | Self::InTypeBoolean
+            | Self::InTypeHexInt32 => Some(4),
+            Self::InTypeInt64
+            | Self::InTypeUInt64
+            | Self::InTypeDouble
+            | Self::InTypeFileTime
+            | Self::InTypeHexInt64 => Some(8),
+            Self::InTypeGuid | Self::InTypeSystemTime => Some(16),
+            _ => None,
+        }
+    }
 }
 
 /// Represent a TDH_OUT_TYPE
@@ -513,5 +544,39 @@ mod tests {
             } => {},
             other => panic!("expected an unsupported property of length 8, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn zero_length_falls_back_to_the_fixed_in_type_size() {
+        // A WBEM/MOF schema may leave the length of fixed-size in types at 0
+        fn property_with_length(in_type: TdhInType, length: u16) -> Property {
+            let mut info = Etw::EVENT_PROPERTY_INFO::default();
+            info.Anonymous1.nonStructType.InType = in_type as u16;
+            info.Anonymous3.length = length;
+            Property::new("prop".into(), &info)
+        }
+
+        assert_eq!(
+            property_with_length(TdhInType::InTypeUInt16, 0).fixed_size(8),
+            Some(2)
+        );
+        assert_eq!(
+            property_with_length(TdhInType::InTypeGuid, 0).fixed_size(8),
+            Some(16)
+        );
+        // An explicit length still wins
+        assert_eq!(
+            property_with_length(TdhInType::InTypeUInt16, 6).fixed_size(8),
+            Some(6)
+        );
+        // A length held by another property is not ignorable
+        let mut info = Etw::EVENT_PROPERTY_INFO {
+            #[allow(clippy::cast_possible_wrap)]
+            Flags: Etw::PROPERTY_FLAGS(PropertyFlags::PROPERTY_PARAM_LENGTH.bits() as i32),
+            ..Default::default()
+        };
+        info.Anonymous1.nonStructType.InType = TdhInType::InTypeUInt16 as u16;
+        info.Anonymous3.lengthPropertyIndex = 3;
+        assert_eq!(Property::new("prop".into(), &info).fixed_size(8), None);
     }
 }
