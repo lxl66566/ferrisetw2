@@ -43,13 +43,18 @@ pub fn convert_sid_to_string(sid: *const c_void) -> SddlResult<String> {
             return Err(SddlNativeError::IoError(std::io::Error::last_os_error()));
         }
 
-        let sid_string = std::ffi::CStr::from_ptr(tmp.0.cast()).to_str()?.to_owned();
+        // The string buffer is LocalAlloc'ed: it must be freed on every path,
+        // including a failed UTF-8 validation (SDDL strings are ASCII, so this
+        // is a defense-in-depth path)
+        let converted = std::ffi::CStr::from_ptr(tmp.0.cast())
+            .to_str()
+            .map(str::to_owned);
 
         if LocalFree(Some(HLOCAL(tmp.0.cast()))) != HLOCAL(std::ptr::null_mut()) {
             return Err(SddlNativeError::IoError(std::io::Error::last_os_error()));
         }
 
-        Ok(sid_string)
+        converted.map_err(SddlNativeError::from)
     }
 }
 
