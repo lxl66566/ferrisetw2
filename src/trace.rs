@@ -728,6 +728,11 @@ impl UserTrace {
     /// On failure of the enable itself, the registration is rolled back and
     /// the error returned.
     ///
+    /// Runtime provider mutations are serialized: an `enable_provider` and a
+    /// `disable_provider` issued concurrently (from any thread) can never
+    /// interleave their OS-level and registration steps, so a same-GUID pair
+    /// of such calls always ends in a consistent state.
+    ///
     /// The same provider GUID may be enabled several times: each entry keeps
     /// its own callbacks (but see [`UserTrace::disable_provider`] about how
     /// Windows only keeps one configuration per GUID, the last one enabled).
@@ -752,21 +757,27 @@ impl UserTrace {
     /// ```
     pub fn enable_provider(&self, provider: Provider) -> TraceResult<()> {
         let provider = Arc::new(provider);
+        // A UserTrace always holds real-time callback data
+        let CallbackData::RealTime(rt) = &**self.callback_data else {
+            return Ok(());
+        };
         // Register first, enable second: once the OS starts delivering events,
-        // the dispatch registry must already know the provider. A UserTrace
-        // always holds real-time callback data.
-        if let CallbackData::RealTime(rt) = &**self.callback_data {
-            rt.add_provider_shared(Arc::clone(&provider));
-        }
+        // the dispatch registry must already know the provider. Both steps run
+        // under the session-mutation lock: a concurrent `disable_provider` of
+        // the same GUID must observe either both steps or none of them (see
+        // [`UserTrace::disable_provider`]).
+        let session_mutation = rt.lock_session_mutations();
+        rt.add_provider_shared(Arc::clone(&provider));
 
         if let Err(e) = enable_provider(self.control_handle, &provider) {
             // Rollback so the callbacks of a provider the OS rejected never
             // fire
-            if let CallbackData::RealTime(rt) = &**self.callback_data {
-                rt.remove_provider_instance(&provider);
-            }
+            rt.remove_provider_instance(&provider);
             return Err(e.into());
         }
+        // The registry is consistent again: release the lock before the
+        // (potentially slow) rundown request, which mutates nothing
+        drop(session_mutation);
 
         if provider.requests_capture_state() {
             capture_provider_state(self.control_handle, &provider)?;
@@ -793,6 +804,8 @@ impl UserTrace {
     /// * Like [`UserTrace::enable_provider`], this is only available on a `UserTrace` that owns its
     ///   session: a [`TraceBuilder::open_existing`] trace returns an error, kernel traces and file
     ///   traces do not offer this method.
+    /// * Provider mutations are serialized (see [`UserTrace::enable_provider`]): a disable racing
+    ///   an enable of the same GUID never leaves the provider enabled but unregistered.
     ///
     /// # Example
     /// ```no_run
@@ -808,6 +821,13 @@ impl UserTrace {
         let CallbackData::RealTime(rt) = &**self.callback_data else {
             return Ok(0);
         };
+        // The whole "OS disable + unregister" sequence runs under the
+        // session-mutation lock: without it, a concurrent `enable_provider` of
+        // the same GUID could register between the two steps, and be removed
+        // right after its OS-level enable succeeded - leaving the session
+        // enabled for a GUID nobody is registered to dispatch anymore (its
+        // events would pile up and eventually be lost)
+        let _disable_in_flight = rt.lock_session_mutations();
         if !rt.has_provider_with_guid(guid) {
             // Nothing of ours is registered under this GUID: do not touch the
             // session (disabling a provider we never enabled would be surprising)
@@ -1504,6 +1524,89 @@ mod test {
 
         // A GUID nothing is registered under is a no-op, session untouched
         assert_eq!(trace.disable_provider(GUID::from_u128(0x3333)).unwrap(), 0);
+    }
+
+    /// A `UserTrace` handle that may be borrowed from several threads
+    ///
+    /// `UserTrace` itself is not `Sync` (its properties embed raw pointers),
+    /// but nothing in the mutation paths under test touches them: they only
+    /// use `CallbackData`, whose interior mutability is fully synchronized
+    /// (atomics, registry `RwLock`, session-mutation mutex).
+    #[derive(Debug)]
+    struct SharedTrace(UserTrace);
+
+    // Safety: see the type documentation
+    unsafe impl Sync for SharedTrace {}
+
+    impl SharedTrace {
+        fn enable_provider(&self, provider: Provider) -> TraceResult<()> {
+            self.0.enable_provider(provider)
+        }
+
+        fn disable_provider(&self, guid: GUID) -> TraceResult<usize> {
+            self.0.disable_provider(guid)
+        }
+
+        fn providers(&self) -> Vec<Arc<Provider>> {
+            self.0.providers()
+        }
+    }
+
+    #[test]
+    fn concurrent_provider_mutations_wait_for_each_other() {
+        // A session mutation (runtime enable or disable) holds the mutation
+        // lock across its OS call and registry update: a concurrent mutation
+        // must wait instead of interleaving (which could leave a provider
+        // enabled at the OS level but unregistered). Here the "OS call" of
+        // both workers deterministically fails (invalid control handle), so
+        // the final registry must come out unchanged.
+        let trace = SharedTrace(trace_without_session(vec![
+            Provider::by_guid(0x1111).build(),
+        ]));
+        let CallbackData::RealTime(rt) = &**trace.0.callback_data else {
+            unreachable!("a UserTrace always holds real-time callback data");
+        };
+        let mutation_in_flight = rt.lock_session_mutations();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|s| {
+            let disabler = s.spawn(|| {
+                let result = trace.disable_provider(GUID::from_u128(0x1111));
+                let _ = done_tx.send(());
+                result
+            });
+            let enabler = s.spawn(|| {
+                let result = trace.enable_provider(Provider::by_guid(0x2222).build());
+                let _ = done_tx.send(());
+                result
+            });
+
+            // While the lock is held, neither mutation may complete
+            assert!(done_rx.recv_timeout(Duration::from_millis(200)).is_err());
+            drop(mutation_in_flight);
+            for _ in 0..2 {
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("both mutations completed once the lock was released");
+            }
+
+            // Both proceeded past the lock and failed at the (invalid) OS
+            // level: the disable kept its registration, the enable rolled back
+            assert!(matches!(
+                disabler.join().unwrap(),
+                Err(TraceError::EtwNativeError(
+                    EvntraceNativeError::InvalidHandle
+                ))
+            ));
+            assert!(matches!(
+                enabler.join().unwrap(),
+                Err(TraceError::EtwNativeError(
+                    EvntraceNativeError::InvalidHandle
+                ))
+            ));
+        });
+        assert_eq!(trace.providers().len(), 1);
+        assert_eq!(trace.providers()[0].guid(), GUID::from_u128(0x1111));
     }
 
     #[test]

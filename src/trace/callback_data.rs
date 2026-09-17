@@ -1,5 +1,5 @@
 use std::sync::{
-    Arc, Mutex, RwLock,
+    Arc, Mutex, MutexGuard, RwLock,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -41,6 +41,17 @@ pub struct RealTimeCallbackData {
     /// the lock has been released, so a callback may itself enable or disable
     /// providers.
     providers: RwLock<ProviderRegistry>,
+    /// Serializes session mutations: `UserTrace::enable_provider` and
+    /// `disable_provider` must apply their "OS-level call + registry update"
+    /// pair atomically with respect to each other. Without it, a disable whose
+    /// OS call races with a concurrent enable of the same GUID could remove the
+    /// freshly registered provider, leaving it enabled at the OS level with
+    /// nothing registered to dispatch (and eventually lose) its events.
+    ///
+    /// Lock order: acquire this before the `providers` lock, never after. Event
+    /// dispatch only ever takes the `providers` read lock, so it never stalls
+    /// on this mutex.
+    session_mutations: Mutex<()>,
 }
 
 /// The providers registered on a real-time trace, indexed both by insertion
@@ -167,6 +178,7 @@ impl Default for RealTimeCallbackData {
             events_lost: AtomicUsize::new(0),
             schema_locator: SchemaLocator::new(),
             providers: RwLock::new(ProviderRegistry::default()),
+            session_mutations: Mutex::new(()),
         }
     }
 }
@@ -174,6 +186,12 @@ impl Default for RealTimeCallbackData {
 impl RealTimeCallbackData {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Lock guarding the "OS call + registry update" pair of the runtime
+    /// provider mutations (see the `session_mutations` field)
+    pub(crate) fn lock_session_mutations(&self) -> MutexGuard<'_, ()> {
+        self.session_mutations.lock().unwrap()
     }
 
     pub fn add_provider(&self, provider: Provider) {
