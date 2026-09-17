@@ -1978,6 +1978,31 @@ mod tests {
         assert_eq!(parser.try_parse::<String>("S").unwrap(), "hï");
     }
 
+    /// Empirical pin for a wide counted string with an ODD byte count: the
+    /// real TDH consumes count+2 bytes without rounding up to a whole number
+    /// of code units, so the crate's identical sizing keeps the properties
+    /// that follow aligned. The dangling half code unit only shows up in the
+    /// decoded value, which drops it (see `decode_counted_payload`)
+    #[test]
+    fn tracelogging_counted_string_odd_byte_count_sizes_as_count_plus_prefix() {
+        let mut meta = b"S16\0".to_vec();
+        meta.push(tlg::IN_STR16);
+        // count = 5 bytes: "a\0b\0c" — the trailing 'c' low byte is a
+        // truncated final code unit
+        let mut values: Vec<u8> = 5u16.to_le_bytes().to_vec();
+        values.extend_from_slice(b"a\0b\0c");
+        values.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+
+        let (record, schema) = tlg_ext_record(&meta, &values);
+        assert_eq!(
+            tdh::property_size(&record, "S16").unwrap(),
+            7,
+            "TDH must take the odd count at face value"
+        );
+
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<String>("S16").unwrap(), "ab");
+    }
     /// An explicit schema length for a UnicodeString counts WCHARs, not
     /// bytes (tdh.h: "the epi.length field contains number of WCHARs in the
     /// string"; eventman.xsd: "Length indicates the size (in characters)"):
