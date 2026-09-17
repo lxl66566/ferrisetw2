@@ -57,8 +57,13 @@ pub struct EventSerializerOptions {
     /// Includes the set of [EVENT_HEADER_EXTENDED_DATA_ITEM](https://learn.microsoft.com/en-us/windows/win32/api/evntcons/ns-evntcons-event_header_extended_data_item) in the serialized output,
     /// as an `Extended` array of `{"Type", "Data"}` entries.
     pub include_extended_data: bool,
-    /// When `true` unimplemented serialization fails with an error, otherwise unimplemented
-    /// serialization is skipped and will not be present in the serialized output.
+    /// Controls how a property or extended data item that cannot be serialized
+    /// is handled. When `true`, the first such entry fails the whole event
+    /// with an error. When `false`, only the affected entry degrades:
+    /// undecodable properties serialize as `null` (a property whose bytes
+    /// cannot be located also nulls out the properties after it, whose
+    /// offsets are then unknown), and unsupported extended data items are
+    /// skipped.
     pub fail_unimplemented: bool,
 }
 
@@ -276,7 +281,8 @@ impl serde::ser::Serialize for DescriptorSer<'_> {
 /// Serializes the extended data items of an event as an array
 ///
 /// Unsupported items are skipped, or fail the serialization when `fail_unimplemented` is set,
-/// mirroring how unimplemented event properties are handled.
+/// mirroring how unimplemented event properties are handled. The same degradation applies
+/// to a SID whose SDDL rendering fails.
 struct ExtendedSer<'a> {
     items: &'a [EventHeaderExtendedDataItem],
     fail_unimplemented: bool,
@@ -310,8 +316,38 @@ impl serde::ser::Serialize for ExtendedSer<'_> {
                 }
                 continue;
             }
+            // SDDL rendering can fail on a malformed SID: degrade this item
+            // alone instead of failing the whole event
+            if let ExtendedDataItem::Sid(sid) = &data {
+                match sid.to_sddl_string() {
+                    Ok(sddl) => state.serialize_element(&SidSer { sddl })?,
+                    Err(e) if self.fail_unimplemented => {
+                        return Err(serde::ser::Error::custom(e));
+                    },
+                    Err(_) => continue,
+                }
+                continue;
+            }
             state.serialize_element(&ExtendedDataItemSer(&data))?;
         }
+        state.end()
+    }
+}
+
+/// Serializes a SID extended data item already rendered to its SDDL form
+/// (pre-computed by [`ExtendedSer`], which degrades failed conversions)
+struct SidSer {
+    sddl: String,
+}
+
+impl serde::ser::Serialize for SidSer {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut state = serializer.serialize_struct("ExtendedDataItem", 2)?;
+        state.serialize_field("Type", "Sid")?;
+        state.serialize_field("Data", &self.sddl)?;
         state.end()
     }
 }
@@ -337,6 +373,8 @@ impl serde::ser::Serialize for ExtendedDataItemSer<'_> {
                 state.serialize_field("Data", &GUIDExt(*guid))?;
             },
             ExtendedDataItem::Sid(sid) => {
+                // Fallback when constructed outside `ExtendedSer`, which
+                // pre-renders SDDL to degrade failed conversions
                 state.serialize_field("Type", "Sid")?;
                 let sddl = sid.to_sddl_string().map_err(serde::ser::Error::custom)?;
                 state.serialize_field("Data", &sddl)?;
@@ -451,30 +489,43 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
     where
         S: serde::Serializer,
     {
-        let mut len: usize = 0;
-        for prop in self.props {
-            if prop.get_parser().is_some() {
-                len += 1;
-            } else if self.options.fail_unimplemented {
-                return Err(serde::ser::Error::custom(format!(
-                    "not implemented {} info: {:?}",
-                    prop.name, prop.info
-                )));
-            }
-        }
-
-        let mut state = serializer.serialize_map(Some(len))?;
+        let strict = self.options.fail_unimplemented;
+        // Exactly one entry per property: its value, or null when it cannot
+        // be decoded
+        let mut state = serializer.serialize_map(Some(self.props.len()))?;
         for (index, prop) in self.props.iter().enumerate() {
             // Positional access: a name-based lookup would hand every
             // same-named property the bytes of the first one
-            let buffer = self
-                .parser
-                .property_bytes_at(index)
-                .map_err(serde::ser::Error::custom)?;
-            ser_property::<S>(&mut state, prop, buffer, self.parser, self.record)?;
+            let buffer = match self.parser.property_bytes_at(index) {
+                Ok(buffer) => buffer,
+                Err(e) => {
+                    if strict {
+                        return Err(serde::ser::Error::custom(e));
+                    }
+                    // The buffer walk stopped here: this property's bytes and
+                    // the offsets of every later one are unknown, so emit
+                    // them as null rather than read them at wrong offsets
+                    null_entry::<S>(&mut state, &prop.name)?;
+                    for prop in &self.props[index + 1..] {
+                        null_entry::<S>(&mut state, &prop.name)?;
+                    }
+                    return state.end();
+                },
+            };
+            ser_property::<S>(&mut state, prop, buffer, self.parser, self.record, strict)?;
         }
         state.end()
     }
+}
+
+/// Writes one `null` entry, the lenient-mode degradation of a property that
+/// cannot be decoded
+fn null_entry<S: serde::ser::Serializer>(
+    map: &mut S::SerializeMap,
+    name: &str,
+) -> Result<(), S::Error> {
+    let none: Option<()> = None;
+    map.serialize_entry(&name, &none)
 }
 
 struct PropSer(PropHandler);
@@ -677,6 +728,7 @@ mod test {
             bytes: &data,
             parser: &parser,
             record: &record,
+            strict: false,
         };
         assert_eq!(
             serde_json::to_value(&ser).unwrap(),
@@ -710,6 +762,7 @@ mod test {
             bytes: &data,
             parser: &parser,
             record: &record,
+            strict: false,
         };
         assert_eq!(
             serde_json::to_value(&ser).unwrap(),
@@ -744,6 +797,7 @@ mod test {
             bytes: &data,
             parser: &parser,
             record: &record,
+            strict: false,
         };
         assert_eq!(
             serde_json::to_value(&ser).unwrap(),
@@ -777,11 +831,139 @@ mod test {
             bytes: &data,
             parser: &parser,
             record: &record,
+            strict: false,
         };
         assert_eq!(
             serde_json::to_value(&ser).unwrap(),
             serde_json::json!({"x": 1, "b": null, "y": null})
         );
+    }
+
+    /// An `EventSerializer` over a synthetic event, schema/header output off
+    fn synthetic_ser<'a>(
+        record: &'a EventRecord,
+        schema: &'a Schema,
+        strict: bool,
+    ) -> EventSerializer<'a> {
+        EventSerializer::new(record, schema, EventSerializerOptions {
+            include_schema: false,
+            include_header: false,
+            fail_unimplemented: strict,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn undecodable_property_degrades_without_sinking_the_event() {
+        // A non-UTF-8 ANSI string (common with the Windows ANSI code pages)
+        // used to fail the whole event: only that property must degrade
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [
+            PropSpec::new("s", TdhInType::InTypeAnsiString, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut data = b"\xff\xfe\0".to_vec(); // invalid UTF-8, NUL-terminated
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(value["Event"], serde_json::json!({"s": null, "n": 7}));
+
+        assert!(serde_json::to_value(synthetic_ser(&record, &schema, true)).is_err());
+    }
+
+    #[test]
+    fn unlocatable_property_nulls_out_the_rest_of_the_event() {
+        // An unterminated string stops the buffer walk: its own bytes and the
+        // offsets of every later property are unknown
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [
+            PropSpec::new("s", TdhInType::InTypeAnsiString, 0),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        // No NUL anywhere in the buffer (the u32 bytes have none either)
+        let mut data = b"ab".to_vec();
+        data.extend_from_slice(&0x1122_3344u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(value["Event"], serde_json::json!({"s": null, "n": null}));
+
+        assert!(serde_json::to_value(synthetic_ser(&record, &schema, true)).is_err());
+    }
+
+    #[test]
+    fn custom_schema_property_degrades_without_sinking_the_event() {
+        // A PROPERTY_HAS_CUSTOM_SCHEMA property used to blank the whole event
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        let props = [
+            PropSpec::new("before", TdhInType::InTypeUInt32, 4),
+            PropSpec::custom_schema("custom", 8),
+            PropSpec::new("after", TdhInType::InTypeUInt32, 4),
+        ];
+        let mut data = 1u32.to_le_bytes().to_vec();
+        data.resize(12, 0xaa);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&props);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({"before": 1, "custom": null, "after": 2})
+        );
+
+        // Strict mode fails on the unsupported property instead
+        assert!(serde_json::to_value(synthetic_ser(&record, &schema, true)).is_err());
+    }
+
+    #[test]
+    fn member_decode_failure_does_not_sink_its_siblings() {
+        // Decode failures only affect their own member: the walk offsets stay
+        // valid, so the members around it keep their values
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            // Fixed length, so the enclosing structure is locally sizeable
+            PropSpec::new("s", TdhInType::InTypeAnsiString, 4),
+            PropSpec::new("y", TdhInType::InTypeUInt32, 4),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("st", &MEMBERS)];
+        let schema = synthetic_schema(&PROPS);
+
+        let mut data = 1u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&[0xff; 4]); // non-UTF-8
+        data.extend_from_slice(&7u32.to_le_bytes());
+        let record = synthetic_record(&data);
+
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({"st": {"x": 1, "s": null, "y": 7}})
+        );
+    }
+
+    #[test]
+    fn sid_extended_data_failing_sddl_degrades_or_fails() {
+        // Revision 2 does not exist (SID_REVISION is 1): the SID is complete
+        // and self-consistent, but ConvertSidToStringSid rejects it
+        let mut sid_blob = vec![2u8, 1, 0, 0, 0, 0, 0, 5];
+        sid_blob.extend_from_slice(&18u32.to_le_bytes());
+        let items = [EventHeaderExtendedDataItem::from_raw_parts(
+            EVENT_HEADER_EXT_TYPE_SID,
+            &sid_blob,
+        )];
+
+        let value = serde_json::to_value(ExtendedSer::new(&items, false)).unwrap();
+        assert_eq!(value, serde_json::json!([]));
+
+        assert!(serde_json::to_value(ExtendedSer::new(&items, true)).is_err());
     }
 
     #[test]
@@ -1050,6 +1232,9 @@ struct StructSer<'a, 'b, 'p, 'r> {
     bytes: &'b [u8],
     parser: &'p Parser<'a, 'b>,
     record: &'r EventRecord,
+    /// `fail_unimplemented`: fail the event on the first undecodable member
+    /// instead of emitting null
+    strict: bool,
 }
 
 impl serde::ser::Serialize for StructSer<'_, '_, '_, '_> {
@@ -1063,13 +1248,19 @@ impl serde::ser::Serialize for StructSer<'_, '_, '_, '_> {
             let Some(buffer) =
                 member_buffer(member, self.bytes, &mut offset, self.record.pointer_size())
             else {
-                let none: Option<()> = None;
                 for member in &self.members[pos..] {
-                    map.serialize_entry(&member.name, &none)?;
+                    null_entry::<S>(&mut map, &member.name)?;
                 }
                 break;
             };
-            ser_property::<S>(&mut map, member, buffer, self.parser, self.record)?;
+            ser_property::<S>(
+                &mut map,
+                member,
+                buffer,
+                self.parser,
+                self.record,
+                self.strict,
+            )?;
         }
         map.end()
     }
@@ -1086,6 +1277,8 @@ struct StructArraySer<'a, 'b, 'p, 'r> {
     bytes: &'b [u8],
     parser: &'p Parser<'a, 'b>,
     record: &'r EventRecord,
+    /// `fail_unimplemented`, forwarded to the element serializer
+    strict: bool,
 }
 
 impl StructArraySer<'_, '_, '_, '_> {
@@ -1125,6 +1318,7 @@ impl serde::ser::Serialize for StructArraySer<'_, '_, '_, '_> {
                 bytes: element,
                 parser: self.parser,
                 record: self.record,
+                strict: self.strict,
             })?;
             offset = end;
         }
@@ -1133,13 +1327,18 @@ impl serde::ser::Serialize for StructArraySer<'_, '_, '_, '_> {
 }
 
 /// Writes one property (or structure member) entry into `map`, decoding the
-/// value from `buffer` through the parser
+/// value from `buffer` through the parser.
+///
+/// `strict` (the `fail_unimplemented` option) fails the whole event on the
+/// first undecodable property; the lenient mode degrades it to a `null`
+/// entry and keeps the rest of the event
 fn ser_property<'a, 'b, S>(
     map: &mut S::SerializeMap,
     prop: &'a Property,
     buffer: &'b [u8],
     parser: &Parser<'a, 'b>,
     record: &EventRecord,
+    strict: bool,
 ) -> Result<(), S::Error>
 where
     S: serde::ser::Serializer,
@@ -1151,6 +1350,7 @@ where
             bytes: buffer,
             parser,
             record,
+            strict,
         });
     }
     if let PropertyInfo::StructArray { members, count } = &prop.info {
@@ -1161,13 +1361,28 @@ where
             bytes: buffer,
             parser,
             record,
+            strict,
         });
     }
 
     let Some(s) = prop.get_parser() else {
-        return Ok(());
+        if strict {
+            return Err(serde::ser::Error::custom(format!(
+                "not implemented {} info: {:?}",
+                prop.name, prop.info
+            )));
+        }
+        return null_entry::<S>(map, &prop.name);
     };
-    s.0.ser_from_bytes::<S>(map, prop, parser, record, buffer)
+    // The handlers parse before writing any entry, so a decode error leaves
+    // the map untouched: degrade to a null entry instead of failing the whole
+    // event (a genuine serializer error cannot be recovered, and the null
+    // write then fails the same way)
+    match s.0.ser_from_bytes::<S>(map, prop, parser, record, buffer) {
+        Ok(()) => Ok(()),
+        Err(e) if strict => Err(e),
+        Err(_) => null_entry::<S>(map, &prop.name),
+    }
 }
 
 /// Resolves the element count of a structure array: either a constant, or the
