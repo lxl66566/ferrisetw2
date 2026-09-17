@@ -1017,6 +1017,71 @@ mod test {
         assert!(serde_json::to_value(ExtendedSer::new(&items, true)).is_err());
     }
 
+    #[test]
+    fn struct_array_count_index_resolves_against_the_top_level_prefix() {
+        // countPropertyIndex is an index into the full property array; the
+        // top-level properties are its head, so a top-level index resolves
+        // through the parser walk, while an index into a structure's member
+        // region (>= TopLevelPropertyCount) cannot be located
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 2] = [
+            PropSpec::new("m0", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("m1", TdhInType::InTypeUInt16, 2),
+        ];
+        // Full array: pad(0), Count(1), Items(2), m0(3), m1(4)
+        static PROPS: [PropSpec; 3] = [
+            PropSpec::new("pad", TdhInType::InTypeUInt16, 2),
+            PropSpec::new("Count", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure_array("Items", &MEMBERS, 1),
+        ];
+        let mut data = 0x1111u16.to_le_bytes().to_vec();
+        data.extend_from_slice(&3u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        // A top-level index reads the referenced property's own bytes
+        assert_eq!(
+            resolve_struct_count(PropertyCount::Index(1), &parser),
+            Some(3)
+        );
+        assert_eq!(
+            resolve_struct_count(PropertyCount::Count(5), &parser),
+            Some(5)
+        );
+        // Member-region and out-of-bounds indexes are not locatable
+        assert_eq!(resolve_struct_count(PropertyCount::Index(3), &parser), None);
+        assert_eq!(resolve_struct_count(PropertyCount::Index(9), &parser), None);
+    }
+
+    #[test]
+    fn unlocatable_struct_array_is_null_not_an_empty_array() {
+        // A structure array whose element count or bytes cannot be resolved
+        // must not silently serialize as an empty array
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt32, 4)];
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("Count", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure_array("Items", &MEMBERS, 0),
+        ];
+        let mut data = 2u32.to_le_bytes().to_vec();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let record = synthetic_record(&data);
+        let schema = synthetic_schema(&PROPS);
+
+        // TDH cannot size the array without a real event, so its bytes are
+        // unlocatable: the walk degrades, nulling the array itself
+        let value = serde_json::to_value(synthetic_ser(&record, &schema, false)).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({"Count": 2, "Items": null})
+        );
+        assert!(serde_json::to_value(synthetic_ser(&record, &schema, true)).is_err());
+    }
+
     fn value_info(in_type: TdhInType) -> PropertyInfo {
         PropertyInfo::Value {
             in_type,
@@ -1354,15 +1419,23 @@ where
         });
     }
     if let PropertyInfo::StructArray { members, count } = &prop.info {
-        let resolved = resolve_struct_count(*count, parser);
-        return map.serialize_entry(&prop.name, &StructArraySer {
-            members,
-            count: resolved.unwrap_or(0),
-            bytes: buffer,
-            parser,
-            record,
-            strict,
-        });
+        return match resolve_struct_count(*count, parser) {
+            // Do not silently serialize an empty array when the count cannot
+            // be resolved: degrade like any other undecodable property
+            Some(count) => map.serialize_entry(&prop.name, &StructArraySer {
+                members,
+                count,
+                bytes: buffer,
+                parser,
+                record,
+                strict,
+            }),
+            None if strict => Err(serde::ser::Error::custom(format!(
+                "cannot resolve the structure array element count of {} ({:?})",
+                prop.name, count
+            ))),
+            None => null_entry::<S>(map, &prop.name),
+        };
     }
 
     let Some(s) = prop.get_parser() else {
@@ -1386,7 +1459,17 @@ where
 }
 
 /// Resolves the element count of a structure array: either a constant, or the
-/// value of the property `PropertyCount::Index` points at
+/// value of the property `PropertyCount::Index` points at.
+///
+/// `countPropertyIndex` is a zero-based index into the full
+/// `EventPropertyInfoArray` (MSDN), which places structure members after the
+/// top-level properties. Top-level entries form the head of that array, so an
+/// index below the top-level count resolves through the parser's positional
+/// walk ([`Parser::property_bytes_at`]), while an index into a structure's
+/// member region cannot be located (TDH's name-based descriptor does not
+/// reliably find structure members either): it yields `None`, which the
+/// caller degrades per `fail_unimplemented` instead of silently emitting an
+/// empty array
 fn resolve_struct_count(count: PropertyCount, parser: &Parser) -> Option<usize> {
     match count {
         PropertyCount::Count(c) => Some(c as usize),

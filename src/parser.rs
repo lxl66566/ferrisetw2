@@ -1120,17 +1120,68 @@ pub(crate) mod test_support {
             ..Default::default()
         })
     }
+
+    /// Builds the user data of a TraceLogging event: the two metadata blobs
+    /// TDH expects (provider then event metadata), each with a `u16` size
+    /// prefix, followed by the field values
+    pub(crate) fn tlg_user_data(event_meta: &[u8], values: &[u8]) -> Vec<u8> {
+        let sized = |payload: &[u8]| -> Vec<u8> {
+            (u16::try_from(payload.len() + 2).unwrap())
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .collect()
+        };
+
+        let provider_name = b"ferrisETW.TraceLoggingTest";
+        let mut provider = provider_name.to_vec();
+        provider.push(0);
+
+        let mut event_name = b"Event1".to_vec();
+        event_name.push(0);
+        event_name.extend_from_slice(event_meta);
+
+        sized(&provider)
+            .into_iter()
+            .chain(sized(&event_name))
+            .chain(values.iter().copied())
+            .collect()
+    }
+
+    /// Decodes a synthetic TraceLogging event through the real
+    /// `TdhGetEventInformation`, no ETW session or admin rights required:
+    /// these events are self-describing, TDH reads the schema from the
+    /// metadata embedded in the user data. Also returns the record, whose
+    /// buffer must stay alive with the schema (for tests parsing or
+    /// serializing the event)
+    pub(crate) fn tlg_schema(user_data: &[u8]) -> (Schema, EventRecord) {
+        // Header size and user data length always fit: synthetic test data
+        #[allow(clippy::cast_possible_truncation)]
+        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
+        let record = EventRecord(Etw::EVENT_RECORD {
+            EventHeader: Etw::EVENT_HEADER {
+                Size: header_size,
+                Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+                EventDescriptor: Etw::EVENT_DESCRIPTOR {
+                    Channel: 11, // TraceLogging channel
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            ..Default::default()
+        });
+        let info = TraceEventInfo::build_from_event(&record)
+            .expect("TDH should decode the synthetic TraceLogging event");
+        (Schema::new(info), record)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use windows::Win32::System::Diagnostics::Etw;
-
     use super::*;
-    use crate::{
-        native::tdh::TraceEventInfo,
-        parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
-    };
+    use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
 
     #[test]
     fn parse_guid_property() {
@@ -1516,63 +1567,6 @@ mod tests {
         expected: (TdhInType, TdhOutType),
     }
 
-    /// Builds the user data of a TraceLogging event: the two metadata blobs
-    /// TDH expects (provider then event metadata), each with a `u16` size
-    /// prefix, followed by the field values. Values are irrelevant here: this
-    /// only exercises schema decoding, but they must be present so that the
-    /// total size is plausible.
-    fn tlg_user_data(event_meta: &[u8], values: &[u8]) -> Vec<u8> {
-        let sized = |payload: &[u8]| -> Vec<u8> {
-            (u16::try_from(payload.len() + 2).unwrap())
-                .to_le_bytes()
-                .into_iter()
-                .chain(payload.iter().copied())
-                .collect()
-        };
-
-        let provider_name = b"ferrisETW.TraceLoggingTest";
-        let mut provider = provider_name.to_vec();
-        provider.push(0);
-
-        let mut event_name = b"Event1".to_vec();
-        event_name.push(0);
-        event_name.extend_from_slice(event_meta);
-
-        sized(&provider)
-            .into_iter()
-            .chain(sized(&event_name))
-            .chain(values.iter().copied())
-            .collect()
-    }
-
-    /// Decodes a synthetic TraceLogging event through the real
-    /// `TdhGetEventInformation`, no ETW session or admin rights required:
-    /// these events are self-describing, TDH reads the schema from the
-    /// metadata embedded in the user data
-    fn tlg_schema(user_data: &[u8]) -> Schema {
-        // Header size and user data length always fit: synthetic test data
-        #[allow(clippy::cast_possible_truncation)]
-        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
-        let header = Etw::EVENT_HEADER {
-            Size: header_size,
-            Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
-            EventDescriptor: Etw::EVENT_DESCRIPTOR {
-                Channel: 11, // TraceLogging channel
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let record = EventRecord(Etw::EVENT_RECORD {
-            EventHeader: header,
-            UserData: user_data.as_ptr() as *mut _,
-            UserDataLength: u16::try_from(user_data.len()).unwrap(),
-            ..Default::default()
-        });
-        let info = TraceEventInfo::build_from_event(&record)
-            .expect("TDH should decode the synthetic TraceLogging event");
-        Schema::new(info)
-    }
-
     /// The metadata descriptor of a [`TlgField`]: NUL-terminated name, then
     /// the in type with bit 0x80 set when an out type byte follows
     fn tlg_field_meta(field: &TlgField) -> Vec<u8> {
@@ -1589,6 +1583,8 @@ mod tests {
     #[test]
     fn tracelogging_types_decode_through_tdh() {
         use tlg::*;
+
+        use crate::parser::test_support::{tlg_schema, tlg_user_data};
 
         let cases = [
             TlgField {
@@ -1666,7 +1662,8 @@ mod tests {
         let meta: Vec<u8> = cases.iter().flat_map(tlg_field_meta).collect();
         let values: Vec<u8> = cases.iter().flat_map(|f| f.value.iter().copied()).collect();
 
-        let schema = tlg_schema(&tlg_user_data(&meta, &values));
+        let user_data = tlg_user_data(&meta, &values);
+        let (schema, _record) = tlg_schema(&user_data);
         // TDH synthesizes extra properties (e.g. a "FieldName.Length"
         // companion for TraceLogging binary fields): match by name
         let props = schema.properties();
@@ -1689,5 +1686,37 @@ mod tests {
             };
             assert_eq!((*actual_in, *actual_out), case.expected);
         }
+    }
+
+    /// Pins down how TDH reports a TraceLogging array whose element count
+    /// travels with the data (Vcount): TDH synthesizes a count property and
+    /// makes the array's countPropertyIndex point at it. That index is the
+    /// ground truth the serializer's structure-array count resolution is
+    /// aligned with
+    #[test]
+    fn tracelogging_array_count_index_points_at_the_synthesized_count() {
+        // metadata: "Items\0" + inType UINT16|Vcount (0x40: the element
+        // count is serialized with the data)
+        use crate::parser::test_support::{tlg_schema, tlg_user_data};
+
+        let mut meta = b"Items\0".to_vec();
+        meta.push(6 | 0x40);
+        let values = 3u16.to_le_bytes().to_vec();
+        let user_data = tlg_user_data(&meta, &values);
+        let (schema, _record) = tlg_schema(&user_data);
+
+        let props = schema.properties();
+        assert_eq!(
+            props.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
+            vec!["Items.Count", "Items"]
+        );
+        let PropertyInfo::Array {
+            count: PropertyCount::Index(index),
+            ..
+        } = &props[1].info
+        else {
+            panic!("'Items' should be a counted array, got {:?}", props[1].info);
+        };
+        assert_eq!(*index, 0);
     }
 }
