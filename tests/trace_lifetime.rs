@@ -99,6 +99,7 @@ fn test_wordpad_trace(
         .named(String::from(requested_trace_name))
         .enable(wordpad_provider);
 
+    let mut process_worker = None;
     let trace = match how_to_process {
         HowToProcess::StartOnly => {
             let (trace, _handle) = trace_builder.start().unwrap();
@@ -106,7 +107,9 @@ fn test_wordpad_trace(
         },
         HowToProcess::ProcessFromHandle => {
             let (trace, handle) = trace_builder.start().unwrap();
-            std::thread::spawn(move || UserTrace::process_from_handle(handle));
+            process_worker = Some(std::thread::spawn(move || {
+                UserTrace::process_from_handle(handle)
+            }));
             trace
         },
         HowToProcess::StartAndProcess => trace_builder.start_and_process().unwrap(),
@@ -119,6 +122,15 @@ fn test_wordpad_trace(
     if explicit_stop {
         trace.stop().unwrap();
         assert_trace_exists(ascii_part_of_the_trace_name, false);
+        // stop() unblocks ProcessTrace: the processing thread must report a
+        // clean shutdown (ERROR_CANCELLED is mapped to Ok), not an error
+        if let Some(worker) = process_worker {
+            let result = worker.join().unwrap();
+            assert!(
+                result.is_ok(),
+                "ProcessTrace must end cleanly on stop: {result:?}"
+            );
+        }
     }
 }
 

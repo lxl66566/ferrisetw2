@@ -449,11 +449,19 @@ pub trait TraceTrait: PrivateTraceTrait + Sized {
     ///
     /// Because this call is blocking, you probably want to call this from a background thread.<br/>
     /// See [`TraceBuilder::start`] for alternative and more convenient ways to start a trace.
+    ///
+    /// When the trace is stopped while this is blocked (e.g. by calling
+    /// [`TraceTrait::stop`], by dropping the trace, or by closing its handle),
+    /// this returns `Ok`: Windows reports `ERROR_CANCELLED` as the end of the
+    /// processing loop, which is an outcome, not a failure.
     fn process(&mut self) -> TraceResult<()> {
         process_trace(self.trace_handle()).map_err(Into::into)
     }
 
     /// Process a trace given its handle.
+    ///
+    /// Like [`TraceTrait::process`], this returns `Ok` when the trace is
+    /// stopped while processing.
     ///
     /// See [`TraceBuilder::start`] for alternative and more convenient ways to start a trace.
     fn process_from_handle(handle: TraceHandle) -> TraceResult<()> {

@@ -15,8 +15,8 @@ use widestring::U16CStr;
 use windows::{
     Win32::{
         Foundation::{
-            ERROR_ALREADY_EXISTS, ERROR_CTX_CLOSE_PENDING, ERROR_INSUFFICIENT_BUFFER,
-            ERROR_SUCCESS, FILETIME, WIN32_ERROR,
+            ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_CTX_CLOSE_PENDING,
+            ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME, WIN32_ERROR,
         },
         System::Diagnostics::{
             Etw,
@@ -476,7 +476,22 @@ pub(crate) fn process_trace(trace_handle: TraceHandle) -> EvntraceNativeResult<(
             Etw::ProcessTrace(&[trace_handle], Some(&raw mut start), None)
         };
 
-        win32_result(status)
+        process_trace_status(status)
+    }
+}
+
+/// Interpret the exit status of `ProcessTrace`
+///
+/// When the trace is stopped (explicitly, or by dropping it), or its handle is
+/// closed, `ProcessTrace` ends with `ERROR_CANCELLED`: that is the normal end
+/// of the processing loop, not an error. This crate's buffer callback always
+/// returns TRUE, so `ERROR_CANCELLED` can only ever mean that normal
+/// termination here.
+fn process_trace_status(status: WIN32_ERROR) -> EvntraceNativeResult<()> {
+    if status.is_ok() || status == ERROR_CANCELLED {
+        Ok(())
+    } else {
+        Err(win32_error(status))
     }
 }
 
@@ -809,6 +824,21 @@ mod tests {
     fn win32_result_accepts_success_only() {
         assert!(win32_result(ERROR_SUCCESS).is_ok());
         assert!(win32_result(ERROR_INVALID_PARAMETER).is_err());
+    }
+
+    #[test]
+    fn cancelled_processing_is_not_an_error() {
+        // Stopping the session (or closing the handle) is the normal way a
+        // ProcessTrace call ends: it must surface as Ok, like ERROR_SUCCESS
+        assert!(process_trace_status(ERROR_SUCCESS).is_ok());
+        assert!(process_trace_status(ERROR_CANCELLED).is_ok());
+
+        let err = process_trace_status(ERROR_INVALID_PARAMETER).unwrap_err();
+        assert!(matches!(
+            err,
+            EvntraceNativeError::IoError(ref e)
+                if e.kind() == std::io::ErrorKind::InvalidInput
+        ));
     }
 
     #[test]
