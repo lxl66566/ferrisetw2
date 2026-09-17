@@ -315,6 +315,10 @@ pub(crate) fn open_trace(
     };
 
     if filter_invalid_trace_handles(trace_handle).is_none() {
+        // The trace never ran: roll back the registry insertion. A stale entry would
+        // make a future `open_trace` whose context lands on the same address fail
+        // with a spurious `AlreadyExist`
+        UNIQUE_VALID_CONTEXTS.remove(log_file.context_ptr());
         Err(EvntraceNativeError::IoError(std::io::Error::last_os_error()))
     } else {
         Ok(trace_handle)
@@ -779,8 +783,10 @@ pub(crate) fn set_extended_kernel_groups(
 
 #[cfg(test)]
 mod tests {
+    use widestring::U16CString;
+
     use super::*;
-    use crate::provider::EventFilter;
+    use crate::{provider::EventFilter, trace::callback_data::RealTimeCallbackData};
 
     #[test]
     fn unbuidable_filters_are_reported() {
@@ -847,5 +853,23 @@ mod tests {
             assert_eq!(id[16], event.event_type);
             assert!(id[17..].iter().all(|&b| b == 0));
         }
+    }
+
+    #[test]
+    fn failed_open_trace_releases_the_context_address() {
+        let callback_data: Box<Arc<CallbackData>> = Box::new(Arc::new(CallbackData::RealTime(
+            RealTimeCallbackData::new(),
+        )));
+        // A nonexistent ETL file makes OpenTraceW fail deterministically
+        let source =
+            SubscriptionSource::FromFile(U16CString::from_str("Z:\\no\\such\\trace.etl").unwrap());
+
+        assert!(open_trace(source, &callback_data).is_err());
+
+        // The failed open must not leave the address registered: a later trace whose
+        // context lands on the same address would fail with a spurious AlreadyExist
+        let ptr = std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>();
+        assert!(UNIQUE_VALID_CONTEXTS.insert(ptr).is_ok());
+        UNIQUE_VALID_CONTEXTS.remove(ptr);
     }
 }
