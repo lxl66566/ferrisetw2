@@ -428,11 +428,16 @@ pub struct EventTraceLogfile<'callbackdata> {
 
 impl<'callbackdata> EventTraceLogfile<'callbackdata> {
     /// Create a new instance
+    ///
+    /// Both callbacks coexist in the `EVENT_TRACE_LOGFILEW` (they are separate members, not
+    /// union alternatives): `callback` runs for every event, `buffer_callback` once per
+    /// processed buffer (with the `BuffersRead`/`EventsLost` fields of the log file valid)
     #[allow(clippy::borrowed_box)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer (see https://github.com/n4r1b/ferrisetw/issues/72)
     pub fn create(
         callback_data: &'callbackdata Box<Arc<CallbackData>>,
         subscription_source: SubscriptionSource,
         callback: unsafe extern "system" fn(*mut Etw::EVENT_RECORD),
+        buffer_callback: unsafe extern "system" fn(*mut Etw::EVENT_TRACE_LOGFILEW) -> u32,
     ) -> Self {
         // That's kind-of fine because the user context is _not supposed_ to be changed by Windows
         // APIs
@@ -444,6 +449,7 @@ impl<'callbackdata> EventTraceLogfile<'callbackdata> {
             Anonymous2: Etw::EVENT_TRACE_LOGFILEW_1 {
                 EventRecordCallback: Some(callback),
             },
+            BufferCallback: Some(buffer_callback),
             Context: not_really_mut_ptr,
             ..Default::default()
         };

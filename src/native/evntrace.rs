@@ -72,12 +72,12 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 /// sound as long as it never dereferences the pointer. (e.g. an `AtomicBool`
 /// embedded in `CallbackData` would be read after free)
 ///
-/// TODO: it _might_ be possible to know whether we've processed the last buffered event, as
-///       ControlTraceW(EVENT_TRACE_CONTROL_QUERY) _might_ tell us if the buffers are empty or not.
-///       In case the trace is in ERROR_CTX_CLOSE_PENDING state, we could call this after every
-///       callback so that we know when to actually free memory used by the (now useless) callback.
-///       Maybe also setting the BufferCallback in EVENT_TRACE_LOGFILEW may help us.
-///       That's <https://github.com/n4r1b/ferrisetw/issues/62>
+/// TODO: it _might_ be possible to know whether we've processed the last buffered event.
+///       `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` (see `RealTimeTraceTrait::statistics`)
+///       and the buffer callback we install (see `buffer_callback_thunk`) both report
+///       session statistics, but neither tells us when the last callback of a closing trace
+///       has run, so callback memory is still discarded (rather than freed) after
+///       `CloseTrace`. That's <https://github.com/n4r1b/ferrisetw/issues/62>
 static UNIQUE_VALID_CONTEXTS: UniqueValidContexts = UniqueValidContexts::new();
 struct UniqueValidContexts(Lazy<RwLock<HashSet<u64>>>);
 enum ContextError {
@@ -149,6 +149,48 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
         }
     })) {
         Ok(()) => {},
+        Err(e) => {
+            log::error!("UNIMPLEMENTED PANIC: {e:?}");
+            std::process::exit(1);
+        },
+    }
+}
+
+/// This will be called by the ETW framework after each buffer has been processed
+///
+/// The `BuffersRead` and `EventsLost` fields of the given log file are valid at this point:
+/// they are recorded so that a running trace can be monitored for lost events (see
+/// `TraceTrait::events_lost`)
+extern "system" fn buffer_callback_thunk(p_logfile: *mut Etw::EVENT_TRACE_LOGFILEW) -> u32 {
+    const TRUE: u32 = 1; // Keep processing buffers (FALSE would cancel the trace processing)
+    match std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if p_logfile.is_null() {
+            return TRUE;
+        }
+        let log_file = unsafe {
+            // Safety: the pointer comes from the ETW framework, and is valid for the duration
+            // of the callback. Windows reserves the right to modify its content, so it is
+            // only read here, and never written to
+            &*p_logfile
+        };
+
+        let p_user_context = log_file.Context;
+        if !UNIQUE_VALID_CONTEXTS.is_valid(p_user_context) {
+            return TRUE;
+        }
+        let p_callback_data = p_user_context.cast::<Arc<CallbackData>>();
+        let callback_data = unsafe {
+            // Safety: same soundness arguments as in `trace_callback_thunk`, plus the counters
+            // written by `on_buffer` are atomics
+            p_callback_data.as_ref()
+        };
+        if let Some(callback_data) = callback_data {
+            let cloned_arc = Arc::clone(callback_data);
+            cloned_arc.on_buffer(log_file.BuffersRead, log_file.EventsLost);
+        }
+        TRUE
+    })) {
+        Ok(result) => result,
         Err(e) => {
             log::error!("UNIMPLEMENTED PANIC: {e:?}");
             std::process::exit(1);
@@ -240,8 +282,12 @@ pub(crate) fn open_trace(
     subscription_source: SubscriptionSource,
     callback_data: &Box<Arc<CallbackData>>,
 ) -> EvntraceNativeResult<TraceHandle> {
-    let mut log_file =
-        EventTraceLogfile::create(callback_data, subscription_source, trace_callback_thunk);
+    let mut log_file = EventTraceLogfile::create(
+        callback_data,
+        subscription_source,
+        trace_callback_thunk,
+        buffer_callback_thunk,
+    );
 
     if let Err(ContextError::AlreadyExist) = UNIQUE_VALID_CONTEXTS.insert(log_file.context_ptr()) {
         // Multiple consumers of the same session or ETL file are supported the

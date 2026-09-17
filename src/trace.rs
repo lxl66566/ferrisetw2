@@ -413,8 +413,33 @@ pub trait TraceTrait: PrivateTraceTrait + Sized {
     // trait
     fn trace_handle(&self) -> TraceHandle;
 
-    // This utility function should be implemented for every trace
+    /// How many events have been delivered to the callbacks so far
+    ///
+    /// This is a consumer-side counter. For the session-side statistics (including events
+    /// lost by the logger itself), see [`RealTimeTraceTrait::statistics`] on real-time
+    /// traces, or [`TraceTrait::events_lost`] for the loss count reported through the
+    /// consumer's buffer callback.
     fn events_handled(&self) -> usize;
+
+    /// How many buffers have been processed so far, as reported by the ETW buffer callback
+    ///
+    /// This counter is fed after each buffer has been processed. For an ETL
+    /// [`FileTrace`], it counts the buffers read from the file.
+    fn buffers_read(&self) -> usize {
+        self.callback_data().buffers_read()
+    }
+
+    /// How many events the ETW framework reported as lost while consuming this trace
+    ///
+    /// For a real-time trace, this catches events the session dropped (e.g. events logged
+    /// while the consumer was not attached, or too slow to drain the buffers). For an ETL
+    /// [`FileTrace`], this is the lost-events count recorded when the file was written.
+    ///
+    /// On real-time traces, this complements [`RealTimeTraceTrait::statistics`]: both
+    /// observe losses, from the consumer side and from the logger side respectively.
+    fn events_lost(&self) -> usize {
+        self.callback_data().events_lost()
+    }
 
     fn close(self) -> TraceResult<bool>;
 
@@ -751,6 +776,8 @@ mod private {
         // It is basically [`Self::stop`], without consuming self (because the `impl Drop` only has
         // a `&mut self`, not a `self`)
         fn non_consuming_stop(&mut self) -> TraceResult<()>;
+        // Accessor backing the default methods of `TraceTrait` (e.g. `events_lost`)
+        fn callback_data(&self) -> &CallbackData;
     }
 }
 
@@ -797,6 +824,10 @@ impl PrivateTraceTrait for UserTrace {
             Etw::EVENT_TRACE_CONTROL_STOP,
         )?;
         Ok(())
+    }
+
+    fn callback_data(&self) -> &CallbackData {
+        &self.callback_data
     }
 }
 
@@ -848,12 +879,20 @@ impl PrivateTraceTrait for KernelTrace {
         )?;
         Ok(())
     }
+
+    fn callback_data(&self) -> &CallbackData {
+        &self.callback_data
+    }
 }
 
 impl PrivateTraceTrait for FileTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
         close_trace(self.trace_handle, &self.callback_data)?;
         Ok(())
+    }
+
+    fn callback_data(&self) -> &CallbackData {
+        &self.callback_data
     }
 }
 
