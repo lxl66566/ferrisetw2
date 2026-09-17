@@ -101,6 +101,9 @@ pub use socket_address::{AddressFamily, TdhSocketAddress};
 /// allocating a key per parsed property.
 struct CachedSlices<'schema, 'record> {
     slices: Vec<PropertySlice<'schema, 'record>>,
+    /// Structure member lookups (registered by `try_parse_member`); they are
+    /// not part of the top-level walk, so they must not advance it
+    members: Vec<PropertySlice<'schema, 'record>>,
     /// Where the next name lookup starts probing
     next_probe: usize,
     /// The user buffer index we've cached up to
@@ -297,9 +300,13 @@ impl<'schema, 'record> Parser<'schema, 'record> {
 
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
-            // Structures span all of their members; defer to TDH for the total
-            // size (their members are laid out by the struct breakdown logic)
+            // Structures span all of their members: when every member has a
+            // fixed size the total follows from the schema, otherwise defer
+            // to TDH (e.g. a count held by another property)
             PropertyInfo::Struct { .. } | PropertyInfo::StructArray { .. } => {
+                if let Some(size) = property.fixed_size(self.record.pointer_size()) {
+                    return Ok(size);
+                }
                 Ok(tdh::property_size(self.record, &property.name)? as usize)
             },
         }
@@ -316,6 +323,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 cache.next_probe = (idx + 1) % cache.slices.len();
                 return Ok(cache.slices[idx]);
             }
+        }
+
+        // Top-level properties shadow same-named structure members
+        if let Some(slice) = cache.members.iter().find(|s| s.property.name == name) {
+            return Ok(*slice);
         }
 
         // If we've parsed every property already, that means no property matches this name
@@ -365,6 +377,51 @@ impl<'schema, 'record> Parser<'schema, 'record> {
     {
         use crate::parser::private::TryParse;
         self.try_parse_impl(name)
+    }
+
+    /// Bytes of a top-level property, located through the parse cache
+    // Read by the serializer, which slices structures out of them
+    #[allow(dead_code)]
+    pub(crate) fn property_bytes(&self, name: &str) -> ParserResult<&'record [u8]> {
+        Ok(self.find_property(name)?.buffer)
+    }
+
+    /// The top-level properties of the schema behind this parser
+    // Read by the serializer, to resolve structure array element counts
+    #[allow(dead_code)]
+    pub(crate) fn top_level_properties(&self) -> &'schema [Property] {
+        self.properties
+    }
+
+    /// Parse a structure member out of an already-located byte range.
+    ///
+    /// Structure members are not top-level properties, so they cannot be
+    /// found by name like `try_parse` does: the caller (the serializer)
+    /// slices them out of the enclosing structure's bytes and hands the
+    /// slice over. The member is registered under its name so the regular
+    /// decoding paths (`TryParse`) can locate it; top-level properties keep
+    /// shadowing same-named members.
+    #[allow(dead_code)]
+    pub(crate) fn try_parse_member<T>(
+        &self,
+        member: &'schema Property,
+        buffer: &'record [u8],
+    ) -> ParserResult<T>
+    where
+        Parser<'schema, 'record>: private::TryParse<T>,
+    {
+        use crate::parser::private::TryParse;
+
+        // Replace any stale entry for this member name (successive array
+        // elements re-register the same members with different bytes)
+        let mut cache = self.cache.borrow_mut();
+        cache.members.retain(|s| s.property.name != member.name);
+        cache.members.push(PropertySlice {
+            property: member,
+            buffer,
+        });
+        drop(cache);
+        self.try_parse_impl(&member.name)
     }
 }
 
@@ -557,10 +614,11 @@ impl private::TryParse<String> for Parser<'_, '_> {
 
                     let mut wide = aligned_buffer.as_slice();
 
-                    match wide.last() {
-                        // remove the null terminator from the slice
-                        Some(c) if c == &0 => wide = &wide[..wide.len() - 1],
-                        _ => (),
+                    // C semantics: the string ends at its first NUL. Top-level
+                    // strings are sized up to that NUL, fixed-length structure
+                    // members may be NUL-padded past it
+                    if let Some(nul) = wide.iter().position(|&c| c == 0) {
+                        wide = &wide[..nul];
                     }
 
                     // Decode UTF-16 to String
@@ -813,12 +871,11 @@ impl private::TryParse<Vec<u8>> for Parser<'_, '_> {
 
 // TODO: Study if we can use primitive types for HexInt64, HexInt32 and Pointer
 
+/// Synthetic `TRACE_EVENT_INFO` / `EVENT_RECORD` builders, shared by the
+/// parser and serializer unit tests: they exercise the parsing logic without
+/// a real ETW session (which would require administrator rights)
 #[cfg(test)]
-mod tests {
-    //! Unit tests built on synthetic `TRACE_EVENT_INFO` / `EVENT_RECORD` buffers,
-    //! so that the parsing logic can be exercised without a real ETW session
-    //! (which would require administrator rights).
-
+pub(crate) mod test_support {
     use std::alloc::Layout;
 
     use windows::Win32::System::Diagnostics::Etw;
@@ -830,22 +887,22 @@ mod tests {
     };
 
     /// Description of one synthetic property of a schema
-    struct PropSpec {
-        name: &'static str,
-        in_type: TdhInType,
-        out_type: TdhOutType,
+    pub(crate) struct PropSpec {
+        pub(crate) name: &'static str,
+        pub(crate) in_type: TdhInType,
+        pub(crate) out_type: TdhOutType,
         /// `EVENT_PROPERTY_INFO.Flags` (e.g. `PropertyParamCount`)
-        flags: u32,
+        pub(crate) flags: u32,
         /// Value written to the count/countPropertyIndex union member
-        count: u16,
+        pub(crate) count: u16,
         /// Value written to the length/lengthPropertyIndex union member
-        length: u16,
+        pub(crate) length: u16,
         /// Members, when the property describes a structure
-        structure: Option<&'static [PropSpec]>,
+        pub(crate) structure: Option<&'static [PropSpec]>,
     }
 
     impl PropSpec {
-        const fn new(name: &'static str, in_type: TdhInType, length: u16) -> Self {
+        pub(crate) const fn new(name: &'static str, in_type: TdhInType, length: u16) -> Self {
             Self {
                 name,
                 in_type,
@@ -857,13 +914,13 @@ mod tests {
             }
         }
 
-        const fn with_out_type(mut self, out_type: TdhOutType) -> Self {
+        pub(crate) const fn with_out_type(mut self, out_type: TdhOutType) -> Self {
             self.out_type = out_type;
             self
         }
 
         /// A structure property with the given members
-        const fn structure(name: &'static str, members: &'static [PropSpec]) -> Self {
+        pub(crate) const fn structure(name: &'static str, members: &'static [PropSpec]) -> Self {
             Self {
                 flags: PropertyFlags::PROPERTY_STRUCT.bits(),
                 structure: Some(members),
@@ -874,7 +931,7 @@ mod tests {
         /// An array of structures whose element count is held by the property
         /// at `count_property_index` (PropertyParamCount, as in the .NET
         /// GCBulk events)
-        const fn structure_array(
+        pub(crate) const fn structure_array(
             name: &'static str,
             members: &'static [PropSpec],
             count_property_index: u16,
@@ -941,7 +998,7 @@ mod tests {
     }
 
     /// Builds a `Schema` wrapping a synthetic `TRACE_EVENT_INFO` describing `props`
-    fn synthetic_schema(props: &[PropSpec]) -> Schema {
+    pub(crate) fn synthetic_schema(props: &[PropSpec]) -> Schema {
         let mut entries = Vec::new();
         flatten_props(props, &mut entries);
 
@@ -1009,13 +1066,24 @@ mod tests {
     }
 
     /// Builds an `EventRecord` whose user data is `user_data`
-    fn synthetic_record(user_data: &[u8]) -> EventRecord {
+    pub(crate) fn synthetic_record(user_data: &[u8]) -> EventRecord {
         EventRecord(Etw::EVENT_RECORD {
             UserData: user_data.as_ptr() as *mut _,
             UserDataLength: u16::try_from(user_data.len()).unwrap(),
             ..Default::default()
         })
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::System::Diagnostics::Etw;
+
+    use super::*;
+    use crate::{
+        native::tdh::TraceEventInfo,
+        parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
+    };
 
     #[test]
     fn parse_guid_property() {

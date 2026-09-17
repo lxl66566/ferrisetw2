@@ -37,7 +37,7 @@ use crate::{
     native::{
         EVENT_EXTENDED_ITEM_INSTANCE, EventHeaderExtendedDataItem, ExtendedDataItem,
         etw_types::event_record::EventRecord,
-        tdh_types::{Property, PropertyInfo, TdhInType, TdhOutType},
+        tdh_types::{Property, PropertyCount, PropertyInfo, TdhInType, TdhOutType},
         time::{FileTime, SystemTime},
     },
     parser::{Parser, TdhSocketAddress},
@@ -126,7 +126,17 @@ impl serde::ser::Serialize for EventSerializer<'_> {
             state.skip_field("Extended")?;
         }
 
-        let event = EventSer::new(self.record, self.schema, &self.parser, &self.options);
+        // The property list is bound to the schema lifetime (`'x`, same as the
+        // parser's `Parser<'x, 'x>`): Parser is invariant over that parameter,
+        // so structure members can only be decoded when both agree. Accessing
+        // the schema through `self.schema` (a copied `&'x Schema`) keeps that
+        // lifetime; going through a shorter reborrow would not.
+        let props = match self.schema.try_properties() {
+            Ok(p) => p,
+            Err(e) if self.options.fail_unimplemented => return Err(serde::ser::Error::custom(e)),
+            Err(_) => &[],
+        };
+        let event = EventSer::new(self.record, props, &self.parser, &self.options);
         state.serialize_field("Event", &event)?;
 
         state.end()
@@ -412,7 +422,10 @@ impl<Address: serde::ser::Serialize> serde::ser::Serialize for StackTraceSer<'_,
 
 struct EventSer<'a, 'b> {
     record: &'a EventRecord,
-    schema: &'a Schema,
+    /// Top-level properties, resolved by the caller at the schema lifetime so
+    /// the parser can decode structure members (Parser is invariant over its
+    /// schema lifetime, both must agree)
+    props: &'b [Property],
     parser: &'a Parser<'b, 'b>,
     options: &'a EventSerializerOptions,
 }
@@ -420,13 +433,13 @@ struct EventSer<'a, 'b> {
 impl<'a, 'b> EventSer<'a, 'b> {
     fn new(
         record: &'a EventRecord,
-        schema: &'a Schema,
+        props: &'b [Property],
         parser: &'a Parser<'b, 'b>,
         options: &'a EventSerializerOptions,
     ) -> Self {
         Self {
             record,
-            schema,
+            props,
             parser,
             options,
         }
@@ -439,17 +452,7 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
         S: serde::Serializer,
     {
         let mut len: usize = 0;
-        let props = match self
-            .schema
-            .try_properties()
-            .map_err(serde::ser::Error::custom)
-        {
-            Err(e) if self.options.fail_unimplemented => return Err(e),
-            Ok(p) => p,
-            _ => &[],
-        };
-
-        for prop in props {
+        for prop in self.props {
             if prop.get_parser().is_some() {
                 len += 1;
             } else if self.options.fail_unimplemented {
@@ -461,10 +464,12 @@ impl serde::ser::Serialize for EventSer<'_, '_> {
         }
 
         let mut state = serializer.serialize_map(Some(len))?;
-        for prop in props {
-            if let Some(s) = prop.get_parser() {
-                s.0.ser::<S>(&mut state, prop, self.parser, self.record)?;
-            }
+        for prop in self.props {
+            let buffer = self
+                .parser
+                .property_bytes(&prop.name)
+                .map_err(serde::ser::Error::custom)?;
+            ser_property::<S>(&mut state, prop, buffer, self.parser, self.record)?;
         }
         state.end()
     }
@@ -511,6 +516,99 @@ mod test {
         let value = serde_json::to_value(HeaderSer::new(&header)).unwrap();
         assert_eq!(value["Flags"], serde_json::json!(0x0001));
         assert_eq!(value["EventProperty"], serde_json::json!(0x0002));
+    }
+
+    #[test]
+    fn struct_properties_serialize_as_nested_objects() {
+        use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+
+        static NESTED_MEMBERS: [PropSpec; 1] =
+            [PropSpec::new("inner_x", TdhInType::InTypeUInt32, 4)];
+        static MEMBERS: [PropSpec; 3] = [
+            PropSpec::new("x", TdhInType::InTypeUInt32, 4),
+            PropSpec::structure("inner", &NESTED_MEMBERS),
+            // Fixed-length string member: NUL-padded to 8 bytes (4 UTF-16 units)
+            PropSpec::new("label", TdhInType::InTypeUnicodeString, 8),
+        ];
+        static PROPS: [PropSpec; 1] = [PropSpec::structure("s", &MEMBERS)];
+
+        let schema = synthetic_schema(&PROPS);
+        let mut data = Vec::new();
+        data.extend_from_slice(&0xaabb_ccdd_u32.to_le_bytes());
+        data.extend_from_slice(&7u32.to_le_bytes());
+        for unit in [u16::from(b'h'), u16::from(b'i'), 0, 0] {
+            data.extend_from_slice(&unit.to_le_bytes());
+        }
+        let record = synthetic_record(&data);
+
+        let ser = EventSerializer::new(&record, &schema, EventSerializerOptions {
+            include_schema: false,
+            include_header: false,
+            ..Default::default()
+        });
+        let value = serde_json::to_value(ser).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({
+                "s": {
+                    "x": 0xAABB_CCDD_u32,
+                    "inner": {"inner_x": 7},
+                    "label": "hi",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn struct_arrays_serialize_as_element_arrays() {
+        use crate::{
+            native::tdh_types::PropertyFlags,
+            parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
+        };
+
+        static MEMBERS: [PropSpec; 2] = [
+            PropSpec::new("a", TdhInType::InTypeUInt32, 4),
+            PropSpec::new("b", TdhInType::InTypeUInt16, 2),
+        ];
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("count", TdhInType::InTypeUInt32, 4),
+            // A constant-count array of structures. Dynamically-counted
+            // arrays (`structure_array`, count held by another property)
+            // need TDH to size the whole property, which requires a real
+            // event; the parser tests cover their schema shape
+            PropSpec {
+                flags: PropertyFlags::PROPERTY_STRUCT.bits(),
+                count: 2,
+                structure: Some(&MEMBERS),
+                ..PropSpec::new("items", TdhInType::InTypeNull, 0)
+            },
+        ];
+
+        let schema = synthetic_schema(&PROPS);
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u32.to_le_bytes()); // count
+        for (a, b) in [(1u32, 10u16), (2, 20)] {
+            data.extend_from_slice(&a.to_le_bytes());
+            data.extend_from_slice(&b.to_le_bytes());
+        }
+        let record = synthetic_record(&data);
+
+        let ser = EventSerializer::new(&record, &schema, EventSerializerOptions {
+            include_schema: false,
+            include_header: false,
+            ..Default::default()
+        });
+        let value = serde_json::to_value(ser).unwrap();
+        assert_eq!(
+            value["Event"],
+            serde_json::json!({
+                "count": 2,
+                "items": [
+                    {"a": 1, "b": 10},
+                    {"a": 2, "b": 20},
+                ],
+            })
+        );
     }
 
     #[test]
@@ -669,6 +767,8 @@ enum PropHandler {
     Binary,
     IpAddr,
     SocketAddress,
+    Struct,
+    StructArray,
     ArrayInt16,
     ArrayUInt16,
     ArrayInt32,
@@ -699,84 +799,215 @@ impl<T: std::fmt::LowerHex> serde::ser::Serialize for HexDisplay<T> {
 }
 
 macro_rules! prop_ser_type {
-    ($typ:ty, $map:expr, $prop:expr, $parser:expr) => {{
+    ($typ:ty, $map:expr, $prop:expr, $parser:expr, $buffer:expr) => {{
         let v = $parser
-            .try_parse::<$typ>(&$prop.name)
+            .try_parse_member::<$typ>($prop, $buffer)
             .map_err(serde::ser::Error::custom)?;
         $map.serialize_entry(&$prop.name, &v)
     }};
 }
 
+/// Serializes one structure element as a nested map: fixed-size members are
+/// sliced out of `bytes` and decoded through the parser, variable-length
+/// members are skipped
+struct StructSer<'a, 'b, 'p, 'r> {
+    members: &'a [Property],
+    bytes: &'b [u8],
+    parser: &'p Parser<'a, 'b>,
+    record: &'r EventRecord,
+}
+
+impl serde::ser::Serialize for StructSer<'_, '_, '_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(self.members.len()))?;
+        let mut offset = 0;
+        for member in self.members {
+            let Some(size) = member.fixed_size(self.record.pointer_size()) else {
+                // Variable-length member: cannot be located without TDH help
+                continue;
+            };
+            let Some(buffer) = self.bytes.get(offset..offset + size) else {
+                break;
+            };
+            offset += size;
+            ser_property::<S>(&mut map, member, buffer, self.parser, self.record)?;
+        }
+        map.end()
+    }
+}
+
+/// Serializes an array of structures as a nested array of maps. Elements are
+/// `stride` bytes apart, starting at `bytes`
+struct StructArraySer<'a, 'b, 'p, 'r> {
+    members: &'a [Property],
+    count: usize,
+    stride: usize,
+    bytes: &'b [u8],
+    parser: &'p Parser<'a, 'b>,
+    record: &'r EventRecord,
+}
+
+impl serde::ser::Serialize for StructArraySer<'_, '_, '_, '_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(self.count))?;
+        for i in 0..self.count {
+            let Some(element) = self.bytes.get(i * self.stride..(i + 1) * self.stride) else {
+                break;
+            };
+            seq.serialize_element(&StructSer {
+                members: self.members,
+                bytes: element,
+                parser: self.parser,
+                record: self.record,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+/// Writes one property (or structure member) entry into `map`, decoding the
+/// value from `buffer` through the parser
+fn ser_property<'a, 'b, S>(
+    map: &mut S::SerializeMap,
+    prop: &'a Property,
+    buffer: &'b [u8],
+    parser: &Parser<'a, 'b>,
+    record: &EventRecord,
+) -> Result<(), S::Error>
+where
+    S: serde::ser::Serializer,
+{
+    // Structures recurse into nested serialization
+    if let PropertyInfo::Struct { members } = &prop.info {
+        return map.serialize_entry(&prop.name, &StructSer {
+            members,
+            bytes: buffer,
+            parser,
+            record,
+        });
+    }
+    if let PropertyInfo::StructArray { members, count } = &prop.info {
+        let resolved = resolve_struct_count(*count, parser);
+        // TDH sizes the whole array; the stride follows from the element count
+        let stride = resolved.filter(|&c| c > 0).map_or(0, |c| buffer.len() / c);
+        return map.serialize_entry(&prop.name, &StructArraySer {
+            members,
+            count: resolved.unwrap_or(0),
+            stride,
+            bytes: buffer,
+            parser,
+            record,
+        });
+    }
+
+    let Some(s) = prop.get_parser() else {
+        return Ok(());
+    };
+    s.0.ser_from_bytes::<S>(map, prop, parser, record, buffer)
+}
+
+/// Resolves the element count of a structure array: either a constant, or the
+/// value of the property `PropertyCount::Index` points at
+fn resolve_struct_count(count: PropertyCount, parser: &Parser) -> Option<usize> {
+    match count {
+        PropertyCount::Count(c) => Some(c as usize),
+        PropertyCount::Index(i) => {
+            let prop = parser.top_level_properties().get(i as usize)?;
+            let bytes = parser.property_bytes(&prop.name).ok()?;
+            match bytes.len() {
+                1 => Some(bytes[0] as usize),
+                2 => Some(u16::from_ne_bytes(bytes.try_into().ok()?) as usize),
+                4 => Some(u32::from_ne_bytes(bytes.try_into().ok()?) as usize),
+                8 => usize::try_from(u64::from_ne_bytes(bytes.try_into().ok()?)).ok(),
+                _ => None,
+            }
+        },
+    }
+}
+
 impl PropHandler {
-    fn ser<S>(
+    fn ser_from_bytes<'a, 'b, S>(
         &self,
         map: &mut S::SerializeMap,
-        prop: &Property,
-        parser: &Parser,
+        prop: &'a Property,
+        parser: &Parser<'a, 'b>,
         record: &EventRecord,
+        buffer: &'b [u8],
     ) -> Result<(), S::Error>
     where
         S: serde::ser::Serializer,
     {
         match self {
-            PropHandler::Bool => prop_ser_type!(bool, map, prop, parser),
-            PropHandler::Int8 => prop_ser_type!(i8, map, prop, parser),
-            PropHandler::UInt8 => prop_ser_type!(u8, map, prop, parser),
-            PropHandler::Int16 => prop_ser_type!(i16, map, prop, parser),
-            PropHandler::UInt16 => prop_ser_type!(u16, map, prop, parser),
-            PropHandler::Int32 => prop_ser_type!(i32, map, prop, parser),
-            PropHandler::UInt32 => prop_ser_type!(u32, map, prop, parser),
-            PropHandler::Int64 => prop_ser_type!(i64, map, prop, parser),
-            PropHandler::UInt64 => prop_ser_type!(u64, map, prop, parser),
+            PropHandler::Bool => prop_ser_type!(bool, map, prop, parser, buffer),
+            PropHandler::Int8 => prop_ser_type!(i8, map, prop, parser, buffer),
+            PropHandler::UInt8 => prop_ser_type!(u8, map, prop, parser, buffer),
+            PropHandler::Int16 => prop_ser_type!(i16, map, prop, parser, buffer),
+            PropHandler::UInt16 => prop_ser_type!(u16, map, prop, parser, buffer),
+            PropHandler::Int32 => prop_ser_type!(i32, map, prop, parser, buffer),
+            PropHandler::UInt32 => prop_ser_type!(u32, map, prop, parser, buffer),
+            PropHandler::Int64 => prop_ser_type!(i64, map, prop, parser, buffer),
+            PropHandler::UInt64 => prop_ser_type!(u64, map, prop, parser, buffer),
             PropHandler::HexInt32 => {
                 let v = parser
-                    .try_parse::<u32>(&prop.name)
+                    .try_parse_member::<u32>(prop, buffer)
                     .map_err(serde::ser::Error::custom)?;
                 map.serialize_entry(&prop.name, &HexDisplay(v))
             },
             PropHandler::HexInt64 => {
                 let v = parser
-                    .try_parse::<u64>(&prop.name)
+                    .try_parse_member::<u64>(prop, buffer)
                     .map_err(serde::ser::Error::custom)?;
                 map.serialize_entry(&prop.name, &HexDisplay(v))
             },
-            PropHandler::Float => prop_ser_type!(f32, map, prop, parser),
-            PropHandler::Double => prop_ser_type!(f64, map, prop, parser),
-            PropHandler::String => prop_ser_type!(String, map, prop, parser),
-            PropHandler::Binary => prop_ser_type!(Vec<u8>, map, prop, parser),
-            PropHandler::IpAddr => prop_ser_type!(IpAddr, map, prop, parser),
-            PropHandler::SocketAddress => prop_ser_type!(TdhSocketAddress, map, prop, parser),
-            PropHandler::FileTime => prop_ser_type!(FileTime, map, prop, parser),
-            PropHandler::SystemTime => prop_ser_type!(SystemTime, map, prop, parser),
-            PropHandler::ArrayInt16 => prop_ser_type!(&[i16], map, prop, parser),
-            PropHandler::ArrayUInt16 => prop_ser_type!(&[u16], map, prop, parser),
-            PropHandler::ArrayInt32 => prop_ser_type!(&[i32], map, prop, parser),
-            PropHandler::ArrayUInt32 => prop_ser_type!(&[u32], map, prop, parser),
-            PropHandler::ArrayInt64 => prop_ser_type!(&[i64], map, prop, parser),
-            PropHandler::ArrayUInt64 => prop_ser_type!(&[u64], map, prop, parser),
+            PropHandler::Float => prop_ser_type!(f32, map, prop, parser, buffer),
+            PropHandler::Double => prop_ser_type!(f64, map, prop, parser, buffer),
+            PropHandler::String => prop_ser_type!(String, map, prop, parser, buffer),
+            PropHandler::Binary => prop_ser_type!(Vec<u8>, map, prop, parser, buffer),
+            PropHandler::IpAddr => prop_ser_type!(IpAddr, map, prop, parser, buffer),
+            PropHandler::SocketAddress => {
+                prop_ser_type!(TdhSocketAddress, map, prop, parser, buffer)
+            },
+            PropHandler::FileTime => prop_ser_type!(FileTime, map, prop, parser, buffer),
+            PropHandler::SystemTime => prop_ser_type!(SystemTime, map, prop, parser, buffer),
+            PropHandler::ArrayInt16 => prop_ser_type!(&[i16], map, prop, parser, buffer),
+            PropHandler::ArrayUInt16 => prop_ser_type!(&[u16], map, prop, parser, buffer),
+            PropHandler::ArrayInt32 => prop_ser_type!(&[i32], map, prop, parser, buffer),
+            PropHandler::ArrayUInt32 => prop_ser_type!(&[u32], map, prop, parser, buffer),
+            PropHandler::ArrayInt64 => prop_ser_type!(&[i64], map, prop, parser, buffer),
+            PropHandler::ArrayUInt64 => prop_ser_type!(&[u64], map, prop, parser, buffer),
             PropHandler::Null => {
                 let value: Option<usize> = None;
                 map.serialize_entry(&prop.name, &value)
             },
             PropHandler::Pointer => {
                 if record.pointer_size() == 4 {
-                    prop_ser_type!(u32, map, prop, parser)
+                    prop_ser_type!(u32, map, prop, parser, buffer)
                 } else {
-                    prop_ser_type!(u64, map, prop, parser)
+                    prop_ser_type!(u64, map, prop, parser, buffer)
                 }
             },
             PropHandler::ArrayPointer => {
                 if record.pointer_size() == 4 {
-                    prop_ser_type!(&[u32], map, prop, parser)
+                    prop_ser_type!(&[u32], map, prop, parser, buffer)
                 } else {
-                    prop_ser_type!(&[u64], map, prop, parser)
+                    prop_ser_type!(&[u64], map, prop, parser, buffer)
                 }
             },
             PropHandler::Guid => {
                 let guid = parser
-                    .try_parse::<GUID>(&prop.name)
+                    .try_parse_member::<GUID>(prop, buffer)
                     .map_err(serde::ser::Error::custom)?;
                 map.serialize_entry(&prop.name, &GUIDExt(guid))
+            },
+            // Structures are handled by `ser_property`, never dispatched here
+            PropHandler::Struct | PropHandler::StructArray => {
+                unreachable!("structure properties go through the nested serializers")
             },
         }
     }
@@ -848,8 +1079,9 @@ impl PropSerable for PropertyInfo {
                     _ => None, // TODO
                 }
             },
-            // Structures are not serialized (yet)
-            PropertyInfo::Struct { .. } | PropertyInfo::StructArray { .. } => None,
+            // Structures serialize as nested maps/arrays (see `ser_property`)
+            PropertyInfo::Struct { .. } => Some(PropSer(PropHandler::Struct)),
+            PropertyInfo::StructArray { .. } => Some(PropSer(PropHandler::StructArray)),
         }
     }
 }

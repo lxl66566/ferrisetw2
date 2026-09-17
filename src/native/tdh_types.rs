@@ -88,10 +88,10 @@ pub enum PropertyInfo {
     },
     /// A structure: its members, in layout order.
     ///
-    /// A structure occupies the concatenation of its members' bytes. Its
-    /// scalar members can be read through [`crate::parser::Parser::try_parse`]
-    /// (member names must be unambiguous at event level); the generic
-    /// `try_parse` of a whole structure is not supported.
+    /// A structure occupies the concatenation of its members' bytes. The
+    /// generic `try_parse` of a whole structure is not supported; with the
+    /// `serde` feature, structures serialize as nested objects (fixed-size
+    /// members only, variable-length members are skipped).
     Struct {
         /// Members of the structure, possibly structures themselves
         // Read by the parser's struct breakdown
@@ -132,6 +132,68 @@ pub struct Property {
     pub name: String,
     /// Information about the property.
     pub info: PropertyInfo,
+}
+
+impl Property {
+    /// Size in bytes when the property has a fixed layout, or `None` when it
+    /// is variable-length (strings without an explicit length, lengths or
+    /// counts held by another property, ...)
+    ///
+    /// Structure sizes follow from the sum of their members' fixed sizes,
+    /// which avoids a TDH round-trip in the common all-fixed case
+    // Shared by the parser's buffer walk and the serializer's member slicing
+    #[allow(dead_code)]
+    pub(crate) fn fixed_size(&self, pointer_size: usize) -> Option<usize> {
+        match &self.info {
+            PropertyInfo::Value {
+                in_type, length, ..
+            } => {
+                if *in_type == TdhInType::InTypePointer {
+                    return Some(pointer_size);
+                }
+                match length {
+                    // A zero length means "ask TDH" for a top-level property; inside
+                    // a structure it marks a variable-length member
+                    PropertyLength::Length(l) if *l > 0 => Some(*l as usize),
+                    _ => None,
+                }
+            },
+            PropertyInfo::Array {
+                in_type,
+                length,
+                count,
+                ..
+            } => {
+                let elem = if *in_type == TdhInType::InTypePointer {
+                    pointer_size
+                } else {
+                    match length {
+                        PropertyLength::Length(l) if *l > 0 => *l as usize,
+                        _ => return None,
+                    }
+                };
+                let count = match count {
+                    PropertyCount::Count(c) => *c as usize,
+                    PropertyCount::Index(_) => return None,
+                };
+                Some(elem * count)
+            },
+            PropertyInfo::Struct { members } => {
+                members.iter().map(|m| m.fixed_size(pointer_size)).sum()
+            },
+            PropertyInfo::StructArray { members, count } => {
+                let elem: usize = members
+                    .iter()
+                    .map(|m| m.fixed_size(pointer_size))
+                    .sum::<Option<usize>>()?;
+                let count = match count {
+                    PropertyCount::Count(c) => *c as usize,
+                    PropertyCount::Index(_) => return None,
+                };
+                Some(elem * count)
+            },
+        }
+    }
 }
 
 #[doc(hidden)]
