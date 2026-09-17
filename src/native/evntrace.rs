@@ -7,7 +7,10 @@ use std::{
     collections::HashSet,
     ffi::c_void,
     panic::AssertUnwindSafe,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use once_cell::sync::Lazy;
@@ -69,7 +72,7 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 ///
 /// But, we would like to free memory used by the callbacks when we're done!
 /// The registry owns an `Arc` clone of every registered `CallbackData`, and the callbacks
-/// resolve their context through a single locked lookup, which validates the pointer and
+/// resolve their context through a single locked lookup, which validates the id and
 /// hands out an owned `Arc` clone in one step (`ContextRegistry::get`):
 /// * a callback that runs after `close_trace` removed the entry misses and drops the event
 /// * a callback that already got its `Arc` keeps the data alive, whatever the closing thread does
@@ -79,56 +82,123 @@ pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 ///   settles the memory-management half of <https://github.com/n4r1b/ferrisetw/issues/62> without
 ///   waiting for the last buffered event
 ///
-/// The context pointer itself is only ever compared to the keys, never dereferenced: the
-/// lookup runs when the pointed-to `CallbackData` may already be deallocated, so touching
-/// the pointee (e.g. reading an `AtomicBool` embedded in `CallbackData`) would be a
-/// use-after-free.
+/// The context id is only ever compared to the keys, never dereferenced (it is not even a
+/// pointer, see `TraceContextId`), so the lookup cannot race a free.
 ///
 /// Lock hierarchy: this registry is a leaf lock. It never nests with the provider registry's
 /// `RwLock` nor with the session-mutations `Mutex`: callbacks clone the `Arc` and release it
 /// before dispatching (so `on_event` never runs under it), and `open_trace`/`close_trace`
 /// hold it alone, never across an OS call.
 static CONTEXT_REGISTRY: ContextRegistry = ContextRegistry::new();
-struct ContextRegistry(Lazy<RwLock<FxHashMap<u64, Arc<CallbackData>>>>);
-enum ContextError {
-    AlreadyExist,
-}
+struct ContextRegistry(Lazy<RwLock<FxHashMap<usize, Arc<CallbackData>>>>);
 
 impl ContextRegistry {
     pub const fn new() -> Self {
         Self(Lazy::new(|| RwLock::new(FxHashMap::default())))
     }
 
-    /// Insert if it did not exist previously
-    fn insert(
-        &self,
-        ctx_ptr: *const c_void,
-        callback_data: Arc<CallbackData>,
-    ) -> Result<(), ContextError> {
-        if self
-            .0
-            .write()
-            .unwrap()
-            .insert(ctx_ptr as u64, callback_data)
-            .is_none()
-        {
-            Ok(())
-        } else {
-            Err(ContextError::AlreadyExist)
-        }
+    fn insert(&self, id: TraceContextId, callback_data: Arc<CallbackData>) {
+        self.0.write().unwrap().insert(id.0, callback_data);
     }
 
-    fn remove(&self, ctx_ptr: *const c_void) {
-        self.0.write().unwrap().remove(&(ctx_ptr as u64));
+    fn remove(&self, id: TraceContextId) {
+        self.0.write().unwrap().remove(&id.0);
     }
 
-    /// Resolve a context pointer handed back by the ETW framework into an owned `Arc` clone
-    /// of the callback data, validating the pointer and keeping the data alive in one step
+    /// Resolve a context id handed back by the ETW framework into an owned `Arc` clone of
+    /// the callback data, validating the id and keeping the data alive in one step
     ///
     /// Read lock: every event takes this once, and concurrent events (from several ETW
     /// delivery threads) must not serialize on each other
-    pub fn get(&self, ctx_ptr: *const c_void) -> Option<Arc<CallbackData>> {
-        self.0.read().unwrap().get(&(ctx_ptr as u64)).cloned()
+    pub fn get(&self, id: TraceContextId) -> Option<Arc<CallbackData>> {
+        self.0.read().unwrap().get(&id.0).cloned()
+    }
+}
+
+/// The unique identity of one open trace, handed to the ETW APIs as their `Context`
+///
+/// The ETW framework round-trips this value opaquely: the `Context` of the
+/// `EVENT_TRACE_LOGFILEW` comes back as the `UserContext` of every `EVENT_RECORD` delivered
+/// for that trace. It is a registry key, not a pointer: it is only ever compared (see
+/// [`CONTEXT_REGISTRY`]), never dereferenced.
+///
+/// Ids come from a process-wide counter and are never reused: once a trace is closed, its id
+/// is retired, so a stale event of a closed trace can only ever miss the registry — even if
+/// the allocator hands a newer trace the memory just freed by the older one (an id scheme is
+/// what rules this ABA misrouting out; keys taken from allocated addresses could not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TraceContextId(usize);
+
+/// Backing counter of [`TraceContextId`]: starts at 1, so ids are never null
+static NEXT_CONTEXT_ID: AtomicUsize = AtomicUsize::new(1);
+
+impl TraceContextId {
+    fn mint() -> Self {
+        Self(NEXT_CONTEXT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Rebuild the id from the `UserContext` the ETW framework handed back
+    fn from_user_context(user_context: *const c_void) -> Self {
+        Self(user_context.addr())
+    }
+
+    /// The value to store in `EVENT_TRACE_LOGFILEW::Context`
+    pub(crate) fn as_user_context(self) -> *mut c_void {
+        // The id is never dereferenced (not by ETW, not by this crate): a bare
+        // integer-to-pointer conversion is exactly what is needed here
+        std::ptr::with_exposed_provenance_mut(self.0)
+    }
+}
+
+/// The registered context of an open trace: its unique [`TraceContextId`], plus the `Arc`
+/// keeping its [`CallbackData`] alive
+///
+/// The registry holds its own clone of the `Arc` while this is registered: ETW callbacks
+/// resolve their `UserContext` through [`CONTEXT_REGISTRY`] and dispatch on their own clone.
+/// Dropping this unregisters the id, so a `TraceContext` must stay owned by the trace until
+/// `close_trace` ran.
+// `pub` within a `pub(crate)` module, like `CallbackData`: it only crosses private signatures
+#[derive(Debug)]
+pub struct TraceContext {
+    id: TraceContextId,
+    data: Arc<CallbackData>,
+}
+
+impl TraceContext {
+    /// Register a freshly built callback data for dispatch, minting its unique context id
+    pub(crate) fn new(callback_data: Arc<CallbackData>) -> Self {
+        let id = TraceContextId::mint();
+        CONTEXT_REGISTRY.insert(id, Arc::clone(&callback_data));
+        Self {
+            id,
+            data: callback_data,
+        }
+    }
+
+    /// The id handed to the ETW APIs for this trace
+    pub(crate) fn id(&self) -> TraceContextId {
+        self.id
+    }
+
+    /// Retire the context: callbacks resolving it from now on drop their event
+    fn unregister(&self) {
+        CONTEXT_REGISTRY.remove(self.id);
+    }
+}
+
+impl Drop for TraceContext {
+    fn drop(&mut self) {
+        // `close_trace` already unregistered this context, but a `start()` that fails
+        // between `open_trace` and the actual `build` drops the context without a close
+        self.unregister();
+    }
+}
+
+impl std::ops::Deref for TraceContext {
+    type Target = CallbackData;
+
+    fn deref(&self) -> &CallbackData {
+        &self.data
     }
 }
 
@@ -145,9 +215,10 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
             // The locked lookup validates the context and hands out an owned `Arc` in one
             // step: from here on, the callback data is owned by this callback, and neither
             // `close_trace` nor dropping the whole `Trace` can free it while it runs. The
-            // raw `UserContext` pointer is only ever compared to registry keys, never
+            // `UserContext` is a registry key, and is only ever compared, never
             // dereferenced.
-            if let Some(callback_data) = CONTEXT_REGISTRY.get(event_record.user_context()) {
+            let context = TraceContextId::from_user_context(event_record.user_context());
+            if let Some(callback_data) = CONTEXT_REGISTRY.get(context) {
                 callback_data.on_event(event_record);
             }
         }
@@ -181,8 +252,8 @@ extern "system" fn buffer_callback_thunk(p_logfile: *mut Etw::EVENT_TRACE_LOGFIL
         // The locked lookup validates the context and hands out an owned `Arc` in one
         // step (see `trace_callback_thunk`: neither `close_trace` nor dropping the
         // `Trace` can free the callback data while this callback runs)
-        let callback_data = CONTEXT_REGISTRY.get(log_file.Context);
-        if let Some(callback_data) = callback_data {
+        let context = TraceContextId::from_user_context(log_file.Context);
+        if let Some(callback_data) = CONTEXT_REGISTRY.get(context) {
             callback_data.on_buffer(log_file.BuffersRead, log_file.EventsLost);
         }
         TRUE
@@ -267,33 +338,26 @@ where
 /// Subscribe to a started trace
 ///
 /// Microsoft calls this "opening" the trace (and this calls `OpenTraceW`)
-#[allow(clippy::borrowed_box)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer
+///
+/// On success, the returned [`TraceContext`] must stay owned (and be passed to
+/// [`close_trace`]) for as long as the trace handle is open: dropping it retires the
+/// context, and the thunks would drop every event of the trace.
 pub(crate) fn open_trace(
     subscription_source: SubscriptionSource,
-    callback_data: &Box<Arc<CallbackData>>,
-) -> EvntraceNativeResult<TraceHandle> {
+    callback_data: Arc<CallbackData>,
+) -> EvntraceNativeResult<(TraceHandle, TraceContext)> {
+    // Register the context before opening: the thunks of this handle will resolve their
+    // `UserContext` through it. The registry keeps its own `Arc` clone, so the data
+    // outlives the closing of the trace if a callback is in flight. Several consumers of
+    // the same session or ETL file each get their own context (one `open_trace` each), so
+    // closing one never discards the callbacks of the other.
+    let context = TraceContext::new(callback_data);
     let mut log_file = EventTraceLogfile::create(
-        callback_data,
+        context.id(),
         subscription_source,
         trace_callback_thunk,
         buffer_callback_thunk,
     );
-
-    // The registry keeps its own `Arc` clone: the callbacks will resolve their context
-    // through it, so the data outlives the closing of the trace if a callback is in flight
-    if let Err(ContextError::AlreadyExist) =
-        CONTEXT_REGISTRY.insert(log_file.context_ptr(), Arc::clone(callback_data))
-    {
-        // Multiple consumers of the same session or ETL file are supported the
-        // usual way: one `open_trace` (hence one context) per trace. Reusing a
-        // single context for a second open is rejected on purpose: `close_trace`
-        // removes the context from the validity registry, so the first close
-        // would silently discard the other trace's callbacks. Supporting it
-        // would require refcounted validity plus shared, address-stable
-        // ownership of the CallbackData (the `Context` pointer must never
-        // move), for no use case reachable through the public API.
-        return Err(EvntraceNativeError::AlreadyExist);
-    }
 
     let trace_handle = unsafe {
         // This function modifies the data pointed to by log_file.
@@ -305,13 +369,11 @@ pub(crate) fn open_trace(
     };
 
     if filter_invalid_trace_handles(trace_handle).is_none() {
-        // The trace never ran: roll back the registry insertion. A stale entry would
-        // make a future `open_trace` whose context lands on the same address fail
-        // with a spurious `AlreadyExist`
-        CONTEXT_REGISTRY.remove(log_file.context_ptr());
+        // The trace never ran: dropping the context unregisters it (ids are never
+        // reused, so this is only hygiene against an unbounded registry)
         Err(EvntraceNativeError::IoError(std::io::Error::last_os_error()))
     } else {
-        Ok(trace_handle)
+        Ok((trace_handle, context))
     }
 }
 
@@ -567,19 +629,17 @@ pub(crate) fn control_trace_by_name(
 /// In case ETW reports there are still events in the queue that are still to trigger callbacks,
 /// this returns Ok(true).<br/> If no further event callback will be invoked, this returns
 /// Ok(false)<br/> On error, this returns an `Err`
-#[allow(clippy::borrowed_box)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer
 pub(crate) fn close_trace(
     trace_handle: TraceHandle,
-    callback_data: &Box<Arc<CallbackData>>,
+    context: &TraceContext,
 ) -> EvntraceNativeResult<bool> {
     match filter_invalid_trace_handles(trace_handle) {
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
-            // By contruction, only one Provider used this context in its callback. It is safe to
-            // remove it, it won't be used by anyone else. Any callback still in flight holds its
-            // own `Arc` clone (see `CONTEXT_REGISTRY`), and the ones that start after this miss
-            // the registry and drop their event.
-            CONTEXT_REGISTRY.remove(std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>());
+            // Retire the context before the close: the events still queued will still
+            // trigger the thunks, which must miss the registry and drop them. Callbacks
+            // already in flight keep their own `Arc` clone (see `CONTEXT_REGISTRY`).
+            context.unregister();
 
             let status = unsafe { Etw::CloseTrace(handle) };
 
@@ -907,24 +967,21 @@ mod tests {
     }
 
     #[test]
-    fn failed_open_trace_releases_the_context_address() {
-        let callback_data: Box<Arc<CallbackData>> = Box::new(Arc::new(CallbackData::RealTime(
-            RealTimeCallbackData::new(),
-        )));
+    fn failed_open_trace_fails_with_the_os_error() {
         // A nonexistent ETL file makes OpenTraceW fail deterministically
         let source =
             SubscriptionSource::FromFile(U16CString::from_str("Z:\\no\\such\\trace.etl").unwrap());
 
-        assert!(open_trace(source, &callback_data).is_err());
-
-        // The failed open must not leave the address registered: a later trace whose
-        // context lands on the same address would fail with a spurious AlreadyExist
-        let ptr = std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>();
-        assert!(
-            CONTEXT_REGISTRY
-                .insert(ptr, Arc::clone(&callback_data))
-                .is_ok()
+        let result = open_trace(
+            source,
+            Arc::new(CallbackData::RealTime(RealTimeCallbackData::new())),
         );
-        CONTEXT_REGISTRY.remove(ptr);
+        assert!(
+            matches!(result, Err(EvntraceNativeError::IoError(_))),
+            "OpenTraceW on a nonexistent file must surface the OS error"
+        );
+        // The context of the failed open was dropped inside `open_trace`, which
+        // unregistered it (see `TraceContext::drop`): no dead id piles up in the
+        // registry
     }
 }

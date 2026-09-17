@@ -17,9 +17,10 @@ use crate::{
         EvntraceNativeError,
         etw_types::{EventTraceProperties, SubscriptionSource},
         evntrace::{
-            ControlHandle, TraceHandle, capture_provider_state, close_trace, control_trace,
-            control_trace_by_name, disable_provider, enable_provider, enable_stack_tracing,
-            open_trace, process_trace, set_extended_kernel_groups, start_trace, win32_error,
+            ControlHandle, TraceContext, TraceHandle, capture_provider_state, close_trace,
+            control_trace, control_trace_by_name, disable_provider, enable_provider,
+            enable_stack_tracing, open_trace, process_trace, set_extended_kernel_groups,
+            start_trace, win32_error,
         },
         version_helper,
     },
@@ -520,11 +521,11 @@ impl TraceTrait for UserTrace {
     }
 
     fn events_handled(&self) -> usize {
-        self.callback_data.events_handled()
+        self.context.events_handled()
     }
 
     fn close(self) -> TraceResult<bool> {
-        close_trace(self.trace_handle, &self.callback_data).map_err(TraceError::EtwNativeError)
+        close_trace(self.trace_handle, &self.context).map_err(TraceError::EtwNativeError)
     }
 }
 
@@ -547,11 +548,11 @@ impl TraceTrait for KernelTrace {
     }
 
     fn events_handled(&self) -> usize {
-        self.callback_data.events_handled()
+        self.context.events_handled()
     }
 
     fn close(self) -> TraceResult<bool> {
-        close_trace(self.trace_handle, &self.callback_data).map_err(TraceError::EtwNativeError)
+        close_trace(self.trace_handle, &self.context).map_err(TraceError::EtwNativeError)
     }
 }
 
@@ -575,11 +576,11 @@ impl TraceTrait for FileTrace {
     }
 
     fn events_handled(&self) -> usize {
-        self.callback_data.events_handled()
+        self.context.events_handled()
     }
 
     fn close(self) -> TraceResult<bool> {
-        close_trace(self.trace_handle, &self.callback_data).map_err(TraceError::EtwNativeError)
+        close_trace(self.trace_handle, &self.context).map_err(TraceError::EtwNativeError)
     }
 }
 
@@ -587,46 +588,36 @@ impl TraceTrait for FileTrace {
 ///
 /// To stop the session, you can drop this instance
 #[derive(Debug)]
-#[allow(clippy::redundant_allocation)] // see https://github.com/n4r1b/ferrisetw/issues/72
 pub struct UserTrace {
     properties: EventTraceProperties,
     control_handle: ControlHandle,
     trace_handle: TraceHandle,
-    // CallbackData is
-    // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
-    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
-    callback_data: Box<Arc<CallbackData>>,
+    // The context owns the `Arc<CallbackData>` registered for dispatch: the ETW callbacks
+    // resolve their `UserContext` through the context registry and hold their own `Arc`
+    // clones, so dropping the trace while a callback runs is safe
+    context: TraceContext,
 }
 
 /// A real-time trace session to collect events from kernel-mode drivers
 ///
 /// To stop the session, you can drop this instance
 #[derive(Debug)]
-#[allow(clippy::redundant_allocation)] // see https://github.com/n4r1b/ferrisetw/issues/72
 pub struct KernelTrace {
     properties: EventTraceProperties,
     control_handle: ControlHandle,
     trace_handle: TraceHandle,
-    // CallbackData is
-    // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
-    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
-    callback_data: Box<Arc<CallbackData>>,
+    // See `UserTrace::context`
+    context: TraceContext,
 }
 
 /// A trace session that reads events from an ETL file
 ///
 /// To stop the session, you can drop this instance
 #[derive(Debug)]
-#[allow(clippy::redundant_allocation)] // see https://github.com/n4r1b/ferrisetw/issues/72
 pub struct FileTrace {
     trace_handle: TraceHandle,
-    // CallbackData is
-    // * `Arc`ed, so that dropping a Trace while a callback is still running is not an issue
-    // * `Boxed`, so that the `UserTrace` can be moved around the stack (e.g. returned by a
-    //   function) but the pointers to the `CallbackData` given to Windows ETW API stay valid
-    callback_data: Box<Arc<CallbackData>>,
+    // See `UserTrace::context`
+    context: TraceContext,
 }
 
 /// Various parameters related to an ETL dump file
@@ -710,7 +701,7 @@ impl UserTrace {
     /// ```
     pub fn request_capture_state(&self) -> TraceResult<()> {
         // A UserTrace always holds real-time callback data
-        if let CallbackData::RealTime(rt) = &**self.callback_data {
+        if let CallbackData::RealTime(rt) = &*self.context {
             for provider in rt.providers() {
                 if provider.requests_capture_state() {
                     capture_provider_state(self.control_handle, &provider)?;
@@ -766,7 +757,7 @@ impl UserTrace {
     pub fn enable_provider(&self, provider: Provider) -> TraceResult<()> {
         let provider = Arc::new(provider);
         // A UserTrace always holds real-time callback data
-        let CallbackData::RealTime(rt) = &**self.callback_data else {
+        let CallbackData::RealTime(rt) = &*self.context else {
             return Ok(());
         };
         // Register first, enable second: once the OS starts delivering events,
@@ -826,7 +817,7 @@ impl UserTrace {
     /// ```
     pub fn disable_provider(&self, guid: GUID) -> TraceResult<usize> {
         // A UserTrace always holds real-time callback data
-        let CallbackData::RealTime(rt) = &**self.callback_data else {
+        let CallbackData::RealTime(rt) = &*self.context else {
             return Ok(0);
         };
         // The whole "OS disable + unregister" sequence runs under the
@@ -855,7 +846,7 @@ impl UserTrace {
     #[must_use]
     pub fn providers(&self) -> Vec<Arc<Provider>> {
         // A UserTrace always holds real-time callback data
-        match &**self.callback_data {
+        match &*self.context {
             CallbackData::RealTime(rt) => rt.providers(),
             CallbackData::FromFile(_) => Vec::new(),
         }
@@ -909,12 +900,11 @@ mod private {
         fn control_handle(&self) -> ControlHandle;
         // The properties are moved into the built trace: passing by value is the point
         #[allow(clippy::large_types_passed_by_value)]
-        #[allow(clippy::redundant_allocation)] // Being Boxed is really important, let's keep the Box<...> in the function signature to make the intent clearer (see https://github.com/n4r1b/ferrisetw/issues/72)
         fn build(
             properties: EventTraceProperties,
             control_handle: ControlHandle,
             trace_handle: TraceHandle,
-            callback_data: Box<Arc<CallbackData>>,
+            context: TraceContext,
         ) -> Self;
         fn augmented_file_mode() -> u32;
         fn enable_flags(_providers: &[Arc<Provider>]) -> u32;
@@ -945,13 +935,13 @@ impl PrivateRealTimeTraceTrait for UserTrace {
         properties: EventTraceProperties,
         control_handle: ControlHandle,
         trace_handle: TraceHandle,
-        callback_data: Box<Arc<CallbackData>>,
+        context: TraceContext,
     ) -> Self {
         UserTrace {
             properties,
             control_handle,
             trace_handle,
-            callback_data,
+            context,
         }
     }
 
@@ -966,7 +956,7 @@ impl PrivateRealTimeTraceTrait for UserTrace {
 
 impl PrivateTraceTrait for UserTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.callback_data)?;
+        close_trace(self.trace_handle, &self.context)?;
         control_trace(
             &mut self.properties,
             self.control_handle,
@@ -976,7 +966,7 @@ impl PrivateTraceTrait for UserTrace {
     }
 
     fn callback_data(&self) -> &CallbackData {
-        &self.callback_data
+        &self.context
     }
 }
 
@@ -995,13 +985,13 @@ impl PrivateRealTimeTraceTrait for KernelTrace {
         properties: EventTraceProperties,
         control_handle: ControlHandle,
         trace_handle: TraceHandle,
-        callback_data: Box<Arc<CallbackData>>,
+        context: TraceContext,
     ) -> Self {
         KernelTrace {
             properties,
             control_handle,
             trace_handle,
-            callback_data,
+            context,
         }
     }
 
@@ -1020,7 +1010,7 @@ impl PrivateRealTimeTraceTrait for KernelTrace {
 
 impl PrivateTraceTrait for KernelTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.callback_data)?;
+        close_trace(self.trace_handle, &self.context)?;
         control_trace(
             &mut self.properties,
             self.control_handle,
@@ -1030,18 +1020,18 @@ impl PrivateTraceTrait for KernelTrace {
     }
 
     fn callback_data(&self) -> &CallbackData {
-        &self.callback_data
+        &self.context
     }
 }
 
 impl PrivateTraceTrait for FileTrace {
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.callback_data)?;
+        close_trace(self.trace_handle, &self.context)?;
         Ok(())
     }
 
     fn callback_data(&self) -> &CallbackData {
-        &self.callback_data
+        &self.context
     }
 }
 
@@ -1193,10 +1183,9 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             }
         }
 
-        let callback_data = Box::new(Arc::new(CallbackData::RealTime(self.rt_callback_data)));
-        let trace_handle = open_trace(
+        let (trace_handle, context) = open_trace(
             SubscriptionSource::RealTimeSession(trace_wide_name),
-            &callback_data,
+            Arc::new(CallbackData::RealTime(self.rt_callback_data)),
         )?;
 
         // Request provider states (rundown) now that the consumer is attached:
@@ -1204,7 +1193,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
         // after `open_trace` (same ordering as krabsetw, which fires it right
         // before ProcessTrace)
         if T::TRACE_KIND == private::TraceKind::User {
-            if let CallbackData::RealTime(rt) = &**callback_data {
+            if let CallbackData::RealTime(rt) = &*context {
                 for prov in rt.providers() {
                     if prov.requests_capture_state() {
                         capture_provider_state(control_handle, &prov)?;
@@ -1214,7 +1203,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
         }
 
         Ok((
-            T::build(full_properties, control_handle, trace_handle, callback_data),
+            T::build(full_properties, control_handle, trace_handle, context),
             trace_handle,
         ))
     }
@@ -1240,7 +1229,6 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
         let trace_wide_name = U16CString::from_vec_truncate(trace_wide_vec);
 
         let flags = self.rt_callback_data.provider_flags::<T>();
-        let callback_data = Box::new(Arc::new(CallbackData::RealTime(self.rt_callback_data)));
 
         // Prepare a wide version of the ETL dump file path
         let wide_etl_dump_file = match self.etl_dump_file {
@@ -1261,9 +1249,9 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             },
         };
 
-        let trace_handle = open_trace(
+        let (trace_handle, context) = open_trace(
             SubscriptionSource::RealTimeSession(trace_wide_name.clone()),
-            &callback_data,
+            Arc::new(CallbackData::RealTime(self.rt_callback_data)),
         )
         .map_err(TraceError::EtwNativeError)?;
 
@@ -1281,7 +1269,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
                 ),
                 ControlHandle { Value: 0 },
                 trace_handle,
-                callback_data,
+                context,
             ),
             trace_handle,
         ))
@@ -1364,7 +1352,7 @@ impl FileTrace {
     }
 
     fn non_consuming_stop(&mut self) -> TraceResult<()> {
-        close_trace(self.trace_handle, &self.callback_data)?;
+        close_trace(self.trace_handle, &self.context)?;
         Ok(())
     }
 }
@@ -1378,16 +1366,15 @@ impl FileTraceBuilder {
         let wide_etl_file_path = U16CString::from_os_str_truncate(self.etl_file_path.as_os_str());
 
         let from_file_cb = CallbackDataFromFile::new(self.callback);
-        let callback_data = Box::new(Arc::new(CallbackData::FromFile(from_file_cb)));
-        let trace_handle = open_trace(
+        let (trace_handle, context) = open_trace(
             SubscriptionSource::FromFile(wide_etl_file_path),
-            &callback_data,
+            Arc::new(CallbackData::FromFile(from_file_cb)),
         )?;
 
         Ok((
             FileTrace {
                 trace_handle,
-                callback_data,
+                context,
             },
             trace_handle,
         ))
@@ -1482,7 +1469,7 @@ mod test {
             ),
             control_handle: ControlHandle { Value: 0 },
             trace_handle: TraceHandle { Value: 0 },
-            callback_data: Box::new(Arc::new(CallbackData::RealTime(rt_callback_data))),
+            context: TraceContext::new(Arc::new(CallbackData::RealTime(rt_callback_data))),
         }
     }
 
@@ -1567,7 +1554,7 @@ mod test {
         let trace = SharedTrace(trace_without_session(vec![
             Provider::by_guid(0x1111).build(),
         ]));
-        let CallbackData::RealTime(rt) = &**trace.0.callback_data else {
+        let CallbackData::RealTime(rt) = &*trace.0.context else {
             unreachable!("a UserTrace always holds real-time callback data");
         };
         let mutation_in_flight = rt.lock_session_mutations();
