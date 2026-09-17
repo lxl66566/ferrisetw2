@@ -347,6 +347,10 @@ impl ProviderBuilder {
     /// The callback will be run on a background thread (the one that is blocked on the `process`
     /// function).
     ///
+    /// A panic escaping the callback cannot unwind into Windows (that would be undefined
+    /// behavior): ferrisetw catches it and terminates the process with exit code 1. Catch
+    /// panics within the callback itself; see the crate-level "Callback panics" section.
+    ///
     /// # Example
     /// ```no_run
     /// # use ferrisetw::provider::Provider;

@@ -203,6 +203,13 @@ impl std::ops::Deref for TraceContext {
 }
 
 /// This will be called by the ETW framework whenever an ETW event is available
+///
+/// The user callbacks dispatched here run across the FFI boundary, on a delivery thread
+/// owned by Windows: a panic must not unwind into the ETW framework, as unwinding into
+/// `extern "system"` native code is undefined behavior. Panics are therefore caught, and
+/// since a callback that panicked midway may have left the subscriber's state
+/// inconsistent, the process is terminated with exit code 1 (see the crate-level
+/// "Callback panics" section) rather than silently dropping the following events.
 extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
         let record_from_ptr = unsafe {
@@ -225,7 +232,7 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
     })) {
         Ok(()) => {},
         Err(e) => {
-            log::error!("UNIMPLEMENTED PANIC: {e:?}");
+            log::error!("a user callback panicked, terminating the process: {e:?}");
             std::process::exit(1);
         },
     }
@@ -236,6 +243,9 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
 /// The `BuffersRead` and `EventsLost` fields of the given log file are valid at this point:
 /// they are recorded so that a running trace can be monitored for lost events (see
 /// `TraceTrait::events_lost`)
+///
+/// Like `trace_callback_thunk`, this must never unwind into Windows: a panic here
+/// terminates the process (see the crate-level "Callback panics" section).
 extern "system" fn buffer_callback_thunk(p_logfile: *mut Etw::EVENT_TRACE_LOGFILEW) -> u32 {
     const TRUE: u32 = 1; // Keep processing buffers (FALSE would cancel the trace processing)
     match std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -260,7 +270,7 @@ extern "system" fn buffer_callback_thunk(p_logfile: *mut Etw::EVENT_TRACE_LOGFIL
     })) {
         Ok(result) => result,
         Err(e) => {
-            log::error!("UNIMPLEMENTED PANIC: {e:?}");
+            log::error!("the buffer callback panicked, terminating the process: {e:?}");
             std::process::exit(1);
         },
     }

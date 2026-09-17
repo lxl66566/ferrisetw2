@@ -55,6 +55,20 @@
 //! ferrisetw may (very) occasionally write error log messages using the [`log`](https://docs.rs/log/latest/log/) crate.<br/>
 //! In case you want them to be printed to the console, your binary should use one of the various logger implementations. [`env_logger`](https://docs.rs/env_logger/latest/env_logger/) is one of them.<br/>
 //! You can have a look at how to use it in the `examples/` folder in the GitHub repository.
+//!
+//! # Callback panics
+//! The callbacks you register on a provider (see
+//! [`crate::provider::ProviderBuilder::add_callback`]) are invoked by Windows itself, on ETW
+//! delivery threads: a panic must not unwind across that FFI boundary, as unwinding into
+//! `extern "system"` native code is undefined behavior. ferrisetw therefore catches panics at
+//! that boundary, logs them through the [`log`](https://docs.rs/log/latest/log/) crate, and
+//! **terminates the process with exit code 1**: a callback that panicked midway may have left
+//! your own state (counters, aggregators, ...) inconsistent, so silently dropping the
+//! following events is not a safer outcome.
+//!
+//! In short, a panicking callback brings the whole process down by design. If your callbacks
+//! process untrusted or unexpected events, catch (and handle) the panics within the callback
+//! itself.
 
 #[macro_use]
 extern crate memoffset;
