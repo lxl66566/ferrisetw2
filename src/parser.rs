@@ -12,6 +12,7 @@ use windows::core::GUID;
 
 use crate::{
     native::{
+        DecodingSource,
         etw_types::event_record::EventRecord,
         sddl, tdh,
         tdh_types::{Property, PropertyCount, PropertyInfo, PropertyLength, TdhInType, TdhOutType},
@@ -105,6 +106,9 @@ struct CachedSlices<'schema, 'record> {
     next_probe: usize,
     /// The user buffer index we've cached up to
     last_cached_offset: usize,
+    /// Where the property values start within the user buffer, or `None`
+    /// when the buffer layout is not supported
+    data_start: Option<usize>,
 }
 
 /// Represents a Parser
@@ -164,7 +168,10 @@ impl<'schema, 'record> Parser<'schema, 'record> {
         Parser {
             record: event_record,
             properties: schema.properties(),
-            cache: RefCell::new(CachedSlices::default()),
+            cache: RefCell::new(CachedSlices {
+                data_start: property_values_start(event_record, schema),
+                ..Default::default()
+            }),
         }
     }
 
@@ -355,7 +362,15 @@ impl<'schema, 'record> Parser<'schema, 'record> {
         let Some(property) = self.properties.get(cache.slices.len()) else {
             return Err(ParserError::NotFound);
         };
-        let Some(remaining_user_buffer) = self.record.user_buffer().get(cache.last_cached_offset..)
+        let Some(data_start) = cache.data_start else {
+            return Err(ParserError::PropertyError(
+                "unsupported event layout: inline TraceLogging metadata".into(),
+            ));
+        };
+        let Some(remaining_user_buffer) = self
+            .record
+            .user_buffer()
+            .get(data_start + cache.last_cached_offset..)
         else {
             return Err(ParserError::PropertyError(
                 "Invalid buffer bounds".to_owned(),
@@ -437,6 +452,54 @@ impl<'schema, 'record> Parser<'schema, 'record> {
             buffer,
         })
     }
+}
+
+/// Offset of the first property value within the event's user buffer, or
+/// `None` for the unsupported inline TraceLogging metadata layout.
+///
+/// Self-describing (TraceLogging) events always carry their decoding metadata
+/// with the event, in one of two forms:
+///
+/// * Extended data items (`EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` and `PROV_TRAITS`), how the
+///   logger delivers real-time sessions and ETL replays: the user buffer then holds the property
+///   values only, starting at offset 0.
+/// * Embedded at the start of the user buffer, when the metadata descriptors could not be hoisted
+///   into extended data (raw descriptor layout): two tightly-packed blobs, each prefixed with its
+///   total `u16` size (itself included) — provider metadata, then event metadata
+///   (`_tlgProviderMetadata_t`/`_tlgEventMetadata_t` in TraceLoggingProvider.h) — followed by the
+///   property values.
+///
+/// TDH decodes the schema of both forms (`DecodingSource` is `Tlg` for
+/// either), but it only knows how to locate the metadata: `TdhGetProperty`
+/// and `TdhGetPropertySize` always compute property offsets from the start
+/// of the user buffer, i.e. they do not skip the embedded blobs either
+/// (verified against the real TDH: on such events both APIs return the
+/// metadata bytes as property data). Parsing values ourselves would silently
+/// report those bytes as property values, so the embedded layout is rejected
+/// with an explicit error instead of misread data.
+///
+/// The detection cannot misfire on a decodable event: a `Tlg` decoding
+/// source without those extended data items means TDH could only have found
+/// the schema in the embedded blobs (a record carrying the values alone
+/// fails to decode, so there is no schema cache path either).
+fn property_values_start(record: &EventRecord, schema: &Schema) -> Option<usize> {
+    use windows::Win32::System::Diagnostics::Etw::{
+        EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL, EVENT_HEADER_EXT_TYPE_PROV_TRAITS,
+    };
+
+    if !matches!(schema.decoding_source(), DecodingSource::DecodingSourceTlg) {
+        return Some(0);
+    }
+    let metadata_in_extended_data = record.extended_data().iter().any(|item| {
+        let ext_type = u32::from(item.data_type());
+        ext_type == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
+            || ext_type == EVENT_HEADER_EXT_TYPE_PROV_TRAITS
+    });
+    if metadata_in_extended_data {
+        return Some(0);
+    }
+
+    None
 }
 
 mod private {
@@ -1180,8 +1243,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use windows::Win32::System::Diagnostics::Etw;
+
     use super::*;
-    use crate::parser::test_support::{PropSpec, synthetic_record, synthetic_schema};
+    use crate::{
+        native::tdh::TraceEventInfo,
+        parser::test_support::{PropSpec, synthetic_record, synthetic_schema},
+    };
 
     #[test]
     fn parse_guid_property() {
@@ -1575,6 +1643,152 @@ mod tests {
         meta.push(field.in_type | u8::from(field.out_type.is_some()) << 7);
         meta.extend(field.out_type);
         meta
+    }
+
+    // ---- TraceLogging metadata location: embedded in the user data vs extended data ----
+
+    /// A synthetic TraceLogging event with its metadata embedded at the start
+    /// of the user data ([`tlg_user_data`] layout), decoded through the real
+    /// `TdhGetEventInformation`
+    fn tlg_record_and_schema(user_data: &[u8]) -> (EventRecord, Schema) {
+        // Header size and user data length always fit: synthetic test data
+        #[allow(clippy::cast_possible_truncation)]
+        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
+        let record = EventRecord(Etw::EVENT_RECORD {
+            EventHeader: Etw::EVENT_HEADER {
+                Size: header_size,
+                Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+                EventDescriptor: Etw::EVENT_DESCRIPTOR {
+                    Channel: 11, // TraceLogging channel
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            ..Default::default()
+        });
+        let info = TraceEventInfo::build_from_event(&record)
+            .expect("TDH should decode the synthetic TraceLogging event");
+        (record, Schema::new(info))
+    }
+
+    /// N32 (u32) then Str8 (counted ANSI string) field descriptors, and their
+    /// values, as laid out by TraceLogging
+    fn tlg_n32_str8() -> (Vec<u8>, Vec<u8>) {
+        let mut meta = b"N32\0".to_vec();
+        meta.push(tlg::IN_U32);
+        meta.extend_from_slice(b"Str8\0");
+        meta.push(tlg::IN_STR8 | 0x80);
+        meta.push(tlg::OUT_UTF8);
+
+        let mut values: Vec<u8> = 0x1122_3344u32.to_le_bytes().to_vec();
+        values.extend_from_slice(&[2, 0, b'h', b'i']); // counted ansi "hi"
+        (meta, values)
+    }
+
+    #[test]
+    fn embedded_tlg_metadata_is_rejected_instead_of_misread() {
+        use crate::parser::test_support::tlg_user_data;
+        // The layout of raw TraceLogging descriptors: the metadata blobs sit
+        // at the start of the user data. TDH decodes the schema but reads
+        // property offsets from the buffer start, so the metadata bytes would
+        // be silently reported as property values; parsing must fail loudly
+        // instead
+        let (meta, values) = tlg_n32_str8();
+        let user_data = tlg_user_data(&meta, &values);
+        let (record, schema) = tlg_record_and_schema(&user_data);
+
+        assert!(
+            matches!(schema.decoding_source(), DecodingSource::DecodingSourceTlg),
+            "TDH must recognize the event as TraceLogging for the detection to apply"
+        );
+
+        let parser = Parser::create(&record, &schema);
+        let err = parser
+            .try_parse::<u32>("N32")
+            .expect_err("the embedded metadata layout must not be parsed");
+        assert!(
+            matches!(err, ParserError::PropertyError(ref msg) if msg.contains("inline TraceLogging")),
+            "unexpected error: {err}"
+        );
+        assert!(parser.property_bytes_at(0).is_err());
+    }
+
+    #[test]
+    fn extended_data_tlg_metadata_parses_from_the_buffer_start() {
+        // The layout of real-time sessions and ETL replays: the metadata
+        // travels in extended data items and the user data holds the values
+        // only. This must keep parsing (no false positive from the embedded
+        // layout detection above)
+        let sized = |payload: &[u8]| -> Vec<u8> {
+            (u16::try_from(payload.len() + 2).unwrap())
+                .to_le_bytes()
+                .into_iter()
+                .chain(payload.iter().copied())
+                .collect()
+        };
+
+        let mut event_meta = vec![0u8]; // tags
+        event_meta.extend_from_slice(b"Event1\0Port\0");
+        event_meta.push(tlg::IN_U16);
+        let event_blob = sized(&event_meta);
+
+        let mut provider_blob = b"ferrisETW.TraceLoggingTest\0".to_vec();
+        provider_blob.push(0); // no trait
+        let provider_blob = sized(&provider_blob);
+
+        let user_data: Vec<u8> = vec![80, 0]; // the Port value
+
+        // Test data uses known-small ext type constants
+        #[allow(clippy::cast_possible_truncation)]
+        let ext_items = Box::new([
+            Etw::EVENT_HEADER_EXTENDED_DATA_ITEM {
+                ExtType: Etw::EVENT_HEADER_EXT_TYPE_PROV_TRAITS as u16,
+                DataSize: u16::try_from(provider_blob.len()).unwrap(),
+                DataPtr: provider_blob.as_ptr() as u64,
+                ..Default::default()
+            },
+            Etw::EVENT_HEADER_EXTENDED_DATA_ITEM {
+                ExtType: Etw::EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL as u16,
+                DataSize: u16::try_from(event_blob.len()).unwrap(),
+                DataPtr: event_blob.as_ptr() as u64,
+                ..Default::default()
+            },
+        ]);
+
+        // Header size and user data length always fit: synthetic test data
+        #[allow(clippy::cast_possible_truncation)]
+        let header_size = size_of::<Etw::EVENT_HEADER>() as u16;
+        let record = EventRecord(Etw::EVENT_RECORD {
+            EventHeader: Etw::EVENT_HEADER {
+                Size: header_size,
+                Flags: 0x0002, // EVENT_HEADER_FLAG_TRACE_MESSAGE
+                EventDescriptor: Etw::EVENT_DESCRIPTOR {
+                    Channel: 11, // TraceLogging channel
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ExtendedDataCount: 2,
+            ExtendedData: std::ptr::from_ref(&*ext_items)
+                .cast::<Etw::EVENT_HEADER_EXTENDED_DATA_ITEM>()
+                .cast_mut(),
+            UserData: user_data.as_ptr() as *mut _,
+            UserDataLength: u16::try_from(user_data.len()).unwrap(),
+            ..Default::default()
+        });
+        let info = TraceEventInfo::build_from_event(&record)
+            .expect("TDH should decode the extended data layout");
+        let schema = Schema::new(info);
+
+        assert!(matches!(
+            schema.decoding_source(),
+            DecodingSource::DecodingSourceTlg
+        ));
+
+        let parser = Parser::create(&record, &schema);
+        assert_eq!(parser.try_parse::<u16>("Port").unwrap(), 80);
     }
 
     /// Pins down how TDH maps TraceLogging metadata to its own in/out types:
