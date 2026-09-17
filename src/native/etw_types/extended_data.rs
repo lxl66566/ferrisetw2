@@ -55,21 +55,31 @@ where
 
     /// Builds a `StackTraceItem` from a raw extended data item
     ///
+    /// Returns `None` when `item_size` cannot hold the fixed part.
+    ///
     /// # Safety
     ///
-    /// `array_size` elements of `Address` must be readable from `first_address`
-    unsafe fn from_raw(
-        match_id: u64,
-        first_address: *const Address,
-        item_size: usize,
-    ) -> StackTraceItem<Address> {
-        let array_size_in_bytes = item_size.saturating_sub(OFFSET_OF_ADDRESS_IN_ITEM);
-        let array_size = array_size_in_bytes / size_of::<Address>();
-        let addresses = unsafe { std::slice::from_raw_parts(first_address, array_size) }.into();
-        StackTraceItem {
-            match_id,
-            addresses,
+    /// `item_size` bytes must be readable from `data_ptr`
+    unsafe fn from_raw(match_id: u64, data_ptr: *const u8, item_size: usize) -> Option<Self> {
+        let addresses_size = item_size.checked_sub(OFFSET_OF_ADDRESS_IN_ITEM)?;
+        let array_size = addresses_size / size_of::<Address>();
+        let first_address = unsafe {
+            // Safety: `item_size` bytes are readable, and the bound check above
+            // guarantees `OFFSET_OF_ADDRESS_IN_ITEM <= item_size`
+            data_ptr.add(OFFSET_OF_ADDRESS_IN_ITEM).cast::<Address>()
+        };
+        // The item sits in the packed event buffer, so the addresses are not
+        // necessarily aligned: copy them element-wise
+        let mut addresses = Vec::with_capacity(array_size);
+        for index in 0..array_size {
+            // Safety: `array_size * size_of::<Address>()` bytes fit in the
+            // readable blob, so `index` addresses to read
+            addresses.push(unsafe { first_address.add(index).read_unaligned() });
         }
+        Some(Self {
+            match_id,
+            addresses: addresses.into_boxed_slice(),
+        })
     }
 }
 
@@ -167,7 +177,9 @@ impl Sid {
 /// See <https://docs.microsoft.com/en-us/windows/win32/api/relogger/ns-relogger-event_header_extended_data_item>
 #[derive(Debug)]
 pub enum ExtendedDataItem {
-    /// Unexpected, invalid or not implemented yet
+    /// Unexpected, invalid (e.g. a declared size smaller than the item's
+    /// fixed part: untrusted input is dropped rather than read out of bounds)
+    /// or not implemented yet
     Unsupported,
     /// Related activity identifier
     RelatedActivityId(GUID),
@@ -207,6 +219,26 @@ impl EventHeaderExtendedDataItem {
         u32::from(self.0.ExtType) == EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL
     }
 
+    /// Reads a fixed-size value from the start of the item's blob, or `None`
+    /// when the declared `DataSize` cannot hold it.
+    ///
+    /// Extended data coming from an ETL file is untrusted input: an item too
+    /// short to hold its value is dropped rather than read out of bounds. The
+    /// value is read unaligned, as items are packed at the end of the event
+    /// buffer without padding.
+    ///
+    /// # Safety
+    ///
+    /// `DataSize` bytes must be readable from `DataPtr`
+    unsafe fn read_fixed<T>(&self) -> Option<T> {
+        if (self.0.DataSize as usize) < size_of::<T>() {
+            return None;
+        }
+        // Safety: DataPtr is non-null (checked by the caller) and holds at
+        // least `size_of::<T>()` bytes per the bound check above
+        Some(unsafe { (self.0.DataPtr as *const T).read_unaligned() })
+    }
+
     /// Returns this extended data as a variant of a Rust enum.
     // TODO: revisit this function
     #[must_use]
@@ -218,8 +250,10 @@ impl EventHeaderExtendedDataItem {
 
         match u32::from(self.0.ExtType) {
             EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID => {
-                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID>();
-                ExtendedDataItem::RelatedActivityId(unsafe { *data_ptr }.RelatedActivityId)
+                unsafe { self.read_fixed::<EVENT_EXTENDED_ITEM_RELATED_ACTIVITYID>() }
+                    .map_or(ExtendedDataItem::Unsupported, |item| {
+                        ExtendedDataItem::RelatedActivityId(item.RelatedActivityId)
+                    })
             },
 
             // A truncated SID (declared count larger than the data) is untrusted
@@ -231,44 +265,62 @@ impl EventHeaderExtendedDataItem {
             },
 
             EVENT_HEADER_EXT_TYPE_TS_ID => {
-                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_TS_ID>();
-                ExtendedDataItem::TsId(unsafe { *data_ptr }.SessionId)
+                unsafe { self.read_fixed::<EVENT_EXTENDED_ITEM_TS_ID>() }
+                    .map_or(ExtendedDataItem::Unsupported, |item| {
+                        ExtendedDataItem::TsId(item.SessionId)
+                    })
             },
 
             EVENT_HEADER_EXT_TYPE_INSTANCE_INFO => {
-                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_INSTANCE>();
-                ExtendedDataItem::InstanceInfo(unsafe { *data_ptr })
+                unsafe { self.read_fixed::<EVENT_EXTENDED_ITEM_INSTANCE>() }.map_or(
+                    ExtendedDataItem::Unsupported,
+                    ExtendedDataItem::InstanceInfo,
+                )
             },
 
             EVENT_HEADER_EXT_TYPE_STACK_TRACE32 => {
-                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_STACK_TRACE32>();
-                ExtendedDataItem::StackTrace32(unsafe {
-                    let match_id = (*data_ptr).MatchId;
-                    let first_address = &raw const (*data_ptr).Address[0];
-                    let item_size = self.0.DataSize as usize;
-                    StackTraceItem::from_raw(match_id, first_address, item_size)
-                })
+                let Some(match_id) = (unsafe { self.read_fixed::<u64>() }) else {
+                    return ExtendedDataItem::Unsupported;
+                };
+                // Safety: DataSize bytes are readable (read_fixed's contract)
+                unsafe {
+                    StackTraceItem::from_raw(
+                        match_id,
+                        data_ptr.cast::<u8>(),
+                        self.0.DataSize as usize,
+                    )
+                }
+                .map_or(
+                    ExtendedDataItem::Unsupported,
+                    ExtendedDataItem::StackTrace32,
+                )
             },
 
             EVENT_HEADER_EXT_TYPE_STACK_TRACE64 => {
-                let data_ptr = data_ptr.cast::<EVENT_EXTENDED_ITEM_STACK_TRACE64>();
-                ExtendedDataItem::StackTrace64(unsafe {
-                    let match_id = (*data_ptr).MatchId;
-                    let first_address = &raw const (*data_ptr).Address[0];
-                    let item_size = self.0.DataSize as usize;
-                    StackTraceItem::from_raw(match_id, first_address, item_size)
-                })
+                let Some(match_id) = (unsafe { self.read_fixed::<u64>() }) else {
+                    return ExtendedDataItem::Unsupported;
+                };
+                // Safety: DataSize bytes are readable (read_fixed's contract)
+                unsafe {
+                    StackTraceItem::from_raw(
+                        match_id,
+                        data_ptr.cast::<u8>(),
+                        self.0.DataSize as usize,
+                    )
+                }
+                .map_or(
+                    ExtendedDataItem::Unsupported,
+                    ExtendedDataItem::StackTrace64,
+                )
             },
 
-            EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY => {
-                let data_ptr = data_ptr.cast::<u64>();
-                ExtendedDataItem::ProcessStartKey(unsafe { *data_ptr })
-            },
+            EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY => unsafe { self.read_fixed::<u64>() }.map_or(
+                ExtendedDataItem::Unsupported,
+                ExtendedDataItem::ProcessStartKey,
+            ),
 
-            EVENT_HEADER_EXT_TYPE_EVENT_KEY => {
-                let data_ptr = data_ptr.cast::<u64>();
-                ExtendedDataItem::EventKey(unsafe { *data_ptr })
-            },
+            EVENT_HEADER_EXT_TYPE_EVENT_KEY => unsafe { self.read_fixed::<u64>() }
+                .map_or(ExtendedDataItem::Unsupported, ExtendedDataItem::EventKey),
 
             EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL => ExtendedDataItem::TraceLogging(
                 unsafe { self.get_event_name() }
@@ -284,9 +336,8 @@ impl EventHeaderExtendedDataItem {
                 ExtendedDataItem::ProvTraits(bytes.to_vec())
             },
 
-            EVENT_HEADER_EXT_TYPE_CONTAINER_ID => {
-                ExtendedDataItem::ContainerId(unsafe { *data_ptr.cast::<GUID>() })
-            },
+            EVENT_HEADER_EXT_TYPE_CONTAINER_ID => unsafe { self.read_fixed::<GUID>() }
+                .map_or(ExtendedDataItem::Unsupported, ExtendedDataItem::ContainerId),
 
             _ => ExtendedDataItem::Unsupported,
         }
@@ -303,6 +354,22 @@ impl EventHeaderExtendedDataItem {
             ExtType: ext_type as u16,
             DataSize: blob.len() as u16,
             DataPtr: blob.as_ptr() as u64,
+            ..Default::default()
+        })
+    }
+
+    /// Builds an item whose blob starts `offset` bytes into `blob` (unit tests
+    /// only: models the unaligned `DataPtr` of packed extended data)
+    ///
+    /// The blob must outlive the returned item
+    #[cfg(test)]
+    pub(crate) fn from_raw_parts_at(ext_type: u32, blob: &[u8], offset: usize) -> Self {
+        // Test inputs use known-small ext types and blobs
+        #[allow(clippy::cast_possible_truncation)]
+        Self(EVENT_HEADER_EXTENDED_DATA_ITEM {
+            ExtType: ext_type as u16,
+            DataSize: (blob.len() - offset) as u16,
+            DataPtr: blob[offset..].as_ptr() as u64,
             ..Default::default()
         })
     }
@@ -627,5 +694,228 @@ mod tests {
         };
 
         assert_eq!(container_id, guid);
+    }
+
+    #[test]
+    fn related_activity_id_is_parsed() {
+        let guid = GUID::from_u128(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10);
+
+        let ExtendedDataItem::RelatedActivityId(related) =
+            EventHeaderExtendedDataItem::from_raw_parts(
+                EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+                &guid_bytes(guid),
+            )
+            .to_extended_data_item()
+        else {
+            panic!("expected the RelatedActivityId variant");
+        };
+
+        assert_eq!(related, guid);
+    }
+
+    #[test]
+    fn ts_id_is_parsed() {
+        let blob = 7u32.to_le_bytes().to_vec();
+
+        let ExtendedDataItem::TsId(session_id) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_TS_ID, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the TsId variant");
+        };
+
+        assert_eq!(session_id, 7);
+    }
+
+    #[test]
+    fn instance_info_is_parsed() {
+        let parent = GUID::from_u128(0x00ff_11ee_22dd_33cc_44bb_55aa_6699_7788);
+        let mut blob = 42u32.to_le_bytes().to_vec();
+        blob.extend_from_slice(&4242u32.to_le_bytes());
+        blob.extend_from_slice(&guid_bytes(parent));
+
+        let ExtendedDataItem::InstanceInfo(info) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_INSTANCE_INFO, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the InstanceInfo variant");
+        };
+
+        assert_eq!(info.InstanceId, 42);
+        assert_eq!(info.ParentInstanceId, 4242);
+        assert_eq!(info.ParentGuid, parent);
+    }
+
+    #[test]
+    fn event_and_process_start_keys_are_parsed() {
+        let blob = 42u64.to_le_bytes().to_vec();
+        let item = EventHeaderExtendedDataItem::from_raw_parts;
+
+        let ExtendedDataItem::EventKey(event_key) =
+            item(EVENT_HEADER_EXT_TYPE_EVENT_KEY, &blob).to_extended_data_item()
+        else {
+            panic!("expected the EventKey variant");
+        };
+        assert_eq!(event_key, 42);
+
+        let ExtendedDataItem::ProcessStartKey(process_start_key) =
+            item(EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, &blob).to_extended_data_item()
+        else {
+            panic!("expected the ProcessStartKey variant");
+        };
+        assert_eq!(process_start_key, 42);
+    }
+
+    #[test]
+    fn stack_trace64_is_parsed() {
+        let mut blob = 0x1234_5678_9abc_def0u64.to_le_bytes().to_vec(); // MatchId
+        blob.extend_from_slice(&0x1000u64.to_le_bytes());
+        blob.extend_from_slice(&0x2000u64.to_le_bytes());
+
+        let ExtendedDataItem::StackTrace64(stack) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_STACK_TRACE64, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the StackTrace64 variant");
+        };
+
+        assert_eq!(stack.match_id(), 0x1234_5678_9abc_def0);
+        assert_eq!(stack.addresses(), &[0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn stack_trace32_is_parsed() {
+        let mut blob = 0xa5a5_a5a5_a5a5_a5a5u64.to_le_bytes().to_vec(); // MatchId
+        blob.extend_from_slice(&0x10u32.to_le_bytes());
+        blob.extend_from_slice(&0x20u32.to_le_bytes());
+
+        let ExtendedDataItem::StackTrace32(stack) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_STACK_TRACE32, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the StackTrace32 variant");
+        };
+
+        assert_eq!(stack.match_id(), 0xa5a5_a5a5_a5a5_a5a5);
+        assert_eq!(stack.addresses(), &[0x10, 0x20]);
+    }
+
+    #[test]
+    fn stack_trace_without_room_for_addresses_is_kept() {
+        // A stack trace holding only its MatchId is valid: no addresses yet
+        let blob = 7u64.to_le_bytes().to_vec();
+
+        let ExtendedDataItem::StackTrace64(stack) =
+            EventHeaderExtendedDataItem::from_raw_parts(EVENT_HEADER_EXT_TYPE_STACK_TRACE64, &blob)
+                .to_extended_data_item()
+        else {
+            panic!("expected the StackTrace64 variant");
+        };
+
+        assert_eq!(stack.match_id(), 7);
+        assert_eq!(stack.addresses(), &[] as &[u64]);
+    }
+
+    #[test]
+    fn short_fixed_size_items_are_dropped() {
+        // Each item is dropped when its declared size cannot hold the fixed
+        // part: the old code dereferenced the data pointer unchecked, reading
+        // past the buffer (untrusted input coming from ETL files)
+        let cases = [
+            (EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID, size_of::<GUID>()),
+            (EVENT_HEADER_EXT_TYPE_TS_ID, size_of::<u32>()),
+            (
+                EVENT_HEADER_EXT_TYPE_INSTANCE_INFO,
+                size_of::<EVENT_EXTENDED_ITEM_INSTANCE>(),
+            ),
+            // Stack traces only need room for their MatchId
+            (EVENT_HEADER_EXT_TYPE_STACK_TRACE32, size_of::<u64>()),
+            (EVENT_HEADER_EXT_TYPE_STACK_TRACE64, size_of::<u64>()),
+            (EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY, size_of::<u64>()),
+            (EVENT_HEADER_EXT_TYPE_EVENT_KEY, size_of::<u64>()),
+            (EVENT_HEADER_EXT_TYPE_CONTAINER_ID, size_of::<GUID>()),
+        ];
+
+        for (ext_type, fixed_size) in cases {
+            // The empty buffer, then one byte short of the fixed part
+            for size in [0, fixed_size - 1] {
+                let blob = vec![0u8; size];
+                assert!(
+                    matches!(
+                        EventHeaderExtendedDataItem::from_raw_parts(ext_type, &blob)
+                            .to_extended_data_item(),
+                        ExtendedDataItem::Unsupported
+                    ),
+                    "a {size}-byte item must be dropped"
+                );
+            }
+
+            // Exactly the fixed part parses (addresses may be empty)
+            let blob = vec![0u8; fixed_size];
+            assert!(
+                !matches!(
+                    EventHeaderExtendedDataItem::from_raw_parts(ext_type, &blob)
+                        .to_extended_data_item(),
+                    ExtendedDataItem::Unsupported
+                ),
+                "a {fixed_size}-byte item must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn unaligned_items_are_read_safely() {
+        // Extended data items are packed at the end of the event buffer, so
+        // DataPtr can sit at an odd offset (e.g. a GUID following a 4-byte SID)
+        let guid = GUID::from_u128(0x1122_3344_5566_7788_99aa_bbcc_ddee_ff00);
+        let mut blob = vec![0xaau8]; // forces the odd offset
+        blob.extend_from_slice(&guid_bytes(guid));
+
+        let ExtendedDataItem::RelatedActivityId(related) =
+            EventHeaderExtendedDataItem::from_raw_parts_at(
+                EVENT_HEADER_EXT_TYPE_RELATED_ACTIVITYID,
+                &blob,
+                1,
+            )
+            .to_extended_data_item()
+        else {
+            panic!("expected the RelatedActivityId variant");
+        };
+        assert_eq!(related, guid);
+
+        let mut blob = vec![0xaau8];
+        blob.extend_from_slice(&42u64.to_le_bytes());
+
+        let ExtendedDataItem::ProcessStartKey(key) =
+            EventHeaderExtendedDataItem::from_raw_parts_at(
+                EVENT_HEADER_EXT_TYPE_PROCESS_START_KEY,
+                &blob,
+                1,
+            )
+            .to_extended_data_item()
+        else {
+            panic!("expected the ProcessStartKey variant");
+        };
+        assert_eq!(key, 42);
+    }
+
+    #[test]
+    fn unaligned_stack_trace_addresses_are_read_safely() {
+        let mut blob = vec![0xaau8]; // forces the odd offset
+        blob.extend_from_slice(&0x42u64.to_le_bytes()); // MatchId
+        blob.extend_from_slice(&0x30u64.to_le_bytes());
+        blob.extend_from_slice(&0x40u64.to_le_bytes());
+
+        let ExtendedDataItem::StackTrace64(stack) = EventHeaderExtendedDataItem::from_raw_parts_at(
+            EVENT_HEADER_EXT_TYPE_STACK_TRACE64,
+            &blob,
+            1,
+        )
+        .to_extended_data_item() else {
+            panic!("expected the StackTrace64 variant");
+        };
+
+        assert_eq!(stack.match_id(), 0x42);
+        assert_eq!(stack.addresses(), &[0x30, 0x40]);
     }
 }
