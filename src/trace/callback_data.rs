@@ -12,12 +12,13 @@ use crate::{
 };
 
 /// Data used by callbacks when the trace is running
-// NOTE: this structure is accessed in an unsafe block in a separate thread (see the
-// `trace_callback_thunk` function). Thus, this struct must only be mutated through interior
-// mutability backed by a synchronization primitive (atomics, the provider registry's RwLock, ...)
-// when the associated trace is running. Providers can be added and removed while the trace
-// processes events (see `UserTrace::enable_provider`/`disable_provider`, issue #54): the registry
-// is guarded by a RwLock, and user callbacks are only ever invoked *without* holding it.
+// NOTE: this structure is accessed from the ETW delivery threads, through `Arc` clones handed
+// out by the context registry (see the `trace_callback_thunk` function). Thus, this struct must
+// only be mutated through interior mutability backed by a synchronization primitive (atomics,
+// the provider registry's RwLock, ...) when the associated trace is running. Providers can be
+// added and removed while the trace processes events (see
+// `UserTrace::enable_provider`/`disable_provider`, issue #54): the registry is guarded by a
+// RwLock, and user callbacks are only ever invoked *without* holding it.
 #[derive(Debug)]
 pub enum CallbackData {
     RealTime(RealTimeCallbackData),

@@ -11,6 +11,7 @@ use std::{
 };
 
 use once_cell::sync::Lazy;
+use rustc_hash::FxHashMap;
 use widestring::U16CStr;
 use windows::{
     Win32::{
@@ -59,40 +60,58 @@ pub enum EvntraceNativeError {
 
 pub(crate) type EvntraceNativeResult<T> = Result<T, EvntraceNativeError>;
 
+/// Registry of the callback context of every open trace
+///
 /// When a trace is closing, it is possible that every past events have not been processed yet.
 /// These events will still be fed to the callback, **after** the trace has been closed
 /// (see `ERROR_CTX_CLOSE_PENDING` in https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-closetrace#remarks)
 /// Also, there is no way to tell which callback invocation is the last one.
 ///
 /// But, we would like to free memory used by the callbacks when we're done!
-/// Since that is not possible, let's discard every callback run after we've called `CloseTrace`.
-/// That's the purpose of this set.
+/// The registry owns an `Arc` clone of every registered `CallbackData`, and the callbacks
+/// resolve their context through a single locked lookup, which validates the pointer and
+/// hands out an owned `Arc` clone in one step (`ContextRegistry::get`):
+/// * a callback that runs after `close_trace` removed the entry misses and drops the event
+/// * a callback that already got its `Arc` keeps the data alive, whatever the closing thread does
+///   in between (closing a trace while a callback is in flight is the normal case, not a race to
+///   defend against)
+/// * the data is freed by the last live `Arc` (registry entry, `Trace`, in-flight callbacks), which
+///   settles the memory-management half of <https://github.com/n4r1b/ferrisetw/issues/62> without
+///   waiting for the last buffered event
 ///
-/// Note: this must remain an external, pointer-keyed registry: `is_valid` runs
-/// when the pointed-to `CallbackData` may already be deallocated, so it is only
-/// sound as long as it never dereferences the pointer. (e.g. an `AtomicBool`
-/// embedded in `CallbackData` would be read after free)
+/// The context pointer itself is only ever compared to the keys, never dereferenced: the
+/// lookup runs when the pointed-to `CallbackData` may already be deallocated, so touching
+/// the pointee (e.g. reading an `AtomicBool` embedded in `CallbackData`) would be a
+/// use-after-free.
 ///
-/// TODO: it _might_ be possible to know whether we've processed the last buffered event.
-///       `ControlTraceW(EVENT_TRACE_CONTROL_QUERY)` (see `RealTimeTraceTrait::statistics`)
-///       and the buffer callback we install (see `buffer_callback_thunk`) both report
-///       session statistics, but neither tells us when the last callback of a closing trace
-///       has run, so callback memory is still discarded (rather than freed) after
-///       `CloseTrace`. That's <https://github.com/n4r1b/ferrisetw/issues/62>
-static UNIQUE_VALID_CONTEXTS: UniqueValidContexts = UniqueValidContexts::new();
-struct UniqueValidContexts(Lazy<RwLock<HashSet<u64>>>);
+/// Lock hierarchy: this registry is a leaf lock. It never nests with the provider registry's
+/// `RwLock` nor with the session-mutations `Mutex`: callbacks clone the `Arc` and release it
+/// before dispatching (so `on_event` never runs under it), and `open_trace`/`close_trace`
+/// hold it alone, never across an OS call.
+static CONTEXT_REGISTRY: ContextRegistry = ContextRegistry::new();
+struct ContextRegistry(Lazy<RwLock<FxHashMap<u64, Arc<CallbackData>>>>);
 enum ContextError {
     AlreadyExist,
 }
 
-impl UniqueValidContexts {
+impl ContextRegistry {
     pub const fn new() -> Self {
-        Self(Lazy::new(|| RwLock::new(HashSet::new())))
+        Self(Lazy::new(|| RwLock::new(FxHashMap::default())))
     }
 
     /// Insert if it did not exist previously
-    fn insert(&self, ctx_ptr: *const c_void) -> Result<(), ContextError> {
-        if self.0.write().unwrap().insert(ctx_ptr as u64) {
+    fn insert(
+        &self,
+        ctx_ptr: *const c_void,
+        callback_data: Arc<CallbackData>,
+    ) -> Result<(), ContextError> {
+        if self
+            .0
+            .write()
+            .unwrap()
+            .insert(ctx_ptr as u64, callback_data)
+            .is_none()
+        {
             Ok(())
         } else {
             Err(ContextError::AlreadyExist)
@@ -103,10 +122,13 @@ impl UniqueValidContexts {
         self.0.write().unwrap().remove(&(ctx_ptr as u64));
     }
 
-    pub fn is_valid(&self, ctx_ptr: *const c_void) -> bool {
-        // Read lock: every event takes this once, and concurrent events (from
-        // several ETW delivery threads) must not serialize on each other
-        self.0.read().unwrap().contains(&(ctx_ptr as u64))
+    /// Resolve a context pointer handed back by the ETW framework into an owned `Arc` clone
+    /// of the callback data, validating the pointer and keeping the data alive in one step
+    ///
+    /// Read lock: every event takes this once, and concurrent events (from several ETW
+    /// delivery threads) must not serialize on each other
+    pub fn get(&self, ctx_ptr: *const c_void) -> Option<Arc<CallbackData>> {
+        self.0.read().unwrap().get(&(ctx_ptr as u64)).cloned()
     }
 }
 
@@ -120,35 +142,13 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
         };
 
         if let Some(event_record) = record_from_ptr {
-            let p_user_context = event_record.user_context();
-            if !UNIQUE_VALID_CONTEXTS.is_valid(p_user_context) {
-                return;
-            }
-            let p_callback_data = p_user_context.cast::<Arc<CallbackData>>();
-            let callback_data = unsafe {
-                // Safety:
-                //  * the API of this create guarantees this points to a `CallbackData` already
-                //    allocated and created
-                //  * we've just checked using UNIQUE_VALID_CONTEXTS that this `CallbackData` has
-                //    not been dropped
-                //  * the API of this crate guarantees this `CallbackData` is not unsynchronizedly
-                //    mutated from another thread during the trace:
-                //      * we're the only one to change CallbackData::events_handled (and that's an
-                //        atomic, so it's fine)
-                //      * the provider registry may be mutated at any time (providers can be
-                //        enabled/disabled while the trace runs, issue #54), but only under its
-                //        RwLock, which `on_event` also takes (and it never holds it while running
-                //        user callbacks)
-                //      * the schema_locator only has interior mutability
-                p_callback_data.as_ref()
-            };
-            if let Some(callback_data) = callback_data {
-                // The UserContext is owned by the `Trace` object. When it is dropped, so will the
-                // UserContext. We clone it now, so that the original Arc can be
-                // safely dropped at all times, but the callback data (including the closure
-                // captured context) will still be alive until the callback ends.
-                let cloned_arc = Arc::clone(callback_data);
-                cloned_arc.on_event(event_record);
+            // The locked lookup validates the context and hands out an owned `Arc` in one
+            // step: from here on, the callback data is owned by this callback, and neither
+            // `close_trace` nor dropping the whole `Trace` can free it while it runs. The
+            // raw `UserContext` pointer is only ever compared to registry keys, never
+            // dereferenced.
+            if let Some(callback_data) = CONTEXT_REGISTRY.get(event_record.user_context()) {
+                callback_data.on_event(event_record);
             }
         }
     })) {
@@ -178,19 +178,12 @@ extern "system" fn buffer_callback_thunk(p_logfile: *mut Etw::EVENT_TRACE_LOGFIL
             &*p_logfile
         };
 
-        let p_user_context = log_file.Context;
-        if !UNIQUE_VALID_CONTEXTS.is_valid(p_user_context) {
-            return TRUE;
-        }
-        let p_callback_data = p_user_context.cast::<Arc<CallbackData>>();
-        let callback_data = unsafe {
-            // Safety: same soundness arguments as in `trace_callback_thunk`, plus the counters
-            // written by `on_buffer` are atomics
-            p_callback_data.as_ref()
-        };
+        // The locked lookup validates the context and hands out an owned `Arc` in one
+        // step (see `trace_callback_thunk`: neither `close_trace` nor dropping the
+        // `Trace` can free the callback data while this callback runs)
+        let callback_data = CONTEXT_REGISTRY.get(log_file.Context);
         if let Some(callback_data) = callback_data {
-            let cloned_arc = Arc::clone(callback_data);
-            cloned_arc.on_buffer(log_file.BuffersRead, log_file.EventsLost);
+            callback_data.on_buffer(log_file.BuffersRead, log_file.EventsLost);
         }
         TRUE
     })) {
@@ -286,7 +279,11 @@ pub(crate) fn open_trace(
         buffer_callback_thunk,
     );
 
-    if let Err(ContextError::AlreadyExist) = UNIQUE_VALID_CONTEXTS.insert(log_file.context_ptr()) {
+    // The registry keeps its own `Arc` clone: the callbacks will resolve their context
+    // through it, so the data outlives the closing of the trace if a callback is in flight
+    if let Err(ContextError::AlreadyExist) =
+        CONTEXT_REGISTRY.insert(log_file.context_ptr(), Arc::clone(callback_data))
+    {
         // Multiple consumers of the same session or ETL file are supported the
         // usual way: one `open_trace` (hence one context) per trace. Reusing a
         // single context for a second open is rejected on purpose: `close_trace`
@@ -311,7 +308,7 @@ pub(crate) fn open_trace(
         // The trace never ran: roll back the registry insertion. A stale entry would
         // make a future `open_trace` whose context lands on the same address fail
         // with a spurious `AlreadyExist`
-        UNIQUE_VALID_CONTEXTS.remove(log_file.context_ptr());
+        CONTEXT_REGISTRY.remove(log_file.context_ptr());
         Err(EvntraceNativeError::IoError(std::io::Error::last_os_error()))
     } else {
         Ok(trace_handle)
@@ -579,9 +576,10 @@ pub(crate) fn close_trace(
         None => Err(EvntraceNativeError::InvalidHandle),
         Some(handle) => {
             // By contruction, only one Provider used this context in its callback. It is safe to
-            // remove it, it won't be used by anyone else.
-            UNIQUE_VALID_CONTEXTS
-                .remove(std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>());
+            // remove it, it won't be used by anyone else. Any callback still in flight holds its
+            // own `Arc` clone (see `CONTEXT_REGISTRY`), and the ones that start after this miss
+            // the registry and drop their event.
+            CONTEXT_REGISTRY.remove(std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>());
 
             let status = unsafe { Etw::CloseTrace(handle) };
 
@@ -922,7 +920,11 @@ mod tests {
         // The failed open must not leave the address registered: a later trace whose
         // context lands on the same address would fail with a spurious AlreadyExist
         let ptr = std::ptr::from_ref(callback_data.as_ref()).cast::<c_void>();
-        assert!(UNIQUE_VALID_CONTEXTS.insert(ptr).is_ok());
-        UNIQUE_VALID_CONTEXTS.remove(ptr);
+        assert!(
+            CONTEXT_REGISTRY
+                .insert(ptr, Arc::clone(&callback_data))
+                .is_ok()
+        );
+        CONTEXT_REGISTRY.remove(ptr);
     }
 }
