@@ -757,27 +757,21 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'s
                         ));
                     }
 
-                    // std::slice::from_raw_parts requires a pointer to be aligned, but we can't
-                    // guarantee that the buffer is aligned. In testing, I found that the buffer
-                    // is in fact never aligned appropriately, so a cheap workaround is to copy
-                    // the buffer into a new Vec<u16> and use that as the source for the slice
-                    // until we can find a better solution.
-                    let mut aligned_buffer = Vec::with_capacity(prop_slice.buffer.len() / 2);
-                    for chunk in prop_slice.buffer.chunks_exact(2) {
-                        aligned_buffer.push(u16::from_ne_bytes(chunk.try_into().unwrap()));
-                    }
-
-                    let mut wide = aligned_buffer.as_slice();
-
                     // C semantics: the string ends at its first NUL. Top-level
                     // strings are sized up to that NUL, fixed-length structure
-                    // members may be NUL-padded past it
-                    if let Some(nul) = wide.iter().position(|&c| c == 0) {
-                        wide = &wide[..nul];
-                    }
+                    // members may be NUL-padded past it. The code units are
+                    // read straight from the event buffer: the event buffer
+                    // cannot be reinterpreted as an aligned &[u16], but
+                    // decode_utf16_lossy consumes an iterator, so no copy is
+                    // needed either
+                    let code_units = prop_slice
+                        .buffer
+                        .chunks_exact(2)
+                        .map(|chunk| u16::from_ne_bytes(chunk.try_into().unwrap()))
+                        .take_while(|&unit| unit != 0);
 
                     // Decode UTF-16 to String
-                    Ok(widestring::decode_utf16_lossy(wide.iter().copied()).collect::<String>())
+                    Ok(widestring::decode_utf16_lossy(code_units).collect::<String>())
                 },
                 TdhInType::InTypeAnsiString => {
                     let string = std::str::from_utf8(prop_slice.buffer)?;
@@ -2127,6 +2121,23 @@ mod tests {
             // property size computation
             assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
         }
+    }
+
+    /// A fixed-length wide member with no NUL at all decodes up to its whole
+    /// length (the terminator is optional within a fixed-size field)
+    #[test]
+    fn fixed_length_unicode_string_without_nul_decodes_to_its_full_length() {
+        let mut user_data: Vec<u8> = "ab".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&[
+            PropSpec::new("s", TdhInType::InTypeUnicodeString, 2),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ]);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(parser.try_parse::<String>("s").unwrap(), "ab");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
     }
 
     /// Array elements follow the same WCHAR-counting rule: length 3 with
