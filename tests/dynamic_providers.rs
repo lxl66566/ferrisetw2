@@ -7,9 +7,17 @@
 //! production is fully under the test's control (no dependency on external processes
 //! or on unrelated system activity). Every test gets its own provider GUID, so the
 //! tests can run in parallel without one test's events polluting another's counters.
-//! Assertions on event delivery use lower bounds and "no growth over a stable window"
-//! checks instead of exact counts, as delivery is asynchronous (buffers flush about
-//! once a second).
+//!
+//! Delivery is asynchronous (buffers flush about once a second), and the in-process
+//! providers learn about enable/disable *after the fact*, through an asynchronous ETW
+//! notification: `tlg::write_event!` silently no-ops until the enable notification
+//! arrives, and events written around a disable may still be delivered while it is in
+//! flight. Assertions on delivery therefore:
+//! * keep writing bursts until the delivery is observed, instead of writing a single burst and
+//!   waiting (a burst written too early after an enable is dropped for good),
+//! * use lower bounds and "no growth over a stable window" checks instead of exact counts,
+//! * only judge silence after a disable once a settling delay has absorbed the in-flight buffers
+//!   and the asynchronous disable notification.
 #![cfg(feature = "admin_tests")]
 
 use std::{
@@ -52,10 +60,15 @@ tlg::define_provider!(PROVIDER_STOPPED, "ferrisetw.DynamicProviders.Stopped");
 
 /// Number of events in each generation burst
 const EVENTS_PER_BATCH: usize = 4;
-/// Generous upper bound to wait for a burst of events to be delivered
+/// Pause between bursts of the write-until-observed loops
+const BURST_PAUSE: Duration = Duration::from_millis(250);
+/// Generous upper bound for the write-until-observed loops
 const EVENT_WAIT: Duration = Duration::from_secs(15);
 /// Duration without counter growth after which delivery is considered settled
-/// (a couple of flush timers, so in-flight buffers have been drained)
+/// (a couple of flush timers, so in-flight buffers have been drained). Also used
+/// as the settling delay before judging silence after a disable: the disable
+/// notification reaches the provider asynchronously, and bursts written before
+/// it arrives are still delivered.
 const STABLE_WINDOW: Duration = Duration::from_secs(2);
 
 /// Burst `count` events of a TraceLogging provider
@@ -66,6 +79,63 @@ macro_rules! write_events {
             tlg::write_event!($provider, "MatrixEvent", str8("Tag", "ferrisetw"));
         }
     };
+}
+
+/// Keep bursting events until `counter` reaches `min`, and return the value seen
+///
+/// The provider only learns that it has been (re-)enabled through an asynchronous
+/// ETW notification, and `tlg::write_event!` silently no-ops until then: a single
+/// burst written right after `enable_provider` may be dropped entirely, and no
+/// amount of waiting would bring it back. Writing bursts until delivery is
+/// observed (returning the current value on timeout) makes the check insensitive
+/// to that notification latency.
+// Must be defined after `write_events!` and before its use sites: `macro_rules!`
+// is textually scoped
+macro_rules! write_until_count {
+    ($provider:ident, $counter:expr, $min:expr, $timeout:expr) => {{
+        let deadline = Instant::now() + $timeout;
+        loop {
+            write_events!($provider, EVENTS_PER_BATCH);
+            let value = $counter.load(Ordering::SeqCst);
+            if value >= $min || Instant::now() >= deadline {
+                break value;
+            }
+            std::thread::sleep(BURST_PAUSE);
+        }
+    }};
+}
+
+/// Keep bursting events until delivery has been quiet for [`STABLE_WINDOW`], and
+/// return the count at that point
+///
+/// Used after a disable: growth right after the call is legitimate (in-flight
+/// buffers, and bursts written before the asynchronous disable notification
+/// reached the provider), but once everything has drained, the very bursts this
+/// loop keeps writing must no longer be delivered. If they still are, the count
+/// never goes quiet and the latest value is returned on timeout for the caller
+/// to assert on.
+// Must be defined after `write_events!` and before its use sites: `macro_rules!`
+// is textually scoped
+macro_rules! write_until_quiet {
+    ($provider:ident, $counter:expr, $timeout:expr) => {{
+        let deadline = Instant::now() + $timeout;
+        let mut last = $counter.load(Ordering::SeqCst);
+        let mut last_change = Instant::now();
+        loop {
+            if Instant::now() >= deadline {
+                break last;
+            }
+            write_events!($provider, EVENTS_PER_BATCH);
+            std::thread::sleep(BURST_PAUSE);
+            let value = $counter.load(Ordering::SeqCst);
+            if value != last {
+                last = value;
+                last_change = Instant::now();
+            } else if last_change.elapsed() >= STABLE_WINDOW {
+                break last;
+            }
+        }
+    }};
 }
 
 #[test]
@@ -82,32 +152,39 @@ fn provider_can_be_enabled_disabled_and_re_enabled_at_runtime() {
         .enable_provider(counting_provider(guid, Arc::clone(&counter)))
         .unwrap();
     assert_eq!(trace.providers().len(), 1);
-    write_events!(PROVIDER_LIFECYCLE, EVENTS_PER_BATCH);
-    let seen = wait_for_count(&counter, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen = write_until_count!(PROVIDER_LIFECYCLE, counter, EVENTS_PER_BATCH, EVENT_WAIT);
     assert!(
         seen >= EVENTS_PER_BATCH,
         "no event after enable (saw {seen})"
     );
-    let settled = wait_until_stable(&counter, EVENT_WAIT);
 
-    // disable -> events written after disable_provider returns stop flowing
+    // disable -> events written after disable stop flowing
     assert_eq!(trace.disable_provider(guid).unwrap(), 1);
     assert!(trace.providers().is_empty());
-    write_events!(PROVIDER_LIFECYCLE, EVENTS_PER_BATCH);
-    let after = wait_until_stable(&counter, EVENT_WAIT);
-    assert_eq!(after, settled, "events delivered after disable");
+    // In-flight buffers are still delivered after the call returns, and the
+    // provider keeps delivering bursts written before the asynchronous disable
+    // notification reached it: let both drain before capturing the baseline,
+    // or the silence check below would be a race
+    std::thread::sleep(STABLE_WINDOW);
+    let silenced = wait_until_stable(&counter, EVENT_WAIT);
+    let quiet = write_until_quiet!(PROVIDER_LIFECYCLE, counter, EVENT_WAIT);
+    assert_eq!(quiet, silenced, "events delivered after disable");
 
     // re-enable -> events flow again
     trace
         .enable_provider(counting_provider(guid, Arc::clone(&counter)))
         .unwrap();
     assert_eq!(trace.providers().len(), 1);
-    write_events!(PROVIDER_LIFECYCLE, EVENTS_PER_BATCH);
-    let seen = wait_for_count(&counter, settled + EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen = write_until_count!(
+        PROVIDER_LIFECYCLE,
+        counter,
+        quiet + EVENTS_PER_BATCH,
+        EVENT_WAIT
+    );
     assert!(
-        seen >= settled + EVENTS_PER_BATCH,
+        seen >= quiet + EVENTS_PER_BATCH,
         "no event after re-enable (saw {seen}, want at least {})",
-        settled + EVENTS_PER_BATCH
+        quiet + EVENTS_PER_BATCH
     );
 
     trace.stop().unwrap();
@@ -133,32 +210,47 @@ fn providers_are_enabled_and_disabled_independently() {
         .unwrap();
     assert_eq!(trace.providers().len(), 2);
 
-    write_events!(PROVIDER_INDEPENDENT_A, EVENTS_PER_BATCH);
-    write_events!(PROVIDER_INDEPENDENT_B, EVENTS_PER_BATCH);
     // Sanity check: a provider that never delivered would make the
     // "no event after disable" assertions below pass vacuously
-    let seen_a = wait_for_count(&counter_a, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen_a = write_until_count!(
+        PROVIDER_INDEPENDENT_A,
+        counter_a,
+        EVENTS_PER_BATCH,
+        EVENT_WAIT
+    );
     assert!(
         seen_a >= EVENTS_PER_BATCH,
         "A never delivered while enabled (saw {seen_a})"
     );
-    let seen_b = wait_for_count(&counter_b, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen_b = write_until_count!(
+        PROVIDER_INDEPENDENT_B,
+        counter_b,
+        EVENTS_PER_BATCH,
+        EVENT_WAIT
+    );
     assert!(
         seen_b >= EVENTS_PER_BATCH,
         "B never delivered while enabled (saw {seen_b})"
     );
-    let settled_a = wait_until_stable(&counter_a, EVENT_WAIT);
     let settled_b = wait_until_stable(&counter_b, EVENT_WAIT);
 
     // Disabling A must not disturb B
     assert_eq!(trace.disable_provider(guids.independent_a).unwrap(), 1);
     assert_eq!(trace.providers().len(), 1);
-    write_events!(PROVIDER_INDEPENDENT_A, EVENTS_PER_BATCH);
-    write_events!(PROVIDER_INDEPENDENT_B, EVENTS_PER_BATCH);
-    let after_a = wait_until_stable(&counter_a, EVENT_WAIT);
-    let seen_b = wait_for_count(&counter_b, settled_b + EVENTS_PER_BATCH, EVENT_WAIT);
+    // Let A's in-flight buffers and the asynchronous disable notification drain
+    // before capturing the baseline (same rationale as the lifecycle test)
+    std::thread::sleep(STABLE_WINDOW);
+    let silenced_a = wait_until_stable(&counter_a, EVENT_WAIT);
+    // A keeps being written to, and must stay silent, while B is checked
+    let quiet_a = write_until_quiet!(PROVIDER_INDEPENDENT_A, counter_a, EVENT_WAIT);
+    let seen_b = write_until_count!(
+        PROVIDER_INDEPENDENT_B,
+        counter_b,
+        settled_b + EVENTS_PER_BATCH,
+        EVENT_WAIT
+    );
     assert_eq!(
-        after_a, settled_a,
+        quiet_a, silenced_a,
         "A events delivered after A was disabled"
     );
     assert!(
@@ -174,11 +266,14 @@ fn providers_are_enabled_and_disabled_independently() {
         ))
         .unwrap();
     assert_eq!(trace.providers().len(), 2);
-    write_events!(PROVIDER_INDEPENDENT_A, EVENTS_PER_BATCH);
-    write_events!(PROVIDER_INDEPENDENT_B, EVENTS_PER_BATCH);
-    let seen_a = wait_for_count(&counter_a, settled_a + EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen_a = write_until_count!(
+        PROVIDER_INDEPENDENT_A,
+        counter_a,
+        quiet_a + EVENTS_PER_BATCH,
+        EVENT_WAIT
+    );
     assert!(
-        seen_a >= settled_a + EVENTS_PER_BATCH,
+        seen_a >= quiet_a + EVENTS_PER_BATCH,
         "A did not resume after re-enable"
     );
 
@@ -196,8 +291,7 @@ fn statistics_stay_consistent_while_providers_come_and_go() {
         .start_and_process()
         .unwrap();
 
-    write_events!(PROVIDER_STATS_A, EVENTS_PER_BATCH);
-    let seen_a = wait_for_count(&counter_a, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen_a = write_until_count!(PROVIDER_STATS_A, counter_a, EVENTS_PER_BATCH, EVENT_WAIT);
     assert!(
         seen_a >= EVENTS_PER_BATCH,
         "A never delivered while enabled (saw {seen_a})"
@@ -210,8 +304,7 @@ fn statistics_stay_consistent_while_providers_come_and_go() {
     trace
         .enable_provider(counting_provider(guids.stats_b, Arc::clone(&counter_b)))
         .unwrap();
-    write_events!(PROVIDER_STATS_B, EVENTS_PER_BATCH);
-    let seen_b = wait_for_count(&counter_b, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen_b = write_until_count!(PROVIDER_STATS_B, counter_b, EVENTS_PER_BATCH, EVENT_WAIT);
     assert!(
         seen_b >= EVENTS_PER_BATCH,
         "B never delivered while enabled (saw {seen_b})"
@@ -307,8 +400,7 @@ fn provider_controls_fail_after_the_session_stopped() {
         .enable(counting_provider(guid, Arc::clone(&counter)))
         .start_and_process()
         .unwrap();
-    write_events!(PROVIDER_STOPPED, EVENTS_PER_BATCH);
-    let seen = wait_for_count(&counter, EVENTS_PER_BATCH, EVENT_WAIT);
+    let seen = write_until_count!(PROVIDER_STOPPED, counter, EVENTS_PER_BATCH, EVENT_WAIT);
     assert!(
         seen >= EVENTS_PER_BATCH,
         "sanity check failed: session never delivered"
@@ -389,20 +481,6 @@ fn guid_from_name(name: &str) -> GUID {
     let bytes = tlg::Guid::from_name(name).to_utf8_bytes();
     let text = std::str::from_utf8(&bytes).unwrap();
     text.try_into().unwrap()
-}
-
-/// Wait until the counter reaches `min`, and return the value seen at that time
-///
-/// Returns the current value on timeout: the caller asserts on the lower bound.
-fn wait_for_count(counter: &AtomicUsize, min: usize, timeout: Duration) -> usize {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let value = counter.load(Ordering::SeqCst);
-        if value >= min || Instant::now() >= deadline {
-            return value;
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// Wait until the counter has not grown for [`STABLE_WINDOW`], and return its value
