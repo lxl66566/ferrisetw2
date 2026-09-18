@@ -189,7 +189,7 @@ impl Property {
                 }
                 match length {
                     PropertyLength::Length(l) if *l > 0 => {
-                        Some(in_type.schema_length_bytes(usize::from(*l)))
+                        Some(in_type.literal_schema_length_bytes(*l))
                     },
                     // A zero length means "ask TDH" for a top-level property;
                     // inside a structure it marks a variable-length member —
@@ -210,7 +210,7 @@ impl Property {
                 } else {
                     match length {
                         PropertyLength::Length(l) if *l > 0 => {
-                            in_type.schema_length_bytes(usize::from(*l))
+                            in_type.literal_schema_length_bytes(*l)
                         },
                         PropertyLength::Length(_) => in_type.fixed_size()?,
                         PropertyLength::Index(_) => return None,
@@ -220,7 +220,7 @@ impl Property {
                     PropertyCount::Count(c) => *c as usize,
                     PropertyCount::Index(_) => return None,
                 };
-                Some(elem * count)
+                elem.checked_mul(count)
             },
             PropertyInfo::Struct { members } => {
                 members.iter().map(|m| m.fixed_size(pointer_size)).sum()
@@ -234,7 +234,7 @@ impl Property {
                     PropertyCount::Count(c) => *c as usize,
                     PropertyCount::Index(_) => return None,
                 };
-                Some(elem * count)
+                elem.checked_mul(count)
             },
             PropertyInfo::Unsupported { length } => match length {
                 PropertyLength::Length(l) if *l > 0 => Some(*l as usize),
@@ -421,11 +421,22 @@ impl TdhInType {
     /// manifest/WBEM schemas, which cannot be installed without elevation.
     /// krabsetw, from which this crate's sizing code originally came, reads
     /// the length as bytes too and shares the issue.
-    pub(crate) fn schema_length_bytes(self, length: usize) -> usize {
+    ///
+    /// The conversion is checked: `length` may be a raw carrier value read
+    /// from the event (length by reference), and a wrapped-around size would
+    /// silently misalign every following property
+    pub(crate) fn schema_length_bytes(self, length: usize) -> Option<usize> {
         match self {
-            Self::InTypeUnicodeString => length * 2,
-            _ => length,
+            Self::InTypeUnicodeString => length.checked_mul(2),
+            _ => Some(length),
         }
+    }
+
+    /// Same conversion for an `EVENT_PROPERTY_INFO` literal: a u16 length
+    /// cannot overflow any usize, so the result is infallible
+    pub(crate) fn literal_schema_length_bytes(self, length: u16) -> usize {
+        self.schema_length_bytes(usize::from(length))
+            .expect("a u16 schema length cannot overflow a usize")
     }
 
     /// Fixed byte size of the in types whose size follows from the in type

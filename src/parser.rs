@@ -215,21 +215,29 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 // in the same unit as a literal length (WCHARs/BYTEs per in
                 // type), and fixed-size in types ignore the length property
                 // entirely, whatever its form
-                let prop_len = match length {
-                    PropertyLength::Length(l) => usize::from(l),
+                match length {
+                    // A literal length is u16: the unit conversion cannot overflow
+                    PropertyLength::Length(l) if l > 0 => {
+                        return Ok(in_type.literal_schema_length_bytes(l));
+                    },
                     PropertyLength::Index(index) => {
                         if let Some(size) = in_type.fixed_size() {
                             return Ok(size);
                         }
-                        match index_value(index) {
-                            Some(len) => return Ok(in_type.schema_length_bytes(len)),
-                            None => return self.tdh_property_size(property),
-                        }
+                        // The carrier value is raw event data: when the unit
+                        // conversion overflows, defer to TDH (which rejects
+                        // absurd sizes) instead of wrapping the size around —
+                        // a wrapped size would silently misalign every
+                        // following property
+                        return match index_value(index)
+                            .and_then(|len| in_type.schema_length_bytes(len))
+                        {
+                            Some(size) => Ok(size),
+                            None => self.tdh_property_size(property),
+                        };
                     },
-                };
-
-                if prop_len > 0 {
-                    return Ok(in_type.schema_length_bytes(prop_len));
+                    // A zero literal length: the size follows from the type below
+                    PropertyLength::Length(_) => (),
                 }
 
                 // Length is not set. We'll have to ask TDH for the right length.
@@ -346,10 +354,10 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                         match length {
                             PropertyLength::Length(0) => in_type.fixed_size(),
                             PropertyLength::Length(l) => {
-                                Some(in_type.schema_length_bytes(usize::from(l)))
+                                Some(in_type.literal_schema_length_bytes(l))
                             },
                             PropertyLength::Index(index) => in_type.fixed_size().or_else(|| {
-                                index_value(index).map(|len| in_type.schema_length_bytes(len))
+                                index_value(index).and_then(|len| in_type.schema_length_bytes(len))
                             }),
                         }
                     };
@@ -362,8 +370,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                     },
                 };
 
-                match elem_size {
-                    Some(elem) => Ok(elem * element_count),
+                // The element count may be a raw carrier value: an overflow
+                // defers to TDH (which rejects absurd sizes) instead of
+                // wrapping the total size around
+                match elem_size.and_then(|elem| elem.checked_mul(element_count)) {
+                    Some(size) => Ok(size),
                     // An empty array occupies no bytes even when its elements
                     // are variable-length (e.g. NUL-terminated strings)
                     None if element_count == 0 => Ok(0),
@@ -394,7 +405,11 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                             .sum::<Option<usize>>(),
                         index_value(*index),
                     ) {
-                        return Ok(elem * count);
+                        // The count carrier is raw event data: an overflow defers
+                        // to TDH instead of wrapping the size around
+                        if let Some(size) = elem.checked_mul(count) {
+                            return Ok(size);
+                        }
                     }
                 }
                 self.tdh_property_size(property)
@@ -1775,6 +1790,71 @@ mod tests {
 
         assert!(matches!(
             parser.try_parse::<u32>("arr"),
+            Err(ParserError::TdhNativeError(_))
+        ));
+    }
+
+    /// A carrier value so large that the unit conversion overflows must defer
+    /// to TDH (which fails on synthetic records) instead of wrapping the size
+    /// around: a wrapped size would silently misalign every following property
+    #[test]
+    fn overflowing_length_reference_defers_to_tdh() {
+        static PROPS: [PropSpec; 2] =
+            [PropSpec::new("len", TdhInType::InTypeUInt64, 8), PropSpec {
+                flags: PropertyFlags::PROPERTY_PARAM_LENGTH.bits(),
+                length: 0, // aliases lengthPropertyIndex
+                ..PropSpec::new("s", TdhInType::InTypeUnicodeString, 0)
+            }];
+        // len * 2 wraps around to 0 on a 64-bit usize
+        let record = synthetic_record(&0x8000_0000_0000_0000u64.to_ne_bytes());
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert!(matches!(
+            parser.try_parse::<String>("s"),
+            Err(ParserError::TdhNativeError(_))
+        ));
+    }
+
+    /// Same contract for an array whose element count travels by reference:
+    /// the element-size-by-count product must not wrap around
+    #[test]
+    fn overflowing_count_reference_defers_to_tdh() {
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("count", TdhInType::InTypeUInt64, 8),
+            PropSpec {
+                count: 0, // aliases countPropertyIndex
+                flags: PropertyFlags::PROPERTY_PARAM_COUNT.bits(),
+                ..PropSpec::new("arr", TdhInType::InTypeUInt64, 8)
+            },
+        ];
+        // 8 * u64::MAX overflows the usize total
+        let record = synthetic_record(&u64::MAX.to_ne_bytes());
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert!(matches!(
+            parser.property_bytes_at(1),
+            Err(ParserError::TdhNativeError(_))
+        ));
+    }
+
+    /// Same contract for a GCBulk-style structure array whose element count
+    /// travels by reference
+    #[test]
+    fn overflowing_struct_array_count_defers_to_tdh() {
+        static MEMBERS: [PropSpec; 1] = [PropSpec::new("v", TdhInType::InTypeUInt64, 8)];
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("count", TdhInType::InTypeUInt64, 8),
+            PropSpec::structure_array("items", &MEMBERS, 0),
+        ];
+        // 8 (member size) * u64::MAX overflows the usize total
+        let record = synthetic_record(&u64::MAX.to_ne_bytes());
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert!(matches!(
+            parser.property_bytes_at(1),
             Err(ParserError::TdhNativeError(_))
         ));
     }
