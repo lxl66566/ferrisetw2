@@ -240,9 +240,10 @@ extern "system" fn trace_callback_thunk(p_record: *mut Etw::EVENT_RECORD) {
 
 /// This will be called by the ETW framework after each buffer has been processed
 ///
-/// The `BuffersRead` and `EventsLost` fields of the given log file are valid at this point:
-/// they are recorded so that a running trace can be monitored for lost events (see
-/// `TraceTrait::events_lost`)
+/// The `BuffersRead` field of the given log file is valid at this point. `EventsLost` is
+/// recorded too, but the Windows documentation marks it as "not used": the resulting
+/// `TraceTrait::events_lost` counter usually stays at 0, and loss monitoring should rely on
+/// the session-side statistics instead
 ///
 /// Like `trace_callback_thunk`, this must never unwind into Windows: a panic here
 /// terminates the process (see the crate-level "Callback panics" section).
@@ -633,9 +634,11 @@ pub(crate) fn control_trace_by_name(
 /// `impl Drop`), because I'm not sure how sensible it is to call other methods (apart from `stop`)
 /// afterwards
 ///
-/// In case ETW reports there are still events in the queue that are still to trigger callbacks,
-/// this returns Ok(true).<br/> If no further event callback will be invoked, this returns
-/// Ok(false)<br/> On error, this returns an `Err`
+/// Returns `Ok(true)` when the close is pending because events are still queued in the consumer
+/// session (`ERROR_CTX_CLOSE_PENDING`), `Ok(false)` when no further event will be processed. Those
+/// queued events still reach the thunks, but the context is retired before the close, so they are
+/// dropped instead of dispatched; callbacks already in flight keep running on their own `Arc`
+/// clone (see the module-level documentation). On error, this returns an `Err`
 pub(crate) fn close_trace(
     trace_handle: TraceHandle,
     context: &TraceContext,
@@ -652,7 +655,8 @@ pub(crate) fn close_trace(
 
             match status {
                 ERROR_SUCCESS => Ok(false),
-                // Events are still queued: they will still trigger the callbacks
+                // Events are still queued: they will reach the thunks, which
+                // drop them (the context is already retired)
                 ERROR_CTX_CLOSE_PENDING => Ok(true),
                 other => Err(win32_error(other)),
             }

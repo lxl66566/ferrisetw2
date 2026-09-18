@@ -216,11 +216,14 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                 // type), and fixed-size in types ignore the length property
                 // entirely, whatever its form
                 match length {
-                    // A literal length is u16: the unit conversion cannot overflow
-                    PropertyLength::Length(l) if l > 0 => {
+                    // A literal length is u16: the unit conversion cannot
+                    // overflow. Content-sized in types determine their size
+                    // from the field bytes themselves: tdh.h says their
+                    // length property must be ignored, in either form
+                    PropertyLength::Length(l) if l > 0 && !in_type.is_content_sized() => {
                         return Ok(in_type.literal_schema_length_bytes(l));
                     },
-                    PropertyLength::Index(index) => {
+                    PropertyLength::Index(index) if !in_type.is_content_sized() => {
                         if let Some(size) = in_type.fixed_size() {
                             return Ok(size);
                         }
@@ -236,11 +239,12 @@ impl<'schema, 'record> Parser<'schema, 'record> {
                             None => self.tdh_property_size(property),
                         };
                     },
-                    // A zero literal length: the size follows from the type below
-                    PropertyLength::Length(_) => (),
+                    // A zero literal length, or a content-sized type: the
+                    // size follows from the type below
+                    _ => (),
                 }
 
-                // Length is not set. We'll have to ask TDH for the right length.
+                // No usable length. We'll have to ask TDH for the right length.
                 // However, before doing so, there are some cases where we could determine
                 // ourselves. The following _very_ common property types can be
                 // short-circuited to prevent the expensive call. (that's taken from
@@ -868,6 +872,19 @@ impl<'schema, 'record> private::TryParse<'schema, 'record, String> for Parser<'s
                     Ok(string.trim_matches(char::default()).to_string())
                 },
                 TdhInType::InTypeSid | TdhInType::InTypeWbemSid => {
+                    // ConvertSidToStringSidA takes no length: it reads
+                    // 8 + 4 * SubAuthorityCount bytes, so anything shorter
+                    // than the header advertises must be rejected before the
+                    // Win32 read runs past the property bytes
+                    let expected = prop_slice
+                        .buffer
+                        .get(1)
+                        .map_or(usize::MAX, |c| 8 + 4 * usize::from(*c));
+                    if prop_slice.buffer.len() < expected {
+                        return Err(ParserError::PropertyError(
+                            "SID property is truncated".into(),
+                        ));
+                    }
                     let string = sddl::convert_sid_to_string(prop_slice.buffer.as_ptr().cast())?;
                     Ok(string)
                 },
@@ -1856,6 +1873,76 @@ mod tests {
         assert!(matches!(
             parser.property_bytes_at(1),
             Err(ParserError::TdhNativeError(_))
+        ));
+    }
+
+    /// tdh.h: the counted families determine their size from their count
+    /// prefix, and their length property "must be ignored": a declared
+    /// length (only a malformed WBEM/MOF schema can carry one) must not
+    /// desync the walk from the content size
+    #[test]
+    fn counted_string_ignores_the_declared_length() {
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("cs", TdhInType::InTypeCountedString, 4),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        // Prefix says 6 payload bytes ("abc" in UTF-16), the schema says 4
+        let mut user_data: Vec<u8> = 6u16.to_ne_bytes().to_vec();
+        user_data.extend(b"abc".iter().flat_map(|b| [*b, 0]));
+        user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        // The walk consumed the 2-byte prefix + 6 payload bytes: the u32
+        // behind them stays aligned
+        assert_eq!(parser.try_parse::<String>("cs").unwrap(), "abc");
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// Same tdh.h rule for SID fields: the size comes from the header (8 +
+    /// 4 bytes per sub-authority), a declared length must not shrink the
+    /// walk and misalign the following property
+    #[test]
+    fn sid_ignores_the_declared_length() {
+        static PROPS: [PropSpec; 2] = [
+            PropSpec::new("sid", TdhInType::InTypeSid, 16),
+            PropSpec::new("n", TdhInType::InTypeUInt32, 4),
+        ];
+        // S-1-5-21-100-200-300: revision, 4 sub-authorities, 24 bytes —
+        // the schema claims 16
+        let sid = [
+            0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x15, 0x00, 0x00, 0x00, 0x64, 0x00,
+            0x00, 0x00, 0xc8, 0x00, 0x00, 0x00, 0x2c, 0x01, 0x00, 0x00,
+        ];
+        let mut user_data = sid.to_vec();
+        user_data.extend_from_slice(&0x1122_3344u32.to_ne_bytes());
+        let record = synthetic_record(&user_data);
+        let schema = synthetic_schema(&PROPS);
+        let parser = Parser::create(&record, &schema);
+
+        assert_eq!(
+            parser.try_parse::<String>("sid").unwrap(),
+            "S-1-5-21-100-200-300"
+        );
+        assert_eq!(parser.try_parse::<u32>("n").unwrap(), 0x1122_3344);
+    }
+
+    /// A SID slice shorter than its header claims must be rejected before
+    /// `ConvertSidToStringSidA` reads past it. The walk sizes content-defined
+    /// fields from their bytes, so this guard covers slices carved out
+    /// elsewhere, e.g. array elements with a declared stride
+    #[test]
+    fn sid_slice_shorter_than_its_header_is_rejected() {
+        let record = synthetic_record(&[]);
+        let schema = synthetic_schema(&[PropSpec::new("sid", TdhInType::InTypeSid, 0)]);
+        let parser = Parser::create(&record, &schema);
+
+        // The header claims 2 sub-authorities (16 bytes), only 8 are present
+        let bytes = [0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        assert!(matches!(
+            parser.try_parse_member::<String>(&schema.properties()[0], &bytes),
+            Err(ParserError::PropertyError(_))
         ));
     }
 

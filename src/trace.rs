@@ -110,8 +110,9 @@ const PERF_INFO_GUID: GUID = GUID::from_values(0xce1d_bfb4, 0x137e, 0x4da6, [
 /// **consumer-side** counters exposed by [`TraceTrait::events_handled`] and
 /// [`TraceTrait::buffers_read`] are a complementary view of the same session.
 ///
-/// A [`FileTrace`] has no session handle, so it does not offer this query; the loss counters
-/// recorded in an ETL file are reported to it through [`TraceTrait::events_lost`].
+/// A [`FileTrace`] has no session handle, so it does not offer this query; its consumer-side
+/// [`TraceTrait::events_lost`] counter is fed from a field the Windows documentation marks
+/// as "not used", so it is no substitute for the logger-side view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TraceStatistics {
     /// Number of events the session has dropped because no buffer was available to hold them
@@ -432,12 +433,10 @@ pub trait TraceTrait: PrivateTraceTrait + Sized {
 
     /// How many events the ETW framework reported as lost while consuming this trace
     ///
-    /// For a real-time trace, this catches events the session dropped (e.g. events logged
-    /// while the consumer was not attached, or too slow to drain the buffers). For an ETL
-    /// [`FileTrace`], this is the lost-events count recorded when the file was written.
-    ///
-    /// On real-time traces, this complements [`RealTimeTraceTrait::statistics`]: both
-    /// observe losses, from the consumer side and from the logger side respectively.
+    /// This counter is fed from the buffer callback's `EventsLost` field, which the Windows
+    /// documentation marks as "not used": on real machines it usually stays at 0. To monitor
+    /// losses, prefer the session-side query [`RealTimeTraceTrait::statistics`] (its
+    /// `events_lost` and `real_time_buffers_lost` come from the logger itself).
     fn events_lost(&self) -> usize {
         self.callback_data().events_lost()
     }

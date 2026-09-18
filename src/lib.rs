@@ -69,6 +69,13 @@
 //! In short, a panicking callback brings the whole process down by design. If your callbacks
 //! process untrusted or unexpected events, catch (and handle) the panics within the callback
 //! itself.
+//!
+//! # Migrating from 1.x
+//! Version 2.0 removes two public API surfaces:
+//! * `UserTrace::stop` and `KernelTrace::stop` lost their inherent methods: bring the
+//!   [`crate::trace::TraceTrait`] trait into scope to call `stop` on any trace.
+//! * The `ferrisetw::traits` module (the `EncodeUtf16` helper) was folded into the parser and
+//!   removed.
 
 #[macro_use]
 extern crate memoffset;

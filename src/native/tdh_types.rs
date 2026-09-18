@@ -188,7 +188,9 @@ impl Property {
                     return Some(pointer_size);
                 }
                 match length {
-                    PropertyLength::Length(l) if *l > 0 => {
+                    // Content-sized in types ignore the length property (see
+                    // `is_content_sized`): they stay variable-length
+                    PropertyLength::Length(l) if *l > 0 && !in_type.is_content_sized() => {
                         Some(in_type.literal_schema_length_bytes(*l))
                     },
                     // A zero length means "ask TDH" for a top-level property;
@@ -437,6 +439,31 @@ impl TdhInType {
     pub(crate) fn literal_schema_length_bytes(self, length: u16) -> usize {
         self.schema_length_bytes(usize::from(length))
             .expect("a u16 schema length cannot overflow a usize")
+    }
+
+    /// Whether the field size follows from the field bytes themselves: a
+    /// count prefix (the counted families), the SID header, or the remaining
+    /// buffer (NONNULLTERMINATED). tdh.h says their length property must be
+    /// ignored, in literal or index form: a manifest cannot declare one
+    /// (eventman.xsd: "Length is not used for other inTypes"), so only
+    /// malformed WBEM/MOF schemas can, and honoring it there would desync
+    /// the walk from TDH's own size computation
+    pub(crate) fn is_content_sized(self) -> bool {
+        matches!(
+            self,
+            Self::InTypeManifestCountedString
+                | Self::InTypeCountedString
+                | Self::InTypeManifestCountedAnsiString
+                | Self::InTypeCountedAnsiString
+                | Self::InTypeReversedCountedString
+                | Self::InTypeReversedCountedAnsiString
+                | Self::InTypeManifestCountedBinary
+                | Self::InTypeNonNullTerminatedString
+                | Self::InTypeNonNullTerminatedAnsiString
+                | Self::InTypeSid
+                | Self::InTypeWbemSid
+                | Self::InTypeHexDump
+        )
     }
 
     /// Fixed byte size of the in types whose size follows from the in type
