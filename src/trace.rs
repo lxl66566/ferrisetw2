@@ -1098,6 +1098,20 @@ impl Drop for StartedSessionGuard<'_> {
     }
 }
 
+/// The kernel providers that the session-wide `EnableFlags` cannot fully configure
+///
+/// A provider carrying event filters also needs a per-provider `EnableTraceEx2`:
+/// filters only travel through `EnableTraceParameters.EnableFilterDesc`, which the
+/// `EnableFlags` field of `EVENT_TRACE_PROPERTIES` has no room for. Returns them
+/// in registration order.
+fn kernel_filter_providers(providers: &[Arc<Provider>]) -> Vec<Arc<Provider>> {
+    providers
+        .iter()
+        .filter(|prov| !prov.filters().is_empty())
+        .cloned()
+        .collect()
+}
+
 impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     /// Define the trace name
     ///
@@ -1246,12 +1260,31 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
             handed_over: false,
         };
 
-        // Kernel-only TraceSetInformation configuration, applied between StartTraceW and
-        // OpenTraceW (the control handle is valid as soon as the session is started, and the
-        // settings must be in place before events start flowing)
+        // Kernel-only configuration, applied between StartTraceW and OpenTraceW (the
+        // control handle is valid as soon as the session is started, and the settings
+        // must be in place before events start flowing)
         if T::TRACE_KIND == private::TraceKind::Kernel {
             enable_stack_tracing(control_handle, &self.stack_tracing_events)?;
             set_extended_kernel_groups(control_handle, &self.extended_kernel_groups)?;
+
+            // Providers carrying event filters (e.g. `EventFilter::ByPids`) are not fully
+            // served by `EnableFlags`: filters only reach a system session through a
+            // per-provider `EnableTraceEx2` carrying `EVENT_FILTER_DESCRIPTOR`s, which
+            // needs Windows 8+ — the same requirement as the `EVENT_TRACE_SYSTEM_LOGGER_MODE`
+            // set in `augmented_file_mode`. Filter-less providers keep the flags-only path.
+            let filtered_providers = kernel_filter_providers(&self.rt_callback_data.providers());
+            // Same policy as `build_event_filter_descriptors`: a requested filter that
+            // cannot be applied is an error, never a silent no-op
+            if !filtered_providers.is_empty() && !version_helper::is_win8_or_greater() {
+                return Err(TraceError::EtwNativeError(
+                    EvntraceNativeError::InvalidFilter(
+                        "kernel providers cannot carry event filters before Windows 8".into(),
+                    ),
+                ));
+            }
+            for prov in filtered_providers {
+                enable_provider(control_handle, &prov)?;
+            }
         }
 
         if T::TRACE_KIND == private::TraceKind::User {
@@ -1534,7 +1567,11 @@ pub fn stop_trace_by_name(trace_name: &str) -> TraceResult<()> {
 mod test {
     use super::*;
     use crate::{
-        native::etw_types::PerfinfoGroupmask, provider::kernel_providers::SYSTEM_CALL_PROVIDER,
+        native::etw_types::PerfinfoGroupmask,
+        provider::{
+            EventFilter,
+            kernel_providers::{self, SYSTEM_CALL_PROVIDER},
+        },
     };
 
     /// A `UserTrace` whose control handle is invalid (value 0), as if it had
@@ -1747,6 +1784,39 @@ mod test {
             StackTracingEvent::SYSCALL_ENTER
         ]);
         assert_eq!(builder.extended_kernel_groups, [ExtendedKernelGroup::Pool]);
+    }
+
+    #[test]
+    fn only_filter_bearing_kernel_providers_need_a_per_provider_enable() {
+        // Filter-less providers are fully served by the session-wide `EnableFlags`:
+        // they must stay on the flags-only path, even when sharing the GUID of a
+        // filtered provider (PROCESS and PROCESS_COUNTER providers share one GUID)
+        let plain = Arc::new(Provider::kernel(&kernel_providers::PROCESS_PROVIDER).build());
+        let plain_same_guid =
+            Arc::new(Provider::kernel(&kernel_providers::PROCESS_COUNTER_PROVIDER).build());
+        let filtered = Arc::new(
+            Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)
+                .add_filter(EventFilter::ByPids(vec![1234]))
+                .build(),
+        );
+        let filtered_too = Arc::new(
+            Provider::kernel(&kernel_providers::THREAD_PROVIDER)
+                .add_filter(EventFilter::ByExecutableNames(vec!["cmd.exe".into()]))
+                .build(),
+        );
+        let providers = vec![
+            Arc::clone(&plain),
+            Arc::clone(&filtered),
+            plain_same_guid,
+            Arc::clone(&filtered_too),
+        ];
+
+        // Registration order is preserved, and the exact provider instances are
+        // selected (identity, not GUID equality)
+        let selected = kernel_filter_providers(&providers);
+        assert_eq!(selected.len(), 2);
+        assert!(Arc::ptr_eq(&selected[0], &filtered));
+        assert!(Arc::ptr_eq(&selected[1], &filtered_too));
     }
 
     #[test]

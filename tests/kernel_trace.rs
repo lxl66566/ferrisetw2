@@ -41,22 +41,23 @@ fn kernel_trace_tests() {
 
 fn create_simple_kernel_trace_trace(notifier: StatusNotifier) -> KernelTrace {
     println!("We are process {}", std::process::id());
-    let our_process_only = EventFilter::ByPids(vec![std::process::id()]);
-
     let our_process_id = std::process::id();
+
     let kernel_provider = Provider::kernel(&kernel_providers::IMAGE_LOAD_PROVIDER)
-        .add_filter(our_process_only)
+        // NB: `ByPids` is enforced at runtime on kernel sessions: starting the trace
+        // issues a per-provider `EnableTraceEx2` carrying the filter descriptor.
+        // Kernel rundown (DCStart) events are nevertheless delivered session-wide,
+        // some of them carrying special PIDs (e.g. 0xFFFFFFFF). So neither this
+        // filter nor the callback may assert that every event's PID is ours: the
+        // only PID-checked event is the DLL load the test generates itself, in
+        // `has_seen_dll_load`.
+        .add_filter(EventFilter::ByPids(vec![our_process_id]))
         .add_callback(
             move |record: &EventRecord, schema_locator: &SchemaLocator| {
                 let schema = schema_locator.event_schema(record).unwrap();
                 let parser = Parser::create(record, &schema);
 
-                // The ByPids filter must prevent events from other processes
-                // from reaching this callback (this used to be broken because
-                // PIDs were truncated to 16 bits, see issue #51)
-                assert_eq!(record.process_id(), our_process_id);
-
-                if has_seen_dll_load(record, &parser) {
+                if has_seen_dll_load(record, &parser, our_process_id) {
                     notifier.notify_success();
                 }
             },
@@ -85,8 +86,11 @@ fn generate_image_load_events() {
     println!("Loading done.");
 }
 
-fn has_seen_dll_load(record: &EventRecord, parser: &Parser) -> bool {
-    if record.process_id() == std::process::id() {
+fn has_seen_dll_load(record: &EventRecord, parser: &Parser, our_process_id: u32) -> bool {
+    // The only PID-checked event: the DLL load the test generates itself.
+    // Other processes also load images while the session runs, and the kernel
+    // rundown lists the system-wide modules, so no other event is attributable.
+    if record.process_id() == our_process_id {
         let filename = parser.try_parse::<String>("FileName");
         println!("   this one's for us: {filename:?}");
         if let Ok(filename) = filename

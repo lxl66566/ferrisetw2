@@ -16,7 +16,12 @@ use windows::Win32::System::Diagnostics::Etw::{
 #[derive(Debug)]
 pub enum EventFilter {
     /// Filter by PID (a process identifier, i.e. a 32bit DWORD).
-    /// This is only effective on kernel mode logger session.
+    ///
+    /// Enforced by ETW itself, through the `EnableTraceEx2` call that enables the
+    /// provider (a scope filter): on kernel sessions this triggers a per-provider
+    /// enablement carrying the filter (Windows 8+). Note that kernel rundown events
+    /// are delivered session-wide regardless of this filter, some with placeholder
+    /// PIDs (e.g. 0xFFFFFFFF).
     ByPids(Vec<u32>),
     /// Keep events with these ETW event IDs, drop the others.
     /// Ignored for TraceLogging providers (their events have no static IDs).
