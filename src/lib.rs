@@ -52,7 +52,7 @@
 //! [Source]: https://docs.microsoft.com/en-us/windows/win32/etw/about-event-tracing
 //!
 //! # Log messages
-//! ferrisetw may (very) occasionally write error log messages using the [`log`](https://docs.rs/log/latest/log/) crate.<br/>
+//! ferrisetw2 may (very) occasionally write error log messages using the [`log`](https://docs.rs/log/latest/log/) crate.<br/>
 //! In case you want them to be printed to the console, your binary should use one of the various logger implementations. [`env_logger`](https://docs.rs/env_logger/latest/env_logger/) is one of them.<br/>
 //! You can have a look at how to use it in the `examples/` folder in the GitHub repository.
 //!
@@ -60,7 +60,7 @@
 //! The callbacks you register on a provider (see
 //! [`crate::provider::ProviderBuilder::add_callback`]) are invoked by Windows itself, on ETW
 //! delivery threads: a panic must not unwind across that FFI boundary, as unwinding into
-//! `extern "system"` native code is undefined behavior. ferrisetw therefore catches panics at
+//! `extern "system"` native code is undefined behavior. ferrisetw2 therefore catches panics at
 //! that boundary, logs them through the [`log`](https://docs.rs/log/latest/log/) crate, and
 //! **terminates the process with exit code 1**: a callback that panicked midway may have left
 //! your own state (counters, aggregators, ...) inconsistent, so silently dropping the
@@ -74,7 +74,7 @@
 //! Version 2.0 removes two public API surfaces:
 //! * `UserTrace::stop` and `KernelTrace::stop` lost their inherent methods: bring the
 //!   [`crate::trace::TraceTrait`] trait into scope to call `stop` on any trace.
-//! * The `ferrisetw::traits` module (the `EncodeUtf16` helper) was folded into the parser and
+//! * The `ferrisetw2::traits` module (the `EncodeUtf16` helper) was folded into the parser and
 //!   removed.
 
 #[macro_use]

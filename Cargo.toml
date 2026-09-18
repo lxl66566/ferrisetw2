@@ -1,12 +1,14 @@
 [package]
-name        = "ferrisetw"
+name        = "ferrisetw2"
 version     = "2.0.0"
 edition     = "2024"
-description = "Basically a KrabsETW rip-off written in Rust"
-repository  = "https://github.com/n4r1b/ferrisetw"
+description = "Safe Rust abstractions over the ETW consumer APIs, fork of ferrisetw"
+repository  = "https://github.com/lxl66566/ferrisetw2"
 license     = "MIT OR Apache-2.0"
 keywords    = ["etw", "event", "krabsetw", "tracing", "windows"]
 categories  = ["api-bindings", "parsing"]
+# Keep tool/CI configs out of the published .crate
+exclude     = [".github", ".gitignore", ".tombi.toml", "clippy.toml", "rustfmt.toml"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

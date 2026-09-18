@@ -41,8 +41,8 @@ impl Schema {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
     ///     let schema = schema_locator.event_schema(record).unwrap();
     ///     let decoding_source = schema.decoding_source();
@@ -56,8 +56,8 @@ impl Schema {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
     ///     let schema = schema_locator.event_schema(record).unwrap();
     ///     let provider_name = schema.provider_name();
@@ -78,8 +78,8 @@ impl Schema {
     /// See: [TaskType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-tasktype-complextype)
     /// # Example
     /// ```
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
     ///     let schema = schema_locator.event_schema(record).unwrap();
     ///     let task_name = schema.task_name();
@@ -100,8 +100,8 @@ impl Schema {
     /// See: [OpcodeType](https://docs.microsoft.com/en-us/windows/win32/wes/eventmanifestschema-opcodetype-complextype)
     /// # Example
     /// ```
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
     ///     let schema = schema_locator.event_schema(record).unwrap();
     ///     let opcode_name = schema.opcode_name();

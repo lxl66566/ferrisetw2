@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord,
     parser::Parser,
     provider::{Provider, TraceFlags},
@@ -59,7 +59,7 @@ fn parse_etw_event(schema: &Schema, record: &EventRecord) {
 }
 
 fn main() {
-    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
+    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw2 to be printed to stderr
 
     let dns_provider = Provider::by_guid(0x1c95126e_7eea_49a9_a3fe_a378b03ddb4d) // Microsoft-Windows-DNS-Client
         .add_callback(dns_etw_callback)

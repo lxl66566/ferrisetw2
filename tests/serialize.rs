@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord, EventSerializer, EventSerializerOptions,
     provider::Provider,
     schema_locator::SchemaLocator,
@@ -252,7 +252,7 @@ const SECONDS_TO_RUN: u64 = 5;
 #[test]
 fn serialize_json() {
     ser_json_test(
-        "ferrisetw-json",
+        "ferrisetw2-json",
         EventSerializerOptions {
             // include_schema: false,
             // include_header: false,
@@ -267,7 +267,7 @@ fn serialize_json() {
 #[test]
 fn serialize_flexbuffer() {
     ser_flexbuffer_test(
-        "ferrisetw-flex",
+        "ferrisetw2-flex",
         EventSerializerOptions {
             // include_schema: false,
             // include_header: false,

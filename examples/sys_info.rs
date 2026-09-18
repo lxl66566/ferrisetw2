@@ -1,4 +1,4 @@
-use ferrisetw::query::*;
+use ferrisetw2::query::*;
 
 fn main() {
     println!("Max PMC: {}", SessionlessInfo::max_pmc().unwrap());

@@ -85,9 +85,9 @@ impl std::fmt::Display for AddressFamily {
 ///
 /// # Example
 /// ```
-/// # use ferrisetw::EventRecord;
-/// # use ferrisetw::parser::{Parser, TdhSocketAddress};
-/// # use ferrisetw::schema_locator::SchemaLocator;
+/// # use ferrisetw2::EventRecord;
+/// # use ferrisetw2::parser::{Parser, TdhSocketAddress};
+/// # use ferrisetw2::schema_locator::SchemaLocator;
 /// let my_callback = |record: &EventRecord, schema_locator: &SchemaLocator| {
 ///     let schema = schema_locator.event_schema(record).unwrap();
 ///     let parser = Parser::create(record, &schema);

@@ -6,7 +6,7 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord, FileTrace, UserTrace,
     provider::Provider,
     schema_locator::SchemaLocator,
@@ -15,7 +15,7 @@ use ferrisetw::{
 
 #[test]
 fn etl_file() {
-    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
+    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw2 to be printed to stderr
 
     let dump_file = DumpFileParams {
         file_path: PathBuf::from("etw-dump-file.etl"),

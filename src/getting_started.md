@@ -1,8 +1,8 @@
-use ferrisetw::EventRecord;
-use ferrisetw::schema_locator::SchemaLocator;
-use ferrisetw::parser::Parser;
-use ferrisetw::provider::Provider;
-use ferrisetw::trace::{UserTrace, TraceTrait};
+use ferrisetw2::EventRecord;
+use ferrisetw2::schema_locator::SchemaLocator;
+use ferrisetw2::parser::Parser;
+use ferrisetw2::provider::Provider;
+use ferrisetw2::trace::{UserTrace, TraceTrait};
 
 fn process_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
     // Basic event scrutinizing can be done directly from the `EventRecord`
@@ -17,7 +17,7 @@ fn process_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
                 // Finally, properties for a given event can be retrieved using a Parser
                 let parser = Parser::create(record, &schema);
 
-                // You'll need type inference to tell ferrisetw what type you want to parse into
+                // You'll need type inference to tell ferrisetw2 what type you want to parse into
                 // In actual code, be sure to correctly handle Err values!
                 let process_id: u32 = parser.try_parse("ProcessID").unwrap();
                 let image_name: String = parser.try_parse("ImageName").unwrap();

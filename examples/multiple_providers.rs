@@ -3,7 +3,7 @@ use std::{
     time::Duration,
 };
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord,
     parser::{Parser, Pointer},
     provider::*,
@@ -52,7 +52,7 @@ fn tcpip_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
 }
 
 fn main() {
-    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
+    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw2 to be printed to stderr
 
     let tcpip_provider = Provider::by_guid(0x7dd42a49_5329_4832_8dfd_43d979153a88) // Microsoft-Windows-Kernel-Network
         .add_callback(tcpip_callback)

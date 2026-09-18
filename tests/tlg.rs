@@ -4,7 +4,7 @@
 //! privileges, so this test is gated behind the `admin_tests` feature.
 #![cfg(feature = "admin_tests")]
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord, GUID,
     parser::Parser,
     provider::Provider,

@@ -99,7 +99,7 @@ impl EventFilter {
 ///
 /// # Example
 /// ```
-/// # use ferrisetw::provider::{EventFilter, EventNamesFilter, Provider};
+/// # use ferrisetw2::provider::{EventFilter, EventNamesFilter, Provider};
 /// let filter = EventFilter::ByEventNames(
 ///     EventNamesFilter::new(vec!["MyEventName".into()])
 ///         .any(0x1)    // only applies to events with keyword bit 0 set

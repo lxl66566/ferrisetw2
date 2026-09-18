@@ -1,39 +1,24 @@
-# FerrisETW 🦀
+# ferrisetw2
 
-This crate provides safe Rust abstractions over the ETW consumer APIs.
+This repository is a fork of [n4r1b/ferrisetw](https://github.com/n4r1b/ferrisetw), maintained separately from upstream. All changes since the fork point were implemented by AI coding agents under human direction.
 
-It started as a [KrabsETW](https://github.com/microsoft/krabsetw/) rip-off written in Rust (hence the name [`Ferris`](https://rustacean.net/) 🦀).
-All credits go to the team at Microsoft who develop KrabsEtw, without it, this project probably wouldn't be a thing.<br/>
-Since version 1.0, the API and internal architecture of this crate is slightly diverging from `krabsetw`, so that it is more Rust-idiomatic.
+Changes relative to upstream:
+
+- Correctness: ~40 bug fixes across the parser, serializer, schema locator and native layer; undecodable properties now degrade gracefully instead of failing the whole event
+- Features: runtime provider enable/disable, session statistics, nested struct decoding and serialization, extended data (SID, stack frames, container id), capture-state (rundown) requests, event/executable/stackwalk filters, kernel session configuration via `TraceSetInformation`, configurable clock type
+- Performance: multi-level schema/name caching, memchr scans, narrower lock scopes, O(1) provider dispatch, fewer TDH round-trips
+- Testing & tooling: unit suite grown from 44 to 143 tests plus 30 doctests, admin-gated live-session integration tests, TDH ground-truth tests, edition 2024, clippy clean
 
 ## Examples
-You can find a examples within the
-  [crate documentation on doc.rs](https://docs.rs/ferrisetw),
-  as well as the [examples](./examples) and the [tests](./tests) folders.
 
-If you are familiar with KrabsETW you'll see that is very similar.
-In case you've never used KrabsETW before, the examples are very straight forward and should be easy to follow. If you have any issues don't hesitate in asking.
+You can find examples within the [crate documentation on docs.rs](https://docs.rs/ferrisetw2), as well as the [examples](./examples) and the [tests](./tests) folders.
 
 ## Documentation
-This crate is documented at [docs.rs](https://docs.rs/crate/ferrisetw/latest).
 
-## Notes
-- The project is still WIP.
-  Feel free to report bugs, issues, feature requests, etc.
-  Of course, contributing will be happily accepted!
-
-
-- The types available for parsing are those that implement the trait TryParse for Parser, basic types are already
-  implemented. In the near future I'll add more :)
-
-
-- I tried to keep dependencies as minimal as possible, also you'll see I went with the new [windows-rs](https://github.com/microsoft/windows-rs) instead of
-  using the [winapi](https://docs.rs/winapi/0.3.9/winapi/). This is a personal decision mainly because I believe the
-  Windows bindings is going to be the "standard" to interact with the Windows API in the near future.
-
+This crate is documented at [docs.rs](https://docs.rs/crate/ferrisetw2/latest).
 
 ### Acknowledgments
-- First of all, the team at MS who develop KrabsETW!!
-- [Shaddy](https://github.com/Shaddy) for, pretty much, teaching me all the Rust I know 😃
-- [n4r1b](https://github.com/n4r1b) for creating this great crate
-- [daladim](https://github.com/daladim) for adding even more features
+
+- The team at Microsoft who develop KrabsETW
+- [Shaddy](https://github.com/Shaddy), who taught [n4r1b](https://github.com/n4r1b) pretty much all the Rust he knows
+- [n4r1b](https://github.com/n4r1b) for creating upstream great crate, [daladim](https://github.com/daladim) for adding even more features

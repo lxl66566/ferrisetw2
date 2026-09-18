@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord, GUID,
     provider::Provider,
     schema_locator::SchemaLocator,
@@ -36,27 +36,27 @@ use ferrisetw::{
 };
 use tracelogging as tlg;
 
-const PROVIDER_LIFECYCLE_NAME: &str = "ferrisetw.DynamicProviders.Lifecycle";
-const PROVIDER_INDEPENDENT_A_NAME: &str = "ferrisetw.DynamicProviders.IndependentA";
-const PROVIDER_INDEPENDENT_B_NAME: &str = "ferrisetw.DynamicProviders.IndependentB";
-const PROVIDER_STATS_A_NAME: &str = "ferrisetw.DynamicProviders.StatsA";
-const PROVIDER_STATS_B_NAME: &str = "ferrisetw.DynamicProviders.StatsB";
-const PROVIDER_SEMANTICS_NAME: &str = "ferrisetw.DynamicProviders.Semantics";
-const PROVIDER_STOPPED_NAME: &str = "ferrisetw.DynamicProviders.Stopped";
+const PROVIDER_LIFECYCLE_NAME: &str = "ferrisetw2.DynamicProviders.Lifecycle";
+const PROVIDER_INDEPENDENT_A_NAME: &str = "ferrisetw2.DynamicProviders.IndependentA";
+const PROVIDER_INDEPENDENT_B_NAME: &str = "ferrisetw2.DynamicProviders.IndependentB";
+const PROVIDER_STATS_A_NAME: &str = "ferrisetw2.DynamicProviders.StatsA";
+const PROVIDER_STATS_B_NAME: &str = "ferrisetw2.DynamicProviders.StatsB";
+const PROVIDER_SEMANTICS_NAME: &str = "ferrisetw2.DynamicProviders.Semantics";
+const PROVIDER_STOPPED_NAME: &str = "ferrisetw2.DynamicProviders.Stopped";
 
-tlg::define_provider!(PROVIDER_LIFECYCLE, "ferrisetw.DynamicProviders.Lifecycle");
+tlg::define_provider!(PROVIDER_LIFECYCLE, "ferrisetw2.DynamicProviders.Lifecycle");
 tlg::define_provider!(
     PROVIDER_INDEPENDENT_A,
-    "ferrisetw.DynamicProviders.IndependentA"
+    "ferrisetw2.DynamicProviders.IndependentA"
 );
 tlg::define_provider!(
     PROVIDER_INDEPENDENT_B,
-    "ferrisetw.DynamicProviders.IndependentB"
+    "ferrisetw2.DynamicProviders.IndependentB"
 );
-tlg::define_provider!(PROVIDER_STATS_A, "ferrisetw.DynamicProviders.StatsA");
-tlg::define_provider!(PROVIDER_STATS_B, "ferrisetw.DynamicProviders.StatsB");
-tlg::define_provider!(PROVIDER_SEMANTICS, "ferrisetw.DynamicProviders.Semantics");
-tlg::define_provider!(PROVIDER_STOPPED, "ferrisetw.DynamicProviders.Stopped");
+tlg::define_provider!(PROVIDER_STATS_A, "ferrisetw2.DynamicProviders.StatsA");
+tlg::define_provider!(PROVIDER_STATS_B, "ferrisetw2.DynamicProviders.StatsB");
+tlg::define_provider!(PROVIDER_SEMANTICS, "ferrisetw2.DynamicProviders.Semantics");
+tlg::define_provider!(PROVIDER_STOPPED, "ferrisetw2.DynamicProviders.Stopped");
 
 /// Number of events in each generation burst
 const EVENTS_PER_BATCH: usize = 4;
@@ -76,7 +76,7 @@ const STABLE_WINDOW: Duration = Duration::from_secs(2);
 macro_rules! write_events {
     ($provider:ident, $count:expr) => {
         for _ in 0..$count {
-            tlg::write_event!($provider, "MatrixEvent", str8("Tag", "ferrisetw"));
+            tlg::write_event!($provider, "MatrixEvent", str8("Tag", "ferrisetw2"));
         }
     };
 }
@@ -368,7 +368,7 @@ fn disable_provider_semantics_for_unknown_and_repeated_calls() {
     // (a GUID derived from a name whose provider is never registered anywhere)
     assert_eq!(
         trace
-            .disable_provider(guid_from_name("ferrisetw.DynamicProviders.Nothing"))
+            .disable_provider(guid_from_name("ferrisetw2.DynamicProviders.Nothing"))
             .unwrap(),
         0
     );
@@ -394,7 +394,7 @@ fn provider_controls_fail_after_the_session_stopped() {
     let guid = providers().stopped;
     let counter = Arc::new(AtomicUsize::new(0));
 
-    let trace_name = format!("ferrisetw-dynamic-providers-{}", std::process::id());
+    let trace_name = format!("ferrisetw2-dynamic-providers-{}", std::process::id());
     let mut trace = UserTrace::new()
         .named(trace_name.clone())
         .enable(counting_provider(guid, Arc::clone(&counter)))

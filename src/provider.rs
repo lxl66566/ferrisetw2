@@ -162,7 +162,7 @@ impl Provider {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw2::provider::Provider;
     /// let my_provider = Provider::by_name("Microsoft-Windows-WinINet")
     ///     .unwrap()
     ///     .build();
@@ -248,7 +248,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw2::provider::Provider;
     /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
     ///     .any(0xf0010000000003ff)
     ///     .build();
@@ -264,7 +264,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw2::provider::Provider;
     /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
     ///     .all(0x4000000000000000)
     ///     .build();
@@ -279,7 +279,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::{Provider};
+    /// # use ferrisetw2::provider::{Provider};
     /// // LogAlways (0x0)
     /// // Critical (0x1)
     /// // Error (0x2)
@@ -301,7 +301,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::{Provider, TraceFlags};
+    /// # use ferrisetw2::provider::{Provider, TraceFlags};
     /// let my_provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
     ///     .trace_flags(TraceFlags::EVENT_ENABLE_PROPERTY_SID)
     ///     .build();
@@ -329,7 +329,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::Provider;
+    /// # use ferrisetw2::provider::Provider;
     /// let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716") // Microsoft-Windows-Kernel-Process
     ///     .request_capture_state()
     ///     .build();
@@ -348,15 +348,15 @@ impl ProviderBuilder {
     /// function).
     ///
     /// A panic escaping the callback cannot unwind into Windows (that would be undefined
-    /// behavior): ferrisetw catches it and terminates the process with exit code 1. Catch
+    /// behavior): ferrisetw2 catches it and terminates the process with exit code 1. Catch
     /// panics within the callback itself; see the crate-level "Callback panics" section.
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::provider::Provider;
-    /// # use ferrisetw::trace::UserTrace;
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::provider::Provider;
+    /// # use ferrisetw2::trace::UserTrace;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// let provider = Provider::by_guid("1EDEEE53-0AFE-4609-B846-D8C0B2075B1F")
     ///     .add_callback(|record: &EventRecord, schema_locator: &SchemaLocator| {
     ///         // Handle Event
@@ -387,7 +387,7 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::{EventFilter, EventNamesFilter, Provider};
+    /// # use ferrisetw2::provider::{EventFilter, EventNamesFilter, Provider};
     /// let only_events_18_or_42 = EventFilter::ByEventIds(vec![18, 42]);
     /// let only_pid_1234 = EventFilter::ByPids(vec![1234]);
     /// let only_cmd_exe = EventFilter::ByExecutableNames(vec!["cmd.exe".into()]);
@@ -412,9 +412,9 @@ impl ProviderBuilder {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::provider::Provider;
-    /// # use ferrisetw::EventRecord;
-    /// # use ferrisetw::schema_locator::SchemaLocator;
+    /// # use ferrisetw2::provider::Provider;
+    /// # use ferrisetw2::EventRecord;
+    /// # use ferrisetw2::schema_locator::SchemaLocator;
     /// # let process_callback = |_event: &EventRecord, _locator: &SchemaLocator| {};
     /// Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716") // Microsoft-Windows-Kernel-Process
     ///     .add_callback(process_callback)

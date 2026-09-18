@@ -6,7 +6,7 @@
 
 use std::{process::Command, time::Duration};
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord,
     parser::Parser,
     provider::{EventFilter, Provider},

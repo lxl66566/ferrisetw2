@@ -1,11 +1,11 @@
 use std::time::Duration;
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord, parser::Parser, provider::*, schema_locator::SchemaLocator, trace::*,
 };
 
 fn main() {
-    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw to be printed to stderr
+    env_logger::init(); // this is optional. This makes the (rare) error logs of ferrisetw2 to be printed to stderr
 
     let image_load_callback =
         |record: &EventRecord, schema_locator: &SchemaLocator| match schema_locator

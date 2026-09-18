@@ -2,9 +2,9 @@ name: Rust
 
 on:
   push:
-    branches: [ "master", "next_major_version" ]
+    branches: ["master", "next_major_version"]
   pull_request:
-    branches: [ "master", "next_major_version" ]
+    branches: ["master", "next_major_version"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,25 +16,25 @@ jobs:
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
-    - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt
-    # Cargo fmt check
-    - run: cargo fmt --check
-    # Cargo check
-    # --all-features: several modules (e.g. ser.rs) are feature-gated and would
-    # otherwise never be compiled by CI
-    - run: cargo check --all-features
-    # Cargo doc
-    - run: cargo doc --no-deps --all-features
-    # Cargo test
-    - run: cargo test --all-features
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+      # Cargo fmt check
+      - run: cargo fmt --check
+      # Cargo check
+      # --all-features: several modules (e.g. ser.rs) are feature-gated and would
+      # otherwise never be compiled by CI
+      - run: cargo check --all-features
+      # Cargo doc
+      - run: cargo doc --no-deps --all-features
+      # Cargo test
+      - run: cargo test --all-features
   clippy:
     runs-on: windows-latest
     steps:
-    - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: clippy
-    - run: cargo clippy --all-features --all-targets -- -D warnings
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - run: cargo clippy --all-features --all-targets -- -D warnings

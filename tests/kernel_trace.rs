@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord,
     parser::Parser,
     provider::{EventFilter, Provider, kernel_providers},

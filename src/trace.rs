@@ -169,7 +169,7 @@ impl TraceStatistics {
 ///
 /// # Example
 /// ```
-/// # use ferrisetw::trace::{KernelTrace, StackTracingEvent};
+/// # use ferrisetw2::trace::{KernelTrace, StackTracingEvent};
 /// let builder = KernelTrace::new().set_stack_tracing(vec![StackTracingEvent::SYSCALL_ENTER]);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -219,7 +219,7 @@ impl StackTracingEvent {
 ///
 /// # Example
 /// ```
-/// # use ferrisetw::trace::{ExtendedKernelGroup, KernelTrace};
+/// # use ferrisetw2::trace::{ExtendedKernelGroup, KernelTrace};
 /// let builder = KernelTrace::new()
 ///     .set_extended_groups(vec![ExtendedKernelGroup::Memory, ExtendedKernelGroup::Pool]);
 /// ```
@@ -503,7 +503,7 @@ pub trait RealTimeTraceTrait: TraceTrait + PrivateRealTimeTraceTrait {
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::trace::{RealTimeTraceTrait, UserTrace};
+    /// # use ferrisetw2::trace::{RealTimeTraceTrait, UserTrace};
     /// # let mut trace = UserTrace::new().start().unwrap().0;
     /// let stats = trace.statistics().unwrap();
     /// if stats.events_lost > 0 || stats.real_time_buffers_lost > 0 {
@@ -689,8 +689,8 @@ impl UserTrace {
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::provider::Provider;
-    /// # use ferrisetw::trace::UserTrace;
+    /// # use ferrisetw2::provider::Provider;
+    /// # use ferrisetw2::trace::UserTrace;
     /// # let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
     /// #     .request_capture_state()
     /// #     .build();
@@ -745,8 +745,8 @@ impl UserTrace {
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::provider::Provider;
-    /// # use ferrisetw::trace::UserTrace;
+    /// # use ferrisetw2::provider::Provider;
+    /// # use ferrisetw2::trace::UserTrace;
     /// # let trace = UserTrace::new().start_and_process().unwrap();
     /// let provider = Provider::by_guid("22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716")
     ///     .add_callback(|_event, _schema| { /* ... */ })
@@ -813,7 +813,7 @@ impl UserTrace {
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::trace::UserTrace;
+    /// # use ferrisetw2::trace::UserTrace;
     /// # use windows::core::GUID;
     /// # let trace = UserTrace::new().start_and_process().unwrap();
     /// # let guid = GUID::new().unwrap();
@@ -1136,7 +1136,7 @@ impl<T: RealTimeTraceTrait + PrivateRealTimeTraceTrait> TraceBuilder<T> {
     ///
     /// # Example
     /// ```
-    /// # use ferrisetw::trace::{ClockType, TraceProperties, UserTrace};
+    /// # use ferrisetw2::trace::{ClockType, TraceProperties, UserTrace};
     /// let props = TraceProperties {
     ///     clock_type: ClockType::SystemTime,
     ///     ..Default::default()
@@ -1427,8 +1427,8 @@ impl TraceBuilder<KernelTrace> {
     ///
     /// # Example
     /// ```no_run
-    /// # use ferrisetw::provider::{Provider, kernel_providers};
-    /// # use ferrisetw::trace::{KernelTrace, StackTracingEvent};
+    /// # use ferrisetw2::provider::{Provider, kernel_providers};
+    /// # use ferrisetw2::trace::{KernelTrace, StackTracingEvent};
     /// let syscall_provider = Provider::kernel(&kernel_providers::SYSTEM_CALL_PROVIDER).build();
     /// let trace = KernelTrace::new()
     ///     .enable(syscall_provider)
@@ -1583,7 +1583,7 @@ mod test {
         for provider in providers {
             rt_callback_data.add_provider(provider);
         }
-        let wide_name = U16CString::from_str_truncate("ferrisetw-test-trace");
+        let wide_name = U16CString::from_str_truncate("ferrisetw2-test-trace");
         UserTrace {
             properties: EventTraceProperties::new::<UserTrace>(
                 &wide_name,

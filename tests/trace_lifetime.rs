@@ -6,7 +6,7 @@
 
 use std::process::Command;
 
-use ferrisetw::{
+use ferrisetw2::{
     EventRecord,
     provider::Provider,
     schema_locator::SchemaLocator,

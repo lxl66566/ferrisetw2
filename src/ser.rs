@@ -7,7 +7,7 @@
 //! as 64bit unix timestamps.
 //!
 //! ```
-//! use ferrisetw::{EventRecord, EventSerializer, schema_locator::SchemaLocator};
+//! use ferrisetw2::{EventRecord, EventSerializer, schema_locator::SchemaLocator};
 //! extern crate serde_json;
 //!
 //! fn event_callback(record: &EventRecord, schema_locator: &SchemaLocator) {
