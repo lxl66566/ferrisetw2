@@ -9,7 +9,13 @@ Changes relative to upstream:
 - Performance: multi-level schema/name caching, memchr scans, narrower lock scopes, O(1) provider dispatch, fewer TDH round-trips
 - Testing & tooling: unit suite grown from 44 to 143 tests plus 30 doctests, admin-gated live-session integration tests, TDH ground-truth tests, edition 2024, clippy clean
 
-## Examples
+## Usage
+
+Add ferrisetw2 to your project:
+
+```sh
+cargo add ferrisetw2
+```
 
 You can find examples within the [crate documentation on docs.rs](https://docs.rs/ferrisetw2), as well as the [examples](./examples) and the [tests](./tests) folders.
 
